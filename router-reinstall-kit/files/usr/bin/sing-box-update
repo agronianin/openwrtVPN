@@ -1,0 +1,76 @@
+#!/bin/sh
+set -eu
+
+SETTINGS=/etc/sing-box/vpn-config/vpn-settings.conf
+STATE=/etc/sing-box/vpn-config/sing-box-update-last-check
+SING_BOX_UPDATE_INTERVAL_HOURS=72
+[ ! -f "$SETTINGS" ] || . "$SETTINGS"
+running=0
+/etc/init.d/sing-box status >/dev/null 2>&1 && running=1
+if [ "${1:-}" = auto ]; then
+  [ "$running" = 1 ] || exit 0
+  case "$SING_BOX_UPDATE_INTERVAL_HOURS" in ''|*[!0-9]*) exit 2 ;; esac
+  [ "$SING_BOX_UPDATE_INTERVAL_HOURS" -gt 0 ] || exit 0
+  now=$(date +%s)
+  last=$(cat "$STATE" 2>/dev/null || echo 0)
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  [ "$((now-last))" -ge "$((SING_BOX_UPDATE_INTERVAL_HOURS*3600))" ] || exit 0
+fi
+
+work=$(mktemp -d /tmp/sing-box-update.XXXXXX)
+trap 'rm -rf "$work"' EXIT HUP INT TERM
+fetch() {
+  if [ "$running" = 1 ]; then
+    if curl -fLsS --connect-timeout 10 --max-time 120 --noproxy '' \
+      --proxy socks5h://127.0.0.1:2080 "$@"; then return; fi
+  fi
+  curl -fLsS --connect-timeout 10 --max-time 120 "$@"
+}
+fetch https://api.github.com/repos/SagerNet/sing-box/releases/latest -o "$work/release.json"
+version=$(jq -er '.tag_name' "$work/release.json")
+jq -e '.prerelease == false and .draft == false' "$work/release.json" >/dev/null
+case "$version" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo 'ERROR: unexpected release version'; exit 1 ;; esac
+current=$(sing-box version | sed -n 's/^sing-box version //p')
+if [ "$current" = "${version#v}" ]; then
+  date +%s > "$STATE"
+  echo "Already current: $current"
+  exit 0
+fi
+arch="${SING_BOX_ARCH:-}"
+if [ -z "$arch" ]; then
+  case "$(uname -m)" in
+    aarch64|arm64) arch=arm64 ;; x86_64) arch=amd64 ;;
+    armv7*) arch=armv7 ;; armv6*) arch=armv6 ;;
+    *) echo 'Set SING_BOX_ARCH to the official release architecture, or update sing-box manually'; exit 1 ;;
+  esac
+fi
+asset="sing-box-${version#v}-linux-$arch-musl.tar.gz"
+url=$(jq -er --arg name "$asset" '.assets[] | select(.name == $name) | .browser_download_url' "$work/release.json")
+digest=$(jq -er --arg name "$asset" '.assets[] | select(.name == $name) | .digest' "$work/release.json")
+case "$url" in https://github.com/SagerNet/sing-box/releases/download/*) ;; *) exit 1 ;; esac
+case "$digest" in sha256:*) ;; *) echo 'ERROR: missing SHA256 digest'; exit 1 ;; esac
+fetch "$url" -o "$work/release.tar.gz"
+printf '%s  %s\n' "${digest#sha256:}" "$work/release.tar.gz" | sha256sum -c -
+tar -xzf "$work/release.tar.gz" -C "$work"
+candidate="$work/sing-box-${version#v}-linux-arm64-musl/sing-box"
+"$candidate" version
+"$candidate" check -c /etc/sing-box/config.json
+cp /usr/bin/sing-box /usr/bin/sing-box.previous
+cp "$candidate" /usr/bin/sing-box.new
+chmod 755 /usr/bin/sing-box.new
+mv /usr/bin/sing-box.new /usr/bin/sing-box
+if [ "$running" = 1 ]; then
+  /etc/init.d/sing-box restart || true
+  sleep 3
+  if ! /etc/init.d/sing-box status >/dev/null 2>&1; then
+    cp /usr/bin/sing-box.previous /usr/bin/sing-box.new
+    mv /usr/bin/sing-box.new /usr/bin/sing-box
+    /etc/init.d/sing-box restart
+    logger -t sing-box-update "Upgrade $version failed; restored $current"
+    echo "ERROR: startup failed; restored $current"
+    exit 1
+  fi
+fi
+date +%s > "$STATE"
+logger -t sing-box-update "Updated $current to $version"
+echo "Updated $current to $version"

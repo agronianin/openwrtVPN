@@ -1,0 +1,4 @@
+# Your personal rules, for example:
+# rule example-proxy
+# outbound vpn-out
+# domain_suffix example.com

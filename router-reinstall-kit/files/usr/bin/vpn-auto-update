@@ -1,0 +1,43 @@
+#!/bin/sh
+set -eu
+
+SETTINGS_FILE="/etc/sing-box/vpn-config/vpn-settings.conf"
+STATE_FILE="/etc/sing-box/subscriptions-cache/last-auto-update"
+UPDATE_INTERVAL_HOURS=6
+
+[ -f "$SETTINGS_FILE" ] && . "$SETTINGS_FILE"
+
+case "$UPDATE_INTERVAL_HOURS" in
+  *[!0-9]*) echo 'ERROR: invalid UPDATE_INTERVAL_HOURS' >&2; exit 2 ;;
+  ''|0)
+    exit 0
+    ;;
+esac
+
+if ! /etc/init.d/sing-box status >/dev/null 2>&1; then
+  logger -t vpn-auto-update "VPN is off; automatic subscription update skipped"
+  exit 0
+fi
+
+now="$(date +%s)"
+last=0
+[ -s "$STATE_FILE" ] && last="$(sed -n '1p' "$STATE_FILE")"
+case "$last" in
+  *[!0-9]*|'') last=0 ;;
+esac
+
+interval_seconds=$((UPDATE_INTERVAL_HOURS * 3600))
+age=$((now - last))
+
+if [ "$age" -lt "$interval_seconds" ]; then
+  exit 0
+fi
+
+if /usr/bin/vpn-subscriptions-update refresh; then
+  mkdir -p "$(dirname "$STATE_FILE")"
+  printf '%s\n' "$now" > "$STATE_FILE"
+  logger -t vpn-auto-update "subscription cache refresh completed without applying config"
+else
+  logger -t vpn-auto-update "subscription cache refresh failed"
+  exit 1
+fi

@@ -1,0 +1,1451 @@
+#!/bin/sh
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+MAX_BODY=262144
+MODEM_ENABLED="$(uci -q get openwrtvpn.main.modem_enabled || echo 0)"
+
+html_escape() {
+  sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
+}
+
+url_decode() {
+  value="${1//+/ }"
+  printf '%b' "$(printf '%s' "$value" | sed 's/%/\\x/g')"
+}
+
+field() {
+  printf '%s' "$POST_DATA" | tr '&' '\n' | sed -n "s/^$1=//p" | head -n 1
+}
+
+read_post() {
+  [ "${REQUEST_METHOD:-}" = "POST" ] || return 0
+  len="${CONTENT_LENGTH:-0}"
+  case "$len" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  [ "$len" -le "$MAX_BODY" ] || len="$MAX_BODY"
+  dd bs=1 count="$len" 2>/dev/null
+}
+
+allowed_remote() {
+  case "${REMOTE_ADDR:-127.0.0.1}" in
+    127.*|::1|192.168.*|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.2?.*|172.30.*|172.31.*|fd*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+run_limited() {
+  tmp="/tmp/router-control.$$.$RANDOM"
+  "$@" >"$tmp" 2>&1
+  rc=$?
+  sed -n '1,240p' "$tmp"
+  if [ ! -s "$tmp" ]; then
+    if [ "$rc" -eq 0 ]; then
+      echo "OK: command completed with no output"
+    else
+      echo "ERROR: command failed with exit code $rc and no output"
+    fi
+  fi
+  rm -f "$tmp"
+  return "$rc"
+}
+
+run_qmi() {
+  timeout 15 qmicli -p -d /dev/cdc-wdm0 "$@" 2>&1 | sed -n '1,220p'
+}
+
+modem_id() {
+  mmcli -L 2>/dev/null | sed -n 's/.*\/Modem\/\([0-9][0-9]*\).*/\1/p' | head -n 1
+}
+
+modem_full_status() {
+  run_limited /usr/bin/modem-t77w968 status
+  echo
+  echo "--- mmcli -L ---"
+  run_limited mmcli -L
+  modem_path="$(mmcli -L 2>/dev/null | sed -n 's/.*\(\/org\/freedesktop\/ModemManager1\/Modem\/[0-9][0-9]*\).*/\1/p' | head -n 1)"
+  if [ -n "$modem_path" ]; then
+    modem_id="${modem_path##*/}"
+    echo
+    echo "--- mmcli -m $modem_id ---"
+    run_limited mmcli -m "$modem_id"
+  fi
+  echo
+  echo "--- network ---"
+  run_limited ifstatus modem_mm
+  run_limited ip addr show wwan0
+  run_limited ip route
+}
+
+modem_radio_status() {
+  mid="$(modem_id)"
+  echo "--- ModemManager radio ---"
+  if [ -n "$mid" ]; then
+    mmcli -m "$mid" --output-keyvalue 2>&1 | grep -E 'manufacturer|model|revision|carrier-configuration|state|power-state|access-technologies|signal-quality|supported-modes|current-modes|supported-bands|current-bands|operator-code|operator-name|registration-state|packet-service-state' | sed -n '1,260p'
+  else
+    echo "ModemManager modem not found"
+  fi
+  echo
+  echo "--- LTE signal ---"
+  [ -n "$mid" ] && mmcli -m "$mid" --signal-get 2>&1 || true
+  echo
+  echo "--- 3GPP location ---"
+  [ -n "$mid" ] && mmcli -m "$mid" --location-get 2>&1 || true
+  echo
+  echo "--- QMI serving system ---"
+  run_qmi --nas-get-serving-system
+  echo
+  echo "--- QMI RF band info ---"
+  run_qmi --nas-get-rf-band-info
+  echo
+  echo "--- QMI signal info ---"
+  run_qmi --nas-get-signal-info
+}
+
+modem_sim_status() {
+  mid="$(modem_id)"
+  sim=""
+  [ -n "$mid" ] && sim="$(mmcli -m "$mid" --output-keyvalue 2>/dev/null | sed -n 's/^modem.generic.sim[[:space:]]*: //p' | head -n 1)"
+  echo "--- SIM from ModemManager ---"
+  if [ -n "$sim" ]; then
+    mmcli -i "${sim##*/}" --output-keyvalue 2>&1 | sed -n '1,260p'
+  else
+    echo "SIM not found by ModemManager"
+  fi
+  echo
+  echo "--- QMI UIM card status ---"
+  run_qmi --uim-get-card-status
+  echo
+  echo "--- QMI UIM slot status ---"
+  run_qmi --uim-get-slot-status
+}
+
+modem_profiles_status() {
+  mid="$(modem_id)"
+  echo "--- current bearer / network ---"
+  [ -n "$mid" ] && mmcli -m "$mid" --output-keyvalue 2>&1 | grep -E 'bearer|initial-bearer|apn|ip-type|packet-service-state|operator' | sed -n '1,220p'
+  echo
+  echo "--- QMI WDS current settings ---"
+  run_qmi --wds-get-current-settings
+  echo
+  echo "--- QMI WDS profile list ---"
+  run_qmi --wds-get-profile-list=3gpp
+  echo
+  echo "--- QMI LTE attach parameters ---"
+  run_qmi --wds-get-lte-attach-parameters
+}
+
+supported_bands() {
+  mid="$(modem_id)"
+  [ -n "$mid" ] || return 1
+  mmcli -m "$mid" --output-keyvalue 2>/dev/null |
+    sed -n 's/^modem.generic.supported-bands.value\[[0-9][0-9]*\][[:space:]]*: //p' |
+    tr '\n' '|' |
+    sed 's/|$//'
+}
+
+normalize_bands() {
+  printf '%s' "$1" |
+    tr ',+' '  ' |
+    tr ' ' '\n' |
+    sed '/^$/d; s/^B\([0-9][0-9]*\)$/eutran-\1/; s/^b\([0-9][0-9]*\)$/eutran-\1/; s/^\([0-9][0-9]*\)$/eutran-\1/' |
+    awk 'NF { out = out ? out "|" $0 : $0 } END { print out }'
+}
+
+modem_set_bands() {
+  mid="$(modem_id)"
+  [ -n "$mid" ] || {
+    echo "ModemManager modem not found"
+    return 1
+  }
+  bands="$(normalize_bands "$1")"
+  case "$bands" in
+    ''|*[!A-Za-z0-9_|-]*)
+      echo "Invalid bands. Example: eutran-3 or eutran-3 eutran-7"
+      return 2
+      ;;
+  esac
+  echo "Setting current bands: $bands"
+  mmcli -m "$mid" --set-current-bands="$bands" 2>&1
+  echo
+  modem_radio_status
+}
+
+modem_set_all_bands() {
+  bands="$(supported_bands)"
+  [ -n "$bands" ] || {
+    echo "Cannot read supported bands"
+    return 1
+  }
+  modem_set_bands "$bands"
+}
+
+current_bands() {
+  mid="$(modem_id)"
+  [ -n "$mid" ] || return 1
+  mmcli -m "$mid" --output-keyvalue 2>/dev/null |
+    sed -n 's/^modem.generic.current-bands.value\[[0-9][0-9]*\][[:space:]]*: //p' |
+    tr '\n' '|' |
+    sed 's/|$//'
+}
+
+band_sample() {
+  label="$1"
+  echo "### BAND $label"
+  run_qmi --nas-get-serving-system | sed -n "/Registration state:/p; /Description:/p; /3GPP cell ID:/p; /LTE tracking area code:/p"
+  run_qmi --nas-get-rf-band-info | sed -n "/Active Band Class:/p; /Active Channel:/p"
+  run_qmi --nas-get-signal-info | sed -n "/RSSI:/p; /RSRQ:/p; /RSRP:/p; /SNR:/p"
+  echo
+}
+
+modem_band_probe() {
+  mid="$(modem_id)"
+  [ -n "$mid" ] || {
+    echo "ModemManager modem not found"
+    return 1
+  }
+  input="$(normalize_bands "$1")"
+  [ -n "$input" ] || input="eutran-3|eutran-7|eutran-20"
+  original="$(current_bands)"
+  [ -n "$original" ] || original="$(supported_bands)"
+  echo "Original allowed bands: $original"
+  echo "Probe list: $input"
+  echo "WARNING: this temporarily changes allowed bands and may interrupt modem traffic."
+  echo
+
+  IFS='|'
+  for band in $input; do
+    case "$band" in
+      eutran-*) ;;
+      *) echo "Skip unsupported input token: $band"; continue ;;
+    esac
+    echo "Setting probe band: $band"
+    mmcli -m "$mid" --set-current-bands="$band" 2>&1 | sed -n '1,20p'
+    sleep 12
+    band_sample "$band"
+  done
+  unset IFS
+
+  echo "Restoring original allowed bands: $original"
+  mmcli -m "$mid" --set-current-bands="$original" 2>&1 | sed -n '1,20p'
+  sleep 8
+  echo
+  echo "--- restored state ---"
+  modem_radio_status
+}
+
+modem_reconnect() {
+  /etc/init.d/modemmanager restart 2>&1
+  sleep 8
+  ifup modem_mm 2>&1
+  sleep 5
+  modem_full_status
+}
+
+network_check() {
+  echo "--- routes ---"
+  ip route 2>&1
+  echo
+  echo "--- dns ---"
+  nslookup ya.ru 2>&1
+  echo
+  echo "--- http ---"
+  timeout 12 curl -4 -sS -I https://ya.ru 2>&1 | sed -n '1,20p'
+}
+
+modem_fix_no_internet() {
+  echo "--- before ---"
+  network_check
+  echo
+  echo "--- reconnect modem_mm ---"
+  /usr/bin/modem-t77w968 connect 2>&1 | sed -n '1,160p'
+  echo
+  echo "--- after ---"
+  network_check
+}
+
+quick_status() {
+  echo "--- modem ---"
+  /usr/bin/modem-t77w968 status 2>&1 | sed -n '1,90p'
+  echo
+  echo "--- vpn ---"
+  /usr/bin/vpnctl status 2>&1 | sed -n '1,50p'
+}
+
+vpn_rules_overview() {
+  /usr/bin/vpnctl status 2>/dev/null | sed -n 's/^profiles: /PROFILES /p; s/^selected: /SELECTED /p'
+  for f in /etc/sing-box/rule-packs/enabled/*.rules; do
+    [ -e "$f" ] || continue
+    pack="$(basename "$f")"
+    echo "PACK file=$pack"
+    awk -v pack="$pack" '
+      {
+        line = $0
+        sub(/[ \t]*#.*/, "", line)
+        gsub(/^[ \t]+|[ \t]+$/, "", line)
+        if (line == "") next
+        n = split(line, p, /[ \t]+/)
+        if (p[1] == "rule") {
+          rule = p[2]
+          outbound = ""
+          next
+        }
+        if (p[1] == "outbound") {
+          outbound = p[2]
+          next
+        }
+        if (p[1] == "final") {
+          printf "FINAL pack=%s outbound=%s\n", pack, p[2]
+          next
+        }
+        if (p[1] == "domain" || p[1] == "domain_suffix" || p[1] == "domain_keyword" || p[1] == "ip_cidr" || p[1] == "rule_set" || p[1] == "ruleset") {
+          type = p[1]
+          for (i = 2; i <= n; i++) {
+            if (p[i] != "") printf "ITEM pack=%s rule=%s outbound=%s type=%s value=%s\n", pack, rule, outbound, type, p[i]
+          }
+        }
+      }
+    ' "$f"
+  done
+}
+
+vpn_rules_apply() {
+  cd /etc/sing-box/rule-packs || exit 1
+  ./apply-rules 2>&1
+}
+
+force_rule_path() {
+  case "$1" in
+    proxy) echo "/etc/sing-box/rule-packs/available/05-force-proxy.rules" ;;
+    direct) echo "/etc/sing-box/rule-packs/available/06-force-direct.rules" ;;
+    *) return 1 ;;
+  esac
+}
+
+subscription_path() {
+  case "$1" in
+    BLACK) echo /etc/sing-box/subscriptions.d/black.txt ;;
+    WHITE) echo /etc/sing-box/subscriptions.d/white.txt ;;
+    *) echo 'ERROR: unknown subscription profile' >&2; return 2 ;;
+  esac
+}
+
+validate_subscriptions() {
+  awk '
+    function invalid(message) { print "ERROR: line " NR ": " message; bad=1; exit 2 }
+    { line=$0; sub(/\r$/, "", line); sub(/[ \t]*#.*/, "", line); sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+    line == "" { next }
+    line ~ /^\[/ {
+      if (group != "" && urls == 0) invalid("subscription has no URLs")
+      if (line !~ /^\[[A-Za-z0-9_.-]+\]$/ || length(line)>82) invalid("use a unique name with letters, digits, dots, dashes or underscores")
+      if (seen[line]++) invalid("duplicate subscription name")
+      group=line; urls=0; count++; next
+    }
+    {
+      if (line ~ /[[:space:][:cntrl:]]/) invalid("URL contains whitespace or control characters")
+      if (line !~ /^https?:\/\/[^\/]+/ && line !~ /^file:\/\/\/etc\/sing-box\/manual-subscriptions\/(black|white)\//) invalid("expected http(s) URL or manual subscription file")
+      if (line ~ /^file:/ && line ~ /(^|\/)\.\.(\/|$)/) invalid("parent paths are not allowed")
+      if (group == "") count++
+      urls++
+    }
+    END { if (!bad && group != "" && urls == 0) { print "ERROR: subscription has no URLs"; exit 2 } if (!bad) print "groups=" count+0 }
+  ' "$1"
+}
+
+save_subscriptions() {
+  profile="$(url_decode "$(field profile)")"
+  path="$(subscription_path "$profile")" || return 2
+  revision="$(url_decode "$(field revision)")"
+  exec 9>/tmp/vpn-subscriptions.lock
+  flock -n 9 || { echo 'ERROR: subscription update is busy; try saving again shortly'; return 75; }
+  current_revision="$(sha256sum "$path" | cut -d' ' -f1)"
+  [ "$revision" = "$current_revision" ] || { echo 'ERROR: file changed in another session; reload the page before saving'; return 2; }
+  umask 077
+  draft="$path.new.$$"
+  printf '%s\n' "$CONTENT" | tr -d '\r' > "$draft" || return 1
+  if [ "$(wc -c < "$draft")" -gt 65536 ]; then rm -f "$draft"; echo 'ERROR: subscription file is too large'; return 2; fi
+  checked="$(validate_subscriptions "$draft")"
+  rc=$?
+  if [ "$rc" != 0 ]; then rm -f "$draft"; printf '%s\n' "$checked"; return "$rc"; fi
+  cp -p "$path" "$path.previous" || { rm -f "$draft"; return 1; }
+  mv "$draft" "$path" || return 1
+  revision="$(sha256sum "$path" | cut -d' ' -f1)"
+  logger -t router-control "saved $profile subscriptions $checked; active VPN unchanged"
+  printf 'SUBSCRIPTIONS_SAVED profile=%s %s revision=%s\n' "$profile" "$checked" "$revision"
+}
+
+save_vpn_intervals() {
+  hours="$(url_decode "$(field update_hours)")"
+  minutes="$(url_decode "$(field health_minutes)")"
+  for value in "$hours" "$minutes"; do
+    case "$value" in ''|*[!0-9]*) echo 'ERROR: periods must be whole numbers'; return 2 ;; esac
+    [ "${#value}" -le 4 ] || { echo 'ERROR: period is too large'; return 2; }
+  done
+  hours="$(printf '%s' "$hours" | sed 's/^0*//')"; hours="${hours:-0}"
+  minutes="$(printf '%s' "$minutes" | sed 's/^0*//')"; minutes="${minutes:-0}"
+  [ "$hours" -le 720 ] && [ "$minutes" -le 1440 ] || { echo 'ERROR: subscription period 0..720 hours, check period 0..1440 minutes'; return 2; }
+  settings=/etc/sing-box/vpn-config/vpn-settings.conf
+  umask 077
+  awk -v hours="$hours" -v minutes="$minutes" '
+    /^UPDATE_INTERVAL_HOURS=/ { print "UPDATE_INTERVAL_HOURS=" hours; update=1; next }
+    /^VPN_HEALTH_INTERVAL_MINUTES=/ { print "VPN_HEALTH_INTERVAL_MINUTES=" minutes; health=1; next }
+    { print }
+    END { if (!update) print "UPDATE_INTERVAL_HOURS=" hours; if (!health) print "VPN_HEALTH_INTERVAL_MINUTES=" minutes }
+  ' "$settings" > "$settings.new.$$" || { rm -f "$settings.new.$$"; return 1; }
+  mv "$settings.new.$$" "$settings" || return 1
+  printf 'UPDATE_INTERVAL_HOURS=%s\nVPN_HEALTH_INTERVAL_MINUTES=%s\n' "$hours" "$minutes"
+  echo 'Settings saved; scheduler reads them on the next minute tick. Active VPN was not restarted.'
+}
+
+save_force_rule() {
+  kind="$1"
+  content="$2"
+  path="$(force_rule_path "$kind")" || return 1
+  backup="/tmp/$(basename "$path").bak.$$"
+  cp "$path" "$backup" 2>/dev/null || true
+  printf '%s\n' "$content" | tr -d '\r' > "$path"
+  if /etc/sing-box/rule-packs/apply-rules; then
+    rm -f "$backup"
+    echo "Saved and applied: $path"
+  else
+    [ -f "$backup" ] && cp "$backup" "$path"
+    rm -f "$backup"
+    echo "ERROR: rule check failed; previous file restored: $path"
+    return 1
+  fi
+}
+
+esc() {
+  printf '%s' "${1:---}" | html_escape
+}
+
+item() {
+  label="$1"
+  value="$2"
+  hint="$3"
+  cat <<EOF
+<div class="item">
+  <div class="item-label">$(esc "$label")</div>
+  <div class="item-value">$(esc "$value")</div>
+  <div class="item-hint">$(esc "$hint")</div>
+</div>
+EOF
+}
+
+badge() {
+  class="$1"
+  text="$2"
+  cat <<EOF
+<span class="badge $class">$(esc "$text")</span>
+EOF
+}
+
+tab_current() {
+  [ "$ACTIVE_TAB" = "$1" ] && printf 'aria-current="page"'
+}
+
+action_result_class() {
+  [ "${RC:-0}" != "0" ] && echo "bad" && return
+  printf '%s\n' "$OUTPUT" | grep -Eq '(^|[[:space:]])(error:|Error:|ERROR:|failed|Failed|FAILED|warning:|Warning:|WARNING:|not found|timeout|Timeout|invalid|Invalid|cannot|Cannot)' && echo "bad" || echo "ok"
+}
+
+result_block() {
+  [ -n "$ACTION" ] || return 0
+  class="$(action_result_class)"
+  if [ "$class" = "ok" ]; then
+    title="Команда выполнена"
+  else
+    title="Команда вернула ошибку или предупреждение"
+  fi
+  cat <<EOF
+<section class="result $class">
+  <div>
+    <strong>$(esc "$title")</strong>
+  </div>
+  $(result_summary)
+  <details>
+    <summary>Команда</summary>
+    <code>$(esc "$CMD")</code>
+  </details>
+  <details>
+    <summary>Показать raw output</summary>
+    <pre>
+EOF
+  printf '%s\n' "$OUTPUT" | html_escape
+  cat <<'EOF'
+    </pre>
+  </details>
+</section>
+EOF
+}
+
+result_summary_item() {
+  item "$1" "$2" "$3"
+}
+
+result_summary() {
+  case "$ACTION" in
+    net_check)
+      route="$(printf '%s\n' "$OUTPUT" | awk '/^default /{print; exit}')"
+      dns="$(printf '%s\n' "$OUTPUT" | grep -E 'Name:|Address [0-9]+:' | tr '\n' ' ')"
+      http="$(printf '%s\n' "$OUTPUT" | grep -m1 '^HTTP/')"
+      echo '<div class="status-grid">'
+      result_summary_item "Маршрут" "$route" "Default route, через который роутер выходит в интернет."
+      result_summary_item "DNS" "$dns" "Если есть Name/Address, резолвинг работает."
+      result_summary_item "HTTP" "$http" "HTTP-ответ от ya.ru. 200/301/302/403 означают, что TCP/HTTPS работает."
+      echo '</div>'
+      ;;
+    modem_radio|modem_band_set|modem_band_all|modem_band_probe|modem_band_b3|modem_band_b137)
+      band="$(printf '%s\n' "$OUTPUT" | sed -n "s/.*Active Band Class: '\\([^']*\\)'.*/\\1/p" | head -n 1)"
+      [ -n "$band" ] || band="$(printf '%s\n' "$OUTPUT" | sed -n 's/^band=eutran-\([0-9][0-9]*\)$/B\1/p; s/^BAND:\([0-9][0-9]*\).*/B\1/p' | head -n 1)"
+      channel="$(printf '%s\n' "$OUTPUT" | sed -n "s/.*Active Channel: *'\\([^']*\\)'.*/\\1/p" | head -n 1)"
+      [ -n "$channel" ] || channel="$(printf '%s\n' "$OUTPUT" | sed -n 's/^earfcn=//p; s/^CHANNEL:\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+      allowed="$(printf '%s\n' "$OUTPUT" | sed -n 's/^modem.generic.current-bands.value\[[0-9][0-9]*\][[:space:]]*: //p' | tr '\n' ' ')"
+      signal="$(printf '%s\n' "$OUTPUT" | awk '/RSSI:|RSRP:|RSRQ:|SNR:/{gsub(/\047/, ""); printf "%s ", $0}')"
+      [ -n "$signal" ] || signal="$(printf '%s\n' "$OUTPUT" | awk -F= '/^(current|rssi|rsrp|rsrq|sinr|snr)=/{printf "%s ", $0}')"
+      if [ "$ACTION" = "modem_band_probe" ]; then
+        carriers_label="Bands seen during probe"
+        carriers_hint="Это разные bands в последовательных пробах, не одновременная агрегация."
+      else
+        carriers_label="Active carriers"
+        carriers_hint="Считается по текущему QMI RF output. Один carrier означает, что активной CA в этом выводе не видно."
+      fi
+      carriers="$(printf '%s\n' "$OUTPUT" | sed -n "s/.*Active Band Class: '\\([^']*\\)'.*/\\1/p" | sort -u | wc -l | tr -d ' ')"
+      echo '<div class="status-grid">'
+      result_summary_item "Активный band" "$band / $channel" "Текущая LTE-частота после выполнения команды."
+      result_summary_item "Разрешенные bands" "$allowed" "Именно этот список задает band lock. Если тут только eutran-3, модем не должен сам уходить на B1/B7."
+      result_summary_item "$carriers_label" "$carriers" "$carriers_hint"
+      result_summary_item "Сигнал" "$signal" "RSSI/RSRP/RSRQ/SNR: чем лучше RSRP/RSRQ/SNR, тем стабильнее связь."
+      echo '</div>'
+      if [ "$ACTION" = "modem_band_probe" ]; then
+        printf '%s\n' "$OUTPUT" | awk '
+          BEGIN {
+            print "<div class=\"table-wrap\"><table><thead><tr><th>Probe band</th><th>Active band</th><th>Channel</th><th>Cell</th><th>RSSI</th><th>RSRP</th><th>RSRQ</th><th>SNR</th><th>CA?</th></tr></thead><tbody>"
+          }
+          /^### BAND / {
+            if (band != "") row()
+            probe=$3; active=""; channel=""; cell=""; rssi=""; rsrp=""; rsrq=""; snr=""; band=probe
+          }
+          /3GPP cell ID:/ { gsub(/\047/, ""); cell=$4 }
+          /Active Band Class:/ { gsub(/\047/, ""); active=$4 }
+          /Active Channel:/ { gsub(/\047/, ""); channel=$3 }
+          /RSSI:/ { gsub(/\047/, ""); rssi=$2 " " $3 }
+          /RSRP:/ { gsub(/\047/, ""); rsrp=$2 " " $3 }
+          /RSRQ:/ { gsub(/\047/, ""); rsrq=$2 " " $3 }
+          /SNR:/ { gsub(/\047/, ""); snr=$2 " " $3 }
+          function row() {
+            print "<tr><td>" probe "</td><td>" active "</td><td>" channel "</td><td>" cell "</td><td>" rssi "</td><td>" rsrp "</td><td>" rsrq "</td><td>" snr "</td><td>no, single-band probe</td></tr>"
+          }
+          END {
+            if (band != "") row()
+            print "</tbody></table></div>"
+          }
+        '
+      fi
+      ;;
+    modem_sim)
+      iccid="$(printf '%s\n' "$OUTPUT" | sed -n 's/^sim.properties.iccid[[:space:]]*: //p' | head -n 1)"
+      euicc="$(printf '%s\n' "$OUTPUT" | sed -n 's/.*Is eUICC: //p' | head -n 1)"
+      echo '<div class="status-grid">'
+      result_summary_item "ICCID" "$iccid" "Идентификатор текущей SIM."
+      result_summary_item "eUICC" "$euicc" "yes означает eSIM/eUICC, no означает обычную UICC по данным QMI."
+      echo '</div>'
+      ;;
+    modem_status|modem_recover|modem_connect|modem_qmi|modem_fix_no_internet|modem_mm_restart|modem_service_restart)
+      usb="$(printf '%s\n' "$OUTPUT" | sed -n 's/^usb_config=//p' | head -n 1)"
+      driver="$(printf '%s\n' "$OUTPUT" | grep -q 'qmi_wwan' && echo qmi_wwan || echo unknown)"
+      up="$(printf '%s\n' "$OUTPUT" | grep -q '"up": true' && echo up || echo unknown)"
+      ip="$(printf '%s\n' "$OUTPUT" | sed -n 's/.*"address": "\([^"]*\)".*/\1/p' | head -n 1)"
+      route="$(printf '%s\n' "$OUTPUT" | awk '/^default /{print; exit}')"
+      dns="$(printf '%s\n' "$OUTPUT" | grep -E 'Name:|Address [0-9]+:' | tr '\n' ' ')"
+      http="$(printf '%s\n' "$OUTPUT" | grep -m1 '^HTTP/')"
+      echo '<div class="status-grid">'
+      result_summary_item "USB/QMI" "config=$usb, driver=$driver" "Для этого модема рабочий вариант: config=1 и qmi_wwan."
+      result_summary_item "modem_mm" "$up" "up означает, что OpenWrt-интерфейс мобильного интернета поднят."
+      result_summary_item "IPv4" "$ip" "Адрес, полученный от оператора."
+      result_summary_item "Маршрут" "$route" "Default route после выполнения команды."
+      [ -n "$dns" ] && result_summary_item "DNS" "$dns" "Результат DNS-проверки, если команда ее выполняла."
+      [ -n "$http" ] && result_summary_item "HTTP" "$http" "HTTP-ответ, если команда проверяла HTTPS."
+      echo '</div>'
+      ;;
+    modem_profiles)
+      ip="$(printf '%s\n' "$OUTPUT" | sed -n 's/.*IPv4 address: //p' | head -n 1)"
+      apn="$(printf '%s\n' "$OUTPUT" | sed -n 's/.*APN: //p' | tail -n 1)"
+      echo '<div class="status-grid">'
+      result_summary_item "IPv4" "$ip" "Адрес, полученный у оператора."
+      result_summary_item "APN" "$apn" "APN из текущего профиля/LTE attach."
+      echo '</div>'
+      ;;
+    vpn_subscriptions_save)
+      if [ "$RC" = 0 ]; then
+        saved_revision="$(printf '%s\n' "$OUTPUT" | sed -n 's/.* revision=//p')"
+        printf '<p data-saved-revision="%s">Список сохранен. Узлы обновятся по расписанию или по кнопке «Обновить подписки». Текущее подключение сохранено.</p>\n' "$(esc "$saved_revision")"
+      else
+        result_summary_item "Сохранение не выполнено" "$OUTPUT" "Исходный файл не изменен; исправьте данные и повторите сохранение."
+      fi
+      ;;
+    vpn_settings_save)
+      hours="$(printf '%s\n' "$OUTPUT" | sed -n 's/^UPDATE_INTERVAL_HOURS=//p')"
+      minutes="$(printf '%s\n' "$OUTPUT" | sed -n 's/^VPN_HEALTH_INTERVAL_MINUTES=//p')"
+      if [ "$RC" = 0 ]; then
+        echo '<div class="status-grid">'
+        result_summary_item "Подписки" "$hours ч" "Период обновления кэша; 0 означает выключено."
+        result_summary_item "Проверка VPN" "$minutes мин" "Три неудачи подряд запускают выбор из актуального кэша; 0 означает выключено."
+        result_summary_item "Настройки" "Сохранены и применены" "Планировщик читает значения каждую минуту. Рабочее соединение не перезапущено."
+        echo '</div>'
+      fi
+      ;;
+    vpn_geo|vpn_exit_check)
+      geo_ip="$(printf '%s\n' "$OUTPUT" | sed -n 's/.*ip=\([^ ]*\).*/\1/p' | head -n 1)"
+      geo_country="$(printf '%s\n' "$OUTPUT" | sed -n 's/.*country=\([^ ]*\).*/\1/p' | head -n 1)"
+      geo_code="$(printf '%s\n' "$OUTPUT" | sed -n 's/.*code=\([^ ]*\).*/\1/p' | head -n 1)"
+      geo_city="$(printf '%s\n' "$OUTPUT" | sed -n 's/.*city=\([^ ]*\).*/\1/p' | head -n 1)"
+      geo_source="$(printf '%s\n' "$OUTPUT" | sed -n 's/.*source=\([^ ]*\).*/\1/p' | head -n 1)"
+      check="$(printf '%s\n' "$OUTPUT" | grep -m1 '^VPN_EXIT_')"
+      echo '<div class="status-grid">'
+      [ -n "$check" ] && result_summary_item "Проверка" "$check" "VPN_EXIT_OK означает, что текущая VPN-нода реально дала внешний IP. VPN_EXIT_FAILED означает, что выход через текущую ноду не подтвержден."
+      result_summary_item "IP выхода" "$geo_ip" "Публичный IP, который видят сайты при текущей маршрутизации."
+      result_summary_item "Страна" "$geo_country ($geo_code)" "Страна выхода по внешнему geo/IP-сервису."
+      result_summary_item "Город" "$geo_city" "Может быть unknown, если geo-сервис не отдал город."
+      result_summary_item "Источник" "$geo_source" "geo-service или ip-only означает реальную проверку внешним сервисом; node-title здесь не используется."
+      echo '</div>'
+      ;;
+    vpn_status|vpn_on|vpn_off|vpn_health|vpn_repair|vpn_update|vpn_mode_*|vpn_rules_*|vpn_sub_*|vpn_node_*)
+      vpn="$(printf '%s\n' "$OUTPUT" | sed -n 's/^VPN: //p' | head -n 1)"
+      profiles="$(printf '%s\n' "$OUTPUT" | sed -n 's/^profiles: //p' | head -n 1)"
+      selected="$(printf '%s\n' "$OUTPUT" | sed -n 's/^selected: //p' | head -n 1)"
+      node="$(printf '%s\n' "$OUTPUT" | awk '/last used node:/{getline; print; exit}')"
+      direct="$(printf '%s\n' "$OUTPUT" | grep -m1 'DIRECT_ALLOWLIST_')"
+      probe="$(printf '%s\n' "$OUTPUT" | grep -m1 'HTTP probe ')"
+      [ -n "$vpn" ] || vpn="$(/etc/init.d/sing-box status >/dev/null 2>&1 && echo running || echo stopped)"
+      echo '<div class="status-grid">'
+      result_summary_item "VPN" "$vpn" "running означает, что sing-box запущен."
+      result_summary_item "Профили" "$profiles" "Текущие профили подписок и правил."
+      result_summary_item "Выбор" "$selected" "Текущая подписка, нода и route_final."
+      result_summary_item "Нода" "$node" "Текущий выбор sing-box API; ICMP ping сам по себе не проверяет работу VPN."
+      [ -n "$direct" ] && result_summary_item "Белый список direct" "$direct" "DIRECT_ALLOWLIST_OK означает, что тестовый домен из allowlist работает напрямую даже при включенном VPN."
+      [ -n "$probe" ] && result_summary_item "VPN probe" "$probe" "HTTP probe OK означает, что текущая VPN-нода дает внешний доступ."
+      if [ "$ACTION" = "vpn_status" ]; then
+        exit_result="$(printf '%s\n' "$OUTPUT" | grep '^VPN_EXIT_' | tail -n 1)"
+        geo_ip="$(printf '%s\n' "$exit_result" | sed -n 's/.*ip=\([^ ]*\).*/\1/p')"
+        geo_country="$(printf '%s\n' "$exit_result" | sed -n 's/.*country=\(.*\) code=.*/\1/p')"
+        geo_city="$(printf '%s\n' "$exit_result" | sed -n 's/.*city=\(.*\) isp=.*/\1/p; /isp=/!s/.*city=\(.*\) source=.*/\1/p')"
+        case "$exit_result" in
+          VPN_EXIT_OK*) exit_status="Внешний IP получен через VPN" ;;
+          VPN_EXIT_FAILED*) exit_status="Выход через VPN не подтвержден: проверочные сервисы недоступны" ;;
+          *) exit_status="Проверка не выполнена: VPN выключен или команда завершилась с ошибкой" ;;
+        esac
+        result_summary_item "Проверка выхода" "$exit_status" "HTTP-проверка и геолокация независимы: сбой geo-сервиса не доказывает, что вся связь отсутствует."
+        result_summary_item "IP выхода" "$geo_ip" "Измеренный внешний IP через vpn-out, а не адрес из названия ноды."
+        result_summary_item "Страна выхода" "$geo_country" "По данным внешнего сервиса; unknown означает, что геолокация недоступна."
+        result_summary_item "Город выхода" "$geo_city" "По данным внешнего сервиса; город может быть неизвестен."
+      fi
+      echo '</div>'
+      case "$ACTION" in
+        vpn_rules_list)
+          printf '%s\n' "$OUTPUT" | awk '
+            BEGIN { print "<div class=\"table-wrap\"><table><thead><tr><th>Rule pack</th><th>Status</th><th>File</th></tr></thead><tbody>" }
+            /^[[:space:]]+[A-Za-z0-9_.-]+[[:space:]]+(enabled|disabled)[[:space:]]+file=/ {
+              file=$0; sub(/^.*file=/, "", file)
+              print "<tr><td>" $1 "</td><td>" $2 "</td><td>" file "</td></tr>"
+            }
+            END { print "</tbody></table></div>" }
+          '
+          ;;
+        vpn_rules_overview)
+          direct_count="$(printf '%s\n' "$OUTPUT" | grep -c '^ITEM .* outbound=direct ' || true)"
+          proxy_count="$(printf '%s\n' "$OUTPUT" | grep -c '^ITEM .* outbound=vpn-out ' || true)"
+          final_route="$(printf '%s\n' "$OUTPUT" | sed -n 's/^FINAL .*outbound=//p' | tail -n 1)"
+          echo '<div class="status-grid">'
+          result_summary_item "DIRECT правил" "$direct_count" "Домены/IP/ruleset, которые активные правила отправляют напрямую."
+          result_summary_item "VPN правил" "$proxy_count" "Домены/IP/ruleset, которые активные правила отправляют через vpn-out."
+          result_summary_item "Final" "$final_route" "Куда идет трафик, если ни одно правило выше не совпало."
+          echo '</div>'
+          printf '%s\n' "$OUTPUT" | awk '
+            function h(s) { gsub(/&/, "\\&amp;", s); gsub(/</, "\\&lt;", s); gsub(/>/, "\\&gt;", s); return s }
+            function kv(line, key, stopkey, x) {
+              x=line
+              sub("^.*" key "=", "", x)
+              if (stopkey != "") sub(" " stopkey "=.*$", "", x)
+              else sub(/[[:space:]][A-Za-z_]+=.*/, "", x)
+              return x
+            }
+            BEGIN { print "<div class=\"table-wrap\"><table><thead><tr><th>Файл</th><th>Правило</th><th>Маршрут</th><th>Тип</th><th>Значение</th></tr></thead><tbody>" }
+            /^ITEM / {
+              line=$0
+              print "<tr><td>" h(kv(line,"pack","rule")) "</td><td>" h(kv(line,"rule","outbound")) "</td><td>" h(kv(line,"outbound","type")) "</td><td>" h(kv(line,"type","value")) "</td><td>" h(kv(line,"value","")) "</td></tr>"
+            }
+            /^FINAL / {
+              line=$0
+              print "<tr><td>" h(kv(line,"pack","outbound")) "</td><td>final</td><td>" h(kv(line,"outbound","")) "</td><td>final</td><td>остальной трафик</td></tr>"
+            }
+            END { print "</tbody></table></div>" }
+          '
+          ;;
+        vpn_sub_list)
+          printf '%s\n' "$OUTPUT" | awk '
+            function h(s) { gsub(/&/, "\\&amp;", s); gsub(/</, "\\&lt;", s); gsub(/>/, "\\&gt;", s); return s }
+            function value(line, key) { x=line; sub("^.*" key "=", "", x); sub(/[[:space:]].*$/, "", x); return x }
+            BEGIN { print "<div class=\"table-wrap\"><table><thead><tr><th>#</th><th>ID</th><th>Nodes</th><th>Mirrors</th><th>Name</th></tr></thead><tbody>" }
+            /^[* ][[:space:]][0-9]+\./ {
+              line=$0
+              mark=(substr(line, 1, 1) == "*" ? "*" : "")
+              sub(/^[* ][[:space:]]*/, "", line)
+              split(line, cols, /[[:space:]]+/)
+              n=cols[1]; sub(/\.$/, "", n)
+              print "<tr><td>" h(mark n) "</td><td>" h(value($0, "id")) "</td><td>" h(value($0, "count")) "</td><td>" h(value($0, "mirrors")) "</td><td>" h(value($0, "name")) "</td></tr>"
+            }
+            END { print "</tbody></table></div>" }
+          '
+          ;;
+        vpn_node_list)
+          printf '%s\n' "$OUTPUT" | awk '
+            function h(s) { gsub(/&/, "\\&amp;", s); gsub(/</, "\\&lt;", s); gsub(/>/, "\\&gt;", s); return s }
+            function value(line, key) { x=line; sub("^.*" key "=", "", x); sub(/[[:space:]].*$/, "", x); return x }
+            BEGIN { print "<div class=\"table-wrap\"><table><thead><tr><th>#</th><th>Tag</th><th>Proto</th><th>Endpoint</th><th>Title</th></tr></thead><tbody>" }
+            /^[* ][[:space:]][0-9]+\./ {
+              line=$0
+              mark=(substr(line, 1, 1) == "*" ? "*" : "")
+              sub(/^[* ][[:space:]]*/, "", line)
+              split(line, cols, /[[:space:]]+/)
+              n=cols[1]; sub(/\.$/, "", n)
+              tag=value($0, "tag")
+              proto=value($0, "proto")
+              endpoint=value($0, "endpoint")
+              title=$0; sub(/^.*title=/, "", title)
+              print "<tr><td>" h(mark n) "</td><td>" h(tag) "</td><td>" h(proto) "</td><td>" h(endpoint) "</td><td>" h(title) "</td></tr>"
+            }
+            END { print "</tbody></table></div>" }
+          '
+          ;;
+        vpn_node_scan|vpn_node_bench)
+          printf '%s\n' "$OUTPUT" | awk '
+            function h(s) { gsub(/&/, "\\&amp;", s); gsub(/</, "\\&lt;", s); gsub(/>/, "\\&gt;", s); return s }
+            function kv(line, key, next, x) {
+              x=line
+              sub("^.*" key "=", "", x)
+              if (next != "") sub(" " next "=.*$", "", x)
+              else sub(/[[:space:]][A-Za-z_]+=.*/, "", x)
+              return x
+            }
+            BEGIN {
+              if ("'"$ACTION"'" == "vpn_node_bench")
+                print "<div class=\"table-wrap\"><table><thead><tr><th>#</th><th>Status</th><th>Speed</th><th>Ping</th><th>Tag</th><th>Proto</th><th>Endpoint</th><th>Country</th><th>City</th><th>Title</th></tr></thead><tbody>"
+              else
+                print "<div class=\"table-wrap\"><table><thead><tr><th>#</th><th>Status</th><th>Ping</th><th>TCP</th><th>Tag</th><th>Proto</th><th>Endpoint</th><th>Country</th><th>City</th><th>Title</th></tr></thead><tbody>"
+            }
+            /^[0-9]+\.[[:space:]]+tag=/ {
+              line=$0
+              n=line; sub(/\..*$/, "", n)
+              if ("'"$ACTION"'" == "vpn_node_bench")
+                print "<tr><td>" h(n) "</td><td>" h(kv(line,"status","speed_kbps")) "</td><td>" h(kv(line,"speed_kbps","bytes")) " kbps</td><td>" h(kv(line,"ping","endpoint")) "</td><td>" h(kv(line,"tag","proto")) "</td><td>" h(kv(line,"proto","status")) "</td><td>" h(kv(line,"endpoint","country")) "</td><td>" h(kv(line,"country","city")) "</td><td>" h(kv(line,"city","title")) "</td><td>" h(kv(line,"title","")) "</td></tr>"
+              else
+                print "<tr><td>" h(n) "</td><td>" h(kv(line,"status","ping")) "</td><td>" h(kv(line,"ping","tcp")) "</td><td>" h(kv(line,"tcp","endpoint")) "</td><td>" h(kv(line,"tag","proto")) "</td><td>" h(kv(line,"proto","status")) "</td><td>" h(kv(line,"endpoint","country")) "</td><td>" h(kv(line,"country","city")) "</td><td>" h(kv(line,"city","title")) "</td><td>" h(kv(line,"title","")) "</td></tr>"
+            }
+            END { print "</tbody></table></div>" }
+          '
+          ;;
+      esac
+      ;;
+  esac
+}
+
+render_modem_cards() {
+  mstat="$(/usr/bin/modem-t77w968 status 2>&1)"
+  mid="$(modem_id)"
+  mmkv=""
+  [ -n "$mid" ] && mmkv="$(mmcli -m "$mid" --output-keyvalue 2>/dev/null || true)"
+  ifjson="$(ifstatus modem_mm 2>/dev/null || true)"
+  qmi_serving="$(run_qmi --nas-get-serving-system)"
+  qmi_rf="$(run_qmi --nas-get-rf-band-info)"
+  qmi_signal="$(run_qmi --nas-get-signal-info)"
+  qmi_slot="$(run_qmi --uim-get-slot-status)"
+  sim_path="$(printf '%s\n' "$mmkv" | sed -n 's/^modem.generic.sim[[:space:]]*: //p' | head -n 1)"
+  simkv=""
+  [ -n "$sim_path" ] && simkv="$(mmcli -i "${sim_path##*/}" --output-keyvalue 2>/dev/null || true)"
+
+  usb_config="$(printf '%s\n' "$mstat" | sed -n 's/^usb_config=//p' | head -n 1)"
+  driver="$(printf '%s\n' "$mstat" | grep -q 'qmi_wwan' && echo qmi_wwan || echo unknown)"
+  mm_state="$(printf '%s\n' "$mmkv" | sed -n 's/^modem.generic.state[[:space:]]*: //p' | head -n 1)"
+  reg="$(printf '%s\n' "$qmi_serving" | sed -n "s/.*Registration state: '\\([^']*\\)'.*/\\1/p" | head -n 1)"
+  operator="$(printf '%s\n' "$qmi_serving" | sed -n "s/.*Description: '\\([^']*\\)'.*/\\1/p" | head -n 1)"
+  band="$(printf '%s\n' "$qmi_rf" | sed -n "s/.*Active Band Class: '\\([^']*\\)'.*/\\1/p" | head -n 1)"
+  channel="$(printf '%s\n' "$qmi_rf" | sed -n "s/.*Active Channel: *'\\([^']*\\)'.*/\\1/p" | head -n 1)"
+  cell="$(printf '%s\n' "$qmi_serving" | sed -n "s/.*3GPP cell ID: '\\([^']*\\)'.*/\\1/p" | head -n 1)"
+  tac="$(printf '%s\n' "$qmi_serving" | sed -n "s/.*LTE tracking area code: '\\([^']*\\)'.*/\\1/p" | head -n 1)"
+  rssi="$(printf '%s\n' "$qmi_signal" | sed -n "s/.*RSSI: '\\([^']*\\)'.*/\\1/p" | head -n 1)"
+  rsrp="$(printf '%s\n' "$qmi_signal" | sed -n "s/.*RSRP: '\\([^']*\\)'.*/\\1/p" | head -n 1)"
+  rsrq="$(printf '%s\n' "$qmi_signal" | sed -n "s/.*RSRQ: '\\([^']*\\)'.*/\\1/p" | head -n 1)"
+  snr="$(printf '%s\n' "$qmi_signal" | sed -n "s/.*SNR: '\\([^']*\\)'.*/\\1/p" | head -n 1)"
+  supported_lte="$(printf '%s\n' "$mmkv" | sed -n 's/^modem.generic.supported-bands.value\[[0-9][0-9]*\][[:space:]]*: eutran-/B/p' | tr '\n' ' ')"
+  current_lte="$(printf '%s\n' "$mmkv" | sed -n 's/^modem.generic.current-bands.value\[[0-9][0-9]*\][[:space:]]*: eutran-/B/p' | tr '\n' ' ')"
+  ip4="$(printf '%s\n' "$ifjson" | sed -n 's/.*"address": "\([^"]*\)".*/\1/p' | head -n 1)"
+  dns="$(printf '%s\n' "$ifjson" | awk '/"dns-server": \[/{f=1; next} f && /\]/{exit} f {gsub(/[",]/, ""); gsub(/^[ \t]+/, ""); if ($0 != "") print}' | tr '\n' ' ')"
+  iccid="$(printf '%s\n' "$simkv" | sed -n 's/^sim.properties.iccid[[:space:]]*: //p' | head -n 1)"
+  esim="$(printf '%s\n' "$qmi_slot" | sed -n 's/.*Is eUICC: //p' | head -n 1)"
+
+  cat <<EOF
+<section class="status-panel">
+  <div class="panel-title">
+    <h2>Модем</h2>
+    $( [ "$usb_config" = "1" ] && [ "$driver" = "qmi_wwan" ] && badge ok "QMI" || badge warn "проверь USB режим" )
+    $( [ "$reg" = "registered" ] && badge ok "сеть зарегистрирована" || badge warn "сеть не подтверждена" )
+  </div>
+  <div class="status-grid">
+EOF
+  item "USB режим" "config=$usb_config, driver=$driver" "Рабочий режим для этого роутера: config=1 и qmi_wwan."
+  item "ModemManager" "$mm_state" "Состояние глазами ModemManager. Иногда QMI уже работает, даже если тут disabled."
+  item "Оператор" "$operator" "Сеть, в которой зарегистрирован модем."
+  item "IPv4" "$ip4" "Адрес, полученный от оператора на modem_mm/wwan0."
+  item "Band / channel" "$band / $channel" "Текущая LTE-частота: band и номер канала."
+  item "Allowed LTE bands" "$current_lte" "Bands, которые сейчас разрешены модему. Если тут только B3, другие LTE bands заблокированы."
+  item "Supported LTE bands" "$supported_lte" "Bands, которые этот модем заявляет как поддерживаемые."
+  item "Cell / TAC" "$cell / $tac" "Текущая базовая станция и tracking area."
+  item "Сигнал" "RSSI $rssi, RSRP $rsrp, RSRQ $rsrq, SNR $snr" "Главные LTE-показатели качества радиоканала."
+  item "SIM / eUICC" "ICCID $iccid, eUICC $esim" "Если eUICC=no, текущая карта выглядит как обычная SIM."
+  item "DNS оператора" "$dns" "DNS, полученные через мобильное соединение."
+  cat <<'EOF'
+  </div>
+</section>
+EOF
+}
+
+render_vpn_cards() {
+  vstat="$(/usr/bin/vpnctl status 2>&1)"
+  running="$(printf '%s\n' "$vstat" | sed -n 's/^VPN: //p' | head -n 1)"
+  profiles="$(printf '%s\n' "$vstat" | sed -n 's/^profiles: //p' | head -n 1)"
+  selected="$(printf '%s\n' "$vstat" | sed -n 's/^selected: //p' | head -n 1)"
+  node="$(printf '%s\n' "$vstat" | awk '/last used node:/{getline; print; exit}')"
+  exit_line="$(printf '%s\n' "$vstat" | sed -n 's/^exit: //p' | head -n 1)"
+  events="$(printf '%s\n' "$vstat" | sed -n 's/^recent sing-box: //p' | head -n 1)"
+  tun="$(ip link show tun0 >/dev/null 2>&1 && echo present || echo absent)"
+  service="$(/etc/init.d/sing-box status >/dev/null 2>&1 && echo running || echo stopped)"
+
+  cat <<EOF
+<section class="status-panel">
+  <div class="panel-title">
+    <h2>VPN</h2>
+    $( [ "$running" = "running" ] && badge ok "включен" || badge warn "выключен" )
+    $( [ "$tun" = "present" ] && badge ok "tun0 есть" || badge warn "tun0 нет" )
+  </div>
+  <div class="status-grid">
+EOF
+  item "Режимы" "$profiles" "Профили подписок и правил."
+  item "Узел" "$node" "Текущий выбор sing-box."
+  location="$(printf '%s\n' "$exit_line" | sed -n 's/.*country=\(.*\) code=.*/\1/p')"
+  exit_ip="$(printf '%s\n' "$exit_line" | sed -n 's/.*ip=\([^ ]*\).*/\1/p')"
+  item "Последний выход" "${location:---} · ${exit_ip:---}" "Последняя проверка; обновить кнопкой проверки."
+  cat <<'EOF'
+  </div>
+  <details><summary>Технический статус</summary>
+EOF
+  printf '<pre>%s</pre></details>\n' "$(esc "$vstat")"
+  power_action=vpn_on; power_label='Включить VPN'; power_checked=false
+  if [ "$running" = running ]; then power_action=vpn_off; power_label='Отключить VPN'; power_checked=true; fi
+  cat <<EOF
+  <form method="post" class="power-form">
+    <input type="hidden" name="tab" value="vpn">
+    <input type="hidden" name="action" value="$power_action">
+    <button type="submit" role="switch" aria-checked="$power_checked" aria-label="VPN">$power_label</button>
+    <div class="inline-result"></div>
+  </form>
+</section>
+EOF
+}
+
+active_tab_for_action() {
+  case "$1" in
+    modem_*|net_check) echo modem ;;
+    vpn_*) echo vpn ;;
+    *) echo vpn ;;
+  esac
+}
+
+case "${CONTENT_LENGTH:-0}" in ''|*[!0-9]*) printf 'Status: 400 Bad Request\r\n\r\nInvalid request length\n'; exit 0 ;; esac
+if [ "${CONTENT_LENGTH:-0}" -gt "$MAX_BODY" ]; then
+  printf 'Status: 413 Content Too Large\r\n\r\nRequest too large; no files changed\n'; exit 0
+fi
+if [ "${REQUEST_METHOD:-}" = POST ] && [ -n "${HTTP_ORIGIN:-}" ]; then
+  case "$HTTP_ORIGIN" in "http://${HTTP_HOST:-}"|"https://${HTTP_HOST:-}") ;; *) printf 'Status: 403 Forbidden\r\n\r\nCross-origin request rejected\n'; exit 0 ;; esac
+fi
+POST_DATA="$(read_post)"
+ACTION="$(url_decode "$(field action)")"
+ARG="$(url_decode "$(field arg)")"
+CONTENT="$(url_decode "$(field content)")"
+AJAX="$(url_decode "$(field ajax)")"
+ACTIVE_TAB="$(url_decode "$(field tab)")"
+[ -n "$ACTIVE_TAB" ] || ACTIVE_TAB="$(printf '%s' "${QUERY_STRING:-}" | tr '&' '\n' | sed -n 's/^tab=//p' | head -n 1)"
+[ -n "$ACTIVE_TAB" ] || ACTIVE_TAB="$(active_tab_for_action "$ACTION")"
+case "$ACTIVE_TAB" in overview|modem|vpn) ;; *) ACTIVE_TAB=overview ;; esac
+if [ "$MODEM_ENABLED" != 1 ]; then
+  case "$ACTION" in modem_*|net_check)
+    printf 'Status: 403 Forbidden\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nModem module disabled\n'
+    exit 0
+    ;;
+  esac
+  [ "$ACTIVE_TAB" != modem ] || ACTIVE_TAB=vpn
+fi
+
+if ! allowed_remote; then
+  printf 'Status: 403 Forbidden\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nForbidden\n'
+  exit 0
+fi
+
+if [ "$ACTION" = vpn_snapshot ]; then
+  printf 'Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n\r\n'
+  render_vpn_cards
+  exit 0
+fi
+
+OUTPUT=""
+CMD=""
+RC=0
+if [ -n "$ACTION" ]; then
+  case "$ACTION" in
+    modem_status) CMD="/usr/bin/modem-t77w968 status
+mid=\$(mmcli -L | sed -n 's/.*\\/Modem\\/\\([0-9][0-9]*\\).*/\\1/p' | head -n 1)
+mmcli -m \"\$mid\"
+ifstatus modem_mm
+ip addr show wwan0
+ip route"; OUTPUT="$(modem_full_status 2>&1)" ;;
+    modem_radio) CMD="mid=\$(mmcli -L | sed -n 's/.*\\/Modem\\/\\([0-9][0-9]*\\).*/\\1/p' | head -n 1)
+mmcli -m \"\$mid\" --output-keyvalue
+mmcli -m \"\$mid\" --signal-get
+mmcli -m \"\$mid\" --location-get
+qmicli -p -d /dev/cdc-wdm0 --nas-get-serving-system
+qmicli -p -d /dev/cdc-wdm0 --nas-get-rf-band-info
+qmicli -p -d /dev/cdc-wdm0 --nas-get-signal-info"; OUTPUT="$(modem_radio_status 2>&1)" ;;
+    modem_sim) CMD="mid=\$(mmcli -L | sed -n 's/.*\\/Modem\\/\\([0-9][0-9]*\\).*/\\1/p' | head -n 1)
+sim=\$(mmcli -m \"\$mid\" --output-keyvalue | sed -n 's/^modem.generic.sim[[:space:]]*: //p' | head -n 1)
+mmcli -i \"\${sim##*/}\" --output-keyvalue
+qmicli -p -d /dev/cdc-wdm0 --uim-get-card-status
+qmicli -p -d /dev/cdc-wdm0 --uim-get-slot-status"; OUTPUT="$(modem_sim_status 2>&1)" ;;
+    modem_profiles) CMD="mid=\$(mmcli -L | sed -n 's/.*\\/Modem\\/\\([0-9][0-9]*\\).*/\\1/p' | head -n 1)
+mmcli -m \"\$mid\" --output-keyvalue
+qmicli -p -d /dev/cdc-wdm0 --wds-get-current-settings
+qmicli -p -d /dev/cdc-wdm0 --wds-get-profile-list=3gpp
+qmicli -p -d /dev/cdc-wdm0 --wds-get-lte-attach-parameters"; OUTPUT="$(modem_profiles_status 2>&1)" ;;
+    modem_band_set) CMD="mid=\$(mmcli -L | sed -n 's/.*\\/Modem\\/\\([0-9][0-9]*\\).*/\\1/p' | head -n 1)
+mmcli -m \"\$mid\" --set-current-bands=$ARG"; OUTPUT="$(modem_set_bands "$ARG" 2>&1)" ;;
+    modem_band_all) CMD="mid=\$(mmcli -L | sed -n 's/.*\\/Modem\\/\\([0-9][0-9]*\\).*/\\1/p' | head -n 1)
+bands=\$(mmcli -m \"\$mid\" --output-keyvalue | sed -n 's/^modem.generic.supported-bands.value\\[[0-9][0-9]*\\][[:space:]]*: //p' | awk 'NF { out = out ? out \"|\" \$0 : \$0 } END { print out }')
+mmcli -m \"\$mid\" --set-current-bands=\"\$bands\""; OUTPUT="$(modem_set_all_bands 2>&1)" ;;
+    modem_band_probe) CMD="mid=\$(mmcli -L | sed -n 's/.*\\/Modem\\/\\([0-9][0-9]*\\).*/\\1/p' | head -n 1)
+orig=\$(mmcli -m \"\$mid\" --output-keyvalue | sed -n 's/^modem.generic.current-bands.value\\[[0-9][0-9]*\\][[:space:]]*: //p' | awk 'NF { out = out ? out \"|\" \$0 : \$0 } END { print out }')
+for band in $ARG; do
+  mmcli -m \"\$mid\" --set-current-bands=eutran-\$band
+  sleep 12
+  qmicli -p -d /dev/cdc-wdm0 --nas-get-serving-system
+  qmicli -p -d /dev/cdc-wdm0 --nas-get-rf-band-info
+  qmicli -p -d /dev/cdc-wdm0 --nas-get-signal-info
+done
+mmcli -m \"\$mid\" --set-current-bands=\"\$orig\""; OUTPUT="$(modem_band_probe "$ARG" 2>&1)" ;;
+    modem_recover) CMD="/usr/bin/modem-t77w968 recover"; OUTPUT="$(run_limited /usr/bin/modem-t77w968 recover)" ;;
+    modem_connect) CMD="/usr/bin/modem-t77w968 connect"; OUTPUT="$(run_limited /usr/bin/modem-t77w968 connect)" ;;
+    modem_qmi) CMD="/usr/bin/modem-t77w968 qmi"; OUTPUT="$(run_limited /usr/bin/modem-t77w968 qmi)" ;;
+    modem_fix_no_internet) CMD="/usr/bin/modem-t77w968 connect; ip route; nslookup ya.ru; curl -4 -I https://ya.ru"; OUTPUT="$(modem_fix_no_internet 2>&1)" ;;
+    modem_mm_restart) CMD="/etc/init.d/modemmanager restart; ifup modem_mm"; OUTPUT="$(modem_reconnect 2>&1)" ;;
+    modem_service_restart) CMD="/etc/init.d/modem-t77w968-qmi restart"; OUTPUT="$(run_limited /etc/init.d/modem-t77w968-qmi restart; run_limited /etc/init.d/modem-t77w968-qmi status)" ;;
+    net_check) CMD="ip route; nslookup ya.ru; curl -4 -I https://ya.ru"; OUTPUT="$(network_check 2>&1)" ;;
+
+    vpn_status) CMD="/usr/bin/vpnctl status check"; OUTPUT="$(run_limited /usr/bin/vpnctl status check)" ;;
+    vpn_subscriptions_save) CMD="validate and atomically save /etc/sing-box/subscriptions.d/{black,white}.txt; no restart"; OUTPUT="$(save_subscriptions 2>&1)" ;;
+    vpn_settings_save) CMD="update UPDATE_INTERVAL_HOURS and VPN_HEALTH_INTERVAL_MINUTES in /etc/sing-box/vpn-config/vpn-settings.conf"; OUTPUT="$(save_vpn_intervals 2>&1)" ;;
+    vpn_on) CMD="/usr/bin/vpnctl on"; OUTPUT="$(run_limited /usr/bin/vpnctl on)" ;;
+    vpn_off) CMD="/usr/bin/vpnctl off"; OUTPUT="$(run_limited /usr/bin/vpnctl off)" ;;
+    vpn_repair) CMD="/usr/bin/vpn-health-check repair"; OUTPUT="$(run_limited /usr/bin/vpn-health-check repair)" ;;
+    vpn_update) CMD="/usr/bin/vpnctl update"; OUTPUT="$(run_limited /usr/bin/vpnctl update)" ;;
+    vpn_mode_black) CMD="/usr/bin/vpnctl mode BLACK"; OUTPUT="$(run_limited /usr/bin/vpnctl mode BLACK)" ;;
+    vpn_mode_white) CMD="/usr/bin/vpnctl mode WHITE"; OUTPUT="$(run_limited /usr/bin/vpnctl mode WHITE)" ;;
+    vpn_rules_black) CMD="/usr/bin/vpnctl rules profile BLACK"; OUTPUT="$(run_limited /usr/bin/vpnctl rules profile BLACK)" ;;
+    vpn_rules_white) CMD="/usr/bin/vpnctl rules profile WHITE"; OUTPUT="$(run_limited /usr/bin/vpnctl rules profile WHITE)" ;;
+    vpn_rules_list) CMD="/usr/bin/vpnctl rules list"; OUTPUT="$(run_limited /usr/bin/vpnctl rules list)" ;;
+    vpn_rules_overview) CMD="read /etc/sing-box/rule-packs/enabled/*.rules"; OUTPUT="$(vpn_rules_overview 2>&1)" ;;
+    vpn_rules_apply) CMD="/etc/sing-box/rule-packs/apply-rules"; OUTPUT="$(vpn_rules_apply 2>&1)" ;;
+    vpn_rules_save_proxy) CMD="save /etc/sing-box/rule-packs/available/05-force-proxy.rules; apply-rules"; OUTPUT="$(save_force_rule proxy "$CONTENT" 2>&1)" ;;
+    vpn_rules_save_direct) CMD="save /etc/sing-box/rule-packs/available/06-force-direct.rules; apply-rules"; OUTPUT="$(save_force_rule direct "$CONTENT" 2>&1)" ;;
+    vpn_sub_list) CMD="/usr/bin/vpnctl subscription list"; OUTPUT="$(run_limited /usr/bin/vpnctl subscription list)" ;;
+    vpn_sub_auto) CMD="/usr/bin/vpnctl subscription auto"; OUTPUT="$(run_limited /usr/bin/vpnctl subscription auto)" ;;
+    vpn_sub_next) CMD="/usr/bin/vpnctl subscription next"; OUTPUT="$(run_limited /usr/bin/vpnctl subscription next)" ;;
+    vpn_sub_set) CMD="/usr/bin/vpnctl subscription set $ARG"; OUTPUT="$(run_limited /usr/bin/vpnctl subscription set "$ARG")" ;;
+    vpn_node_list) CMD="/usr/bin/vpnctl node list"; OUTPUT="$(run_limited /usr/bin/vpnctl node list)" ;;
+    vpn_node_auto) CMD="/usr/bin/vpnctl node auto"; OUTPUT="$(run_limited /usr/bin/vpnctl node auto)" ;;
+    vpn_node_next) CMD="/usr/bin/vpnctl node next"; OUTPUT="$(run_limited /usr/bin/vpnctl node next)" ;;
+    vpn_node_prev) CMD="/usr/bin/vpnctl node prev"; OUTPUT="$(run_limited /usr/bin/vpnctl node prev)" ;;
+    vpn_node_set) CMD="/usr/bin/vpnctl node set $ARG"; OUTPUT="$(run_limited /usr/bin/vpnctl node set "$ARG")" ;;
+    vpn_node_test) CMD="/usr/bin/vpnctl node test current"; OUTPUT="$(run_limited /usr/bin/vpnctl node test current)" ;;
+    vpn_node_scan) CMD="/usr/bin/vpnctl node scan"; OUTPUT="$(run_limited /usr/bin/vpnctl node scan)" ;;
+    vpn_node_bench) CMD="/usr/bin/vpnctl node bench 60"; OUTPUT="$(run_limited /usr/bin/vpnctl node bench 60)" ;;
+    vpn_node_verify) CMD="/usr/bin/vpnctl node verify"; OUTPUT="$(run_limited /usr/bin/vpnctl node verify)" ;;
+    vpn_node_find) CMD="/usr/bin/vpnctl node find"; OUTPUT="$(run_limited /usr/bin/vpnctl node find)" ;;
+    vpn_node_pin) CMD="/usr/bin/vpnctl node pin"; OUTPUT="$(run_limited /usr/bin/vpnctl node pin)" ;;
+    *) CMD="unknown"; OUTPUT="Unknown action: $ACTION" ;;
+  esac
+  RC=$?
+  if [ -z "$OUTPUT" ]; then
+    if [ "$RC" -eq 0 ]; then
+      OUTPUT="OK: command completed with no output"
+    else
+      OUTPUT="ERROR: command failed with exit code $RC and no output"
+    fi
+  fi
+  case "$ACTION" in
+    vpn_*)
+      if ! printf '%s\n' "$OUTPUT" | grep -q '^VPN: '; then
+        OUTPUT="$OUTPUT
+
+--- status after action ---
+$(/usr/bin/vpnctl status 2>&1 | sed -n '1,90p')"
+      fi
+      ;;
+    modem_*|net_check)
+      if ! printf '%s\n' "$OUTPUT" | grep -q '^usb_config='; then
+        OUTPUT="$OUTPUT
+
+--- modem status after action ---
+$(/usr/bin/modem-t77w968 status 2>&1 | sed -n '1,140p')"
+      fi
+      ;;
+  esac
+fi
+
+if [ "$AJAX" = "1" ]; then
+  printf 'Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n\r\n'
+  result_block
+  exit 0
+fi
+
+button() {
+  tab="$1"
+  action="$2"
+  title="$3"
+  command="$4"
+  desc="$5"
+  cat <<EOF
+<form method="post" class="action-card">
+  <input type="hidden" name="tab" value="$tab">
+  <input type="hidden" name="action" value="$action">
+  <button type="submit">$title</button>
+  <div class="action-body">
+    <strong>$title</strong>
+    <p>$desc</p>
+    <details class="command-details">
+      <summary>Команда</summary>
+      <code>$command</code>
+    </details>
+  </div>
+  <div class="inline-result"></div>
+</form>
+EOF
+}
+
+button_arg() {
+  tab="$1"
+  action="$2"
+  title="$3"
+  command="$4"
+  desc="$5"
+  placeholder="$6"
+  cat <<EOF
+<form method="post" class="action-card">
+  <input type="hidden" name="tab" value="$tab">
+  <input type="hidden" name="action" value="$action">
+  <button type="submit">$title</button>
+  <div class="action-body">
+    <strong>$title</strong>
+    <input name="arg" placeholder="$placeholder">
+    <p>$desc</p>
+    <details class="command-details">
+      <summary>Команда</summary>
+      <code>$command</code>
+    </details>
+  </div>
+  <div class="inline-result"></div>
+</form>
+EOF
+}
+
+subscription_editor() {
+  profile="$1"
+  path="$(subscription_path "$profile")"
+  revision="$(sha256sum "$path" | cut -d' ' -f1)"
+  opened=""
+  [ "$profile" != "$(cat /etc/sing-box/vpn-config/vpn-subscription-profile 2>/dev/null)" ] || opened=open
+  cat <<EOF
+<details class="profile-editor" $opened>
+<summary>$profile</summary>
+<form method="post" class="subscription-form">
+<input type="hidden" name="tab" value="vpn">
+<input type="hidden" name="action" value="vpn_subscriptions_save">
+<input type="hidden" name="profile" value="$profile">
+<input type="hidden" name="revision" value="$revision">
+<details><summary>Исходный файл и комментарии</summary>
+<label>Список подписок $profile
+<textarea name="content" class="subscription-source" spellcheck="false">$(html_escape < "$path")</textarea></label>
+</details>
+<span class="save-state" data-save-state aria-live="polite"></span>
+<button type="submit">Сохранить список $profile</button>
+<div class="inline-result"></div>
+</form>
+</details>
+EOF
+}
+
+vpn_interval_editor() {
+  settings=/etc/sing-box/vpn-config/vpn-settings.conf
+  hours="$(sed -n 's/^UPDATE_INTERVAL_HOURS=//p' "$settings" | head -n 1)"
+  minutes="$(sed -n 's/^VPN_HEALTH_INTERVAL_MINUTES=//p' "$settings" | head -n 1)"
+  cat <<EOF
+<section class="section">
+<div class="panel-title"><h2>Автоматизация VPN</h2></div>
+<form method="post" class="editor-card">
+<input type="hidden" name="action" value="vpn_settings_save">
+<input type="hidden" name="tab" value="vpn">
+<label>Обновление подписок, часов <input type="number" name="update_hours" min="0" max="720" required value="$(esc "${hours:-1}")"></label>
+<label>Проверка соединения, минут <input type="number" name="health_minutes" min="0" max="1440" required value="$(esc "${minutes:-5}")"></label>
+<p>0 отключает соответствующую задачу. Обновление сохраняет подключение. Три неудачные проверки подряд запускают автоматический выбор из актуальных узлов.</p>
+<button type="submit">Сохранить периоды</button>
+<div class="inline-result"></div>
+</form>
+</section>
+EOF
+}
+
+rule_editor() {
+  kind="$1"
+  title="$2"
+  desc="$3"
+  action="$4"
+  path="$(force_rule_path "$kind")"
+  content="$(cat "$path" 2>/dev/null)"
+  cat <<EOF
+<form method="post" class="editor-card">
+  <input type="hidden" name="tab" value="vpn">
+  <input type="hidden" name="action" value="$action">
+  <label>$title</label>
+  <p>$desc</p>
+  <textarea name="content" spellcheck="false">$(printf '%s' "$content" | html_escape)</textarea>
+  <button type="submit">Сохранить и применить</button>
+  <details class="command-details">
+    <summary>Команда</summary>
+    <code>save $path</code>
+    <code>/etc/sing-box/rule-packs/apply-rules</code>
+  </details>
+  <div class="inline-result"></div>
+</form>
+EOF
+}
+
+printf 'Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n\r\n'
+cat <<'EOF'
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenWrtVPN</title>
+  <style>
+    :root { color-scheme: light; --bg: #eef2f4; --panel: #fff; --line: #d7dee3; --text: #182026; --muted: #64727d; --blue: #1769aa; --green: #1f7a4d; --amber: #9a6100; --red: #b12a34; }
+    body { margin: 0; font: 14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; color: var(--text); background: var(--bg); }
+    header { padding: 18px 22px; background: #13202b; color: #fff; }
+    main { padding: 16px 20px 28px; max-width: 1220px; margin: 0 auto; }
+    h1 { margin: 0; font-size: 22px; }
+    h2 { margin: 0; font-size: 18px; }
+    h3 { margin: 22px 0 10px; font-size: 15px; color: #273541; }
+    p { margin: 7px 0 0; color: var(--muted); }
+    code { display: block; margin-top: 6px; color: #384650; overflow-wrap: anywhere; white-space: pre-wrap; font-size: 12px; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 10px 0 0; background: #101820; color: #eef4f8; padding: 12px; border-radius: 6px; font-size: 12px; }
+    input[type=radio] { position: absolute; left: -9999px; }
+    .tabs { display: flex; gap: 8px; margin: 14px 0; flex-wrap: wrap; }
+    .tabs label { padding: 9px 13px; border: 1px solid var(--line); border-radius: 6px; background: #fff; cursor: pointer; font-weight: 700; }
+    #tab-overview:checked ~ .tabs label[for=tab-overview], #tab-modem:checked ~ .tabs label[for=tab-modem], #tab-vpn:checked ~ .tabs label[for=tab-vpn] { background: var(--blue); border-color: var(--blue); color: #fff; }
+    .tab { display: block; }
+    #tab-overview:checked ~ .tab-overview, #tab-modem:checked ~ .tab-modem, #tab-vpn:checked ~ .tab-vpn { display: block; }
+    .status-panel, .result, .section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; margin-bottom: 14px; }
+    .panel-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+    .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }
+    .item { border: 1px solid #e3e8ec; border-radius: 7px; padding: 10px; background: #fbfcfd; min-height: 82px; }
+    .item-label { color: var(--muted); font-size: 12px; }
+    .item-value { margin-top: 4px; font-weight: 750; overflow-wrap: anywhere; }
+    .item-hint { margin-top: 6px; color: var(--muted); font-size: 12px; }
+    .badge { display: inline-flex; align-items: center; border-radius: 999px; padding: 3px 8px; color: #fff; font-size: 12px; font-weight: 750; }
+    .badge.ok { background: var(--green); }
+    .badge.warn { background: var(--amber); }
+    .badge.bad { background: var(--red); }
+    .actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; }
+    .action-card { display: flex; flex-direction: column; gap: 9px; background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+    button { width: 100%; border: 0; border-radius: 6px; background: var(--blue); color: #fff; padding: 10px; font-weight: 800; cursor: pointer; min-height: 42px; white-space: normal; overflow-wrap: anywhere; }
+    .action-body strong { display: block; }
+    .action-card input { box-sizing: border-box; width: 100%; margin-top: 7px; padding: 8px; border: 1px solid #c8d0d7; border-radius: 5px; }
+    .inline-result { margin-top: 2px; }
+    .inline-result:empty { display: none; }
+    .action-card .result, .editor-card .result { margin: 0; }
+    textarea { box-sizing: border-box; width: 100%; min-height: 190px; margin-top: 9px; padding: 9px; border: 1px solid #c8d0d7; border-radius: 6px; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; color: #182026; background: #fbfcfd; }
+    .table-wrap { overflow-x: auto; margin-top: 10px; }
+    table { width: 100%; border-collapse: collapse; background: #fff; }
+    th, td { border: 1px solid #dfe5ea; padding: 7px 8px; text-align: left; white-space: nowrap; }
+    th { background: #eef3f6; color: #273541; }
+    .editor-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 10px; }
+    .editor-card { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+    .editor-card label { display: block; font-weight: 800; }
+    .group-title { margin: 18px 0 8px; color: #273541; font-size: 15px; }
+    .command-details { margin-top: 8px; }
+    .command-details summary { font-size: 12px; }
+    .result.ok { border-left: 5px solid var(--green); }
+    .result.bad { border-left: 5px solid var(--red); }
+    details { margin-top: 10px; }
+    summary { cursor: pointer; color: var(--blue); font-weight: 750; }
+  </style>
+  <link rel="stylesheet" href="/vpn.css">
+</head>
+<body>
+<header>
+  <h1>OpenWrtVPN</h1>
+</header>
+<main>
+EOF
+
+cat <<EOF
+<nav class="tabs">
+  <a href="?tab=overview" $(tab_current overview)>Обзор</a>
+  $([ "$MODEM_ENABLED" != 1 ] || printf '<a href="?tab=modem" %s>Модем</a>' "$(tab_current modem)")
+  <a href="?tab=vpn" $(tab_current vpn)>VPN</a>
+</nav>
+EOF
+
+if [ "$ACTIVE_TAB" = overview ]; then
+echo '<section class="tab tab-overview">'
+[ "$MODEM_ENABLED" != 1 ] || render_modem_cards
+render_vpn_cards
+echo '</section>'
+fi
+
+if [ "$ACTIVE_TAB" = modem ]; then
+echo '<section class="tab tab-modem">'
+render_modem_cards
+cat <<'EOF'
+<section class="section">
+<div class="panel-title"><h2>Восстановление</h2></div>
+<div class="actions">
+EOF
+button modem net_check "Проверить интернет" "ip route; nslookup ya.ru; curl -4 -I https://ya.ru" "Сначала нажимать это: проверяет маршрут, DNS и HTTPS с самого роутера."
+button modem modem_fix_no_internet "Нет интернета: переподключить" "/usr/bin/modem-t77w968 connect; ip route; nslookup ya.ru; curl -4 -I https://ya.ru" "Мягко перезапускает ModemManager/netifd без смены USB-режима и без AT/NV-команд."
+button modem modem_mm_restart "Restart ModemManager" "/etc/init.d/modemmanager restart; ifup modem_mm" "Полный мягкий перезапуск ModemManager и modem_mm. Использовать, если обычное переподключение не помогло."
+button modem modem_recover "Восстановить QMI режим" "/usr/bin/modem-t77w968 recover" "Использовать после обрыва питания, если USB mode снова стал не QMI."
+button modem modem_status "Полный статус" "/usr/bin/modem-t77w968 status; mmcli -m <id>; ifstatus modem_mm; ip route" "USB/QMI/ModemManager/маршруты. Главная кнопка для диагностики, если непонятно, что сломалось."
+button modem modem_band_all "Вернуть все bands" "mid=\$(mmcli -L | sed -n 's/.*\\/Modem\\/\\([0-9][0-9]*\\).*/\\1/p' | head -n 1)
+bands=\$(mmcli -m \"\$mid\" --output-keyvalue | sed -n 's/^modem.generic.supported-bands.value\\[[0-9][0-9]*\\][[:space:]]*: //p' | awk 'NF { out = out ? out \"|\" \$0 : \$0 } END { print out }')
+mmcli -m \"\$mid\" --set-current-bands=\"\$bands\"" "Снимает band lock. Это сейчас стабильный режим: data bearer поднялся именно после возврата всех bands."
+cat <<'EOF'
+</div>
+</section>
+<section class="section">
+<div class="panel-title"><h2>Диагностика</h2></div>
+<div class="actions">
+EOF
+button modem modem_radio "Радио и сота" "qmicli -p -d /dev/cdc-wdm0 --nas-get-serving-system
+qmicli -p -d /dev/cdc-wdm0 --nas-get-rf-band-info
+qmicli -p -d /dev/cdc-wdm0 --nas-get-signal-info" "Быстрая QMI-диагностика текущего band/channel/cell/signal."
+button modem modem_profiles "APN / bearer profiles" "qmicli -p -d /dev/cdc-wdm0 --wds-get-current-settings
+qmicli -p -d /dev/cdc-wdm0 --wds-get-profile-list=3gpp
+qmicli -p -d /dev/cdc-wdm0 --wds-get-lte-attach-parameters" "APN/IP/DNS и 3GPP profiles. Обычно не нужен для скорости."
+button modem modem_sim "SIM / eUICC status" "mmcli -i <sim>; qmicli -p -d /dev/cdc-wdm0 --uim-get-card-status" "SIM/eUICC/PIN/ICCID. Обычно не нужен для восстановления интернета."
+cat <<'EOF'
+</div>
+</section>
+<section class="section">
+<div class="panel-title"><h2>Band lock</h2></div>
+<p>Advanced. Manual band lock может оборвать data bearer. Если интернет пропал после lock, нажать `Вернуть все bands`, затем `Нет интернета: переподключить`.</p>
+<div class="actions">
+EOF
+button_arg modem modem_band_set "Установить bands" "mid=\$(mmcli -L | sed -n 's/.*\\/Modem\\/\\([0-9][0-9]*\\).*/\\1/p' | head -n 1)
+mmcli -m \"\$mid\" --set-current-bands=<bands>" "Примеры: 3, eutran-3, eutran-3 eutran-7. Если указать только B3, модем не сможет использовать B7." "3 или eutran-3 eutran-7"
+cat <<'EOF'
+</div>
+</section>
+EOF
+case "$ACTION" in modem_*|net_check) result_block ;; esac
+echo '<div id="modem-result" class="ajax-result"></div>'
+echo '</section>'
+fi
+
+if [ "$ACTIVE_TAB" = vpn ]; then
+echo '<section class="tab tab-vpn">'
+cat <<'EOF'
+<nav class="vpn-nav" aria-label="Разделы VPN">
+<a href="#vpn-connection">VPN</a><a href="#vpn-subscriptions">Подписки</a><a href="#vpn-nodes">Узлы</a><a href="#vpn-rules">Правила</a><a href="#vpn-settings">Ещё</a>
+</nav>
+<section id="vpn-connection" class="vpn-view">
+<div id="vpn-summary">
+EOF
+render_vpn_cards
+cat <<'EOF'
+ </div>
+<section class="section">
+<div class="panel-title"><h2>Проверка и восстановление</h2></div>
+<div class="actions">
+EOF
+button vpn vpn_status "Проверить подключение" "/usr/bin/vpnctl status check" "HTTPS, внешний IP и страна выхода. Без смены узла."
+button vpn vpn_repair "Починить VPN-интернет" "/usr/bin/vpn-health-check repair" "Проверяет VPN и прямой выход. При сбое один раз загружает актуальный кеш, после чего узел выбирает sing-box."
+cat <<'EOF'
+</div>
+<h3 class="group-title">Режим подключения</h3>
+<div class="actions">
+EOF
+button vpn vpn_mode_black "BLACK" "/usr/bin/vpnctl mode BLACK" "Режим черных списков. Меняет подписки и правила; соединения могут прерваться."
+button vpn vpn_mode_white "WHITE" "/usr/bin/vpnctl mode WHITE" "Режим белых списков. Меняет подписки и правила; соединения могут прерваться."
+cat <<'EOF'
+</div>
+</section>
+</section>
+<section id="vpn-subscriptions" class="vpn-view">
+<h2>Подписки</h2>
+<p>Выше в списке — выше приоритет. Адреса одной группы — зеркала одной подписки. Сохранение не прерывает VPN.</p>
+EOF
+subscription_editor BLACK
+subscription_editor WHITE
+cat <<'EOF'
+<div class="actions">
+EOF
+button vpn vpn_update "Обновить узлы из подписок" "/usr/bin/vpnctl update" "Загружает узлы через VPN. Сохраняет рабочее подключение."
+cat <<'EOF'
+</div>
+<details class="advanced"><summary>Выбор источника узлов</summary>
+<div class="actions">
+EOF
+button vpn vpn_sub_list "Список подписок" "/usr/bin/vpnctl subscription list" "Показывает группы подписок текущего профиля."
+button vpn vpn_sub_auto "Автовыбор подписки" "/usr/bin/vpnctl subscription auto" "Возвращает автоматический выбор подписки и пересобирает config."
+button vpn vpn_sub_next "Следующая подписка" "/usr/bin/vpnctl subscription next" "Переключает на следующую группу подписок текущего профиля и пересобирает config."
+button_arg vpn vpn_sub_set "Выбрать подписку" "/usr/bin/vpnctl subscription set <name-or-number>" "Переключает на указанную подписку, например white-01 или 1, и пересобирает config." "white-01 или 1"
+cat <<'EOF'
+</div>
+</details>
+</section>
+<section id="vpn-nodes" class="vpn-view">
+<h2>Узлы</h2>
+<div class="actions">
+EOF
+button vpn vpn_node_list "Список нод" "/usr/bin/vpnctl node list" "Показывает ноды текущей подписки."
+button vpn vpn_node_auto "Автовыбор из свежего кэша" "/usr/bin/vpnctl node auto" "Применяет свежий кэш. Соединения могут кратковременно прерваться."
+button vpn vpn_node_verify "Проверить текущий выход" "/usr/bin/vpnctl node verify" "Проверяет HTTPS через текущий узел без переключения."
+cat <<'EOF'
+</div>
+<details class="advanced"><summary>Ручной выбор узла</summary><div class="actions">
+EOF
+button vpn vpn_node_next "Следующая нода" "/usr/bin/vpnctl node next" "Переключает на следующую ноду текущей подписки и пересобирает config."
+button vpn vpn_node_prev "Предыдущая нода" "/usr/bin/vpnctl node prev" "Переключает на предыдущую ноду текущей подписки и пересобирает config."
+button_arg vpn vpn_node_set "Выбрать ноду" "/usr/bin/vpnctl node set <number>" "Переключает на ноду по номеру из списка node list и пересобирает config." "57"
+button vpn vpn_node_test "Тест текущей ноды" "/usr/bin/vpnctl node test current" "Проверяет текущую выбранную ноду."
+button vpn vpn_node_scan "Быстрый scan нод" "/usr/bin/vpnctl node scan" "Безопасно проверяет endpoint-доступность текущей подписки: ping и TCP connect, без переключения нод и без restart sing-box."
+button vpn vpn_node_pin "Зафиксировать текущую" "/usr/bin/vpnctl node pin" "Фиксирует текущий выбранный узел."
+cat <<'EOF'
+</div></details>
+<details class="advanced"><summary>Тесты с разрывом соединений</summary><div class="actions">
+EOF
+button vpn vpn_node_bench "Опасный speed bench" "/usr/bin/vpnctl node bench 60" "Опасная проверка: по очереди переключает до 60 нод, перезапускает sing-box, мерит короткую загрузку по недиректному URL и оставляет лучшую российскую ноду из успешных. Yandex/direct URL для bench запрещены."
+button vpn vpn_node_find "Найти лучшую ноду" "/usr/bin/vpnctl node find" "Долгий ручной поиск: проверяет ноды с пересборкой config, во время поиска может рваться клиентский интернет."
+cat <<'EOF'
+</div></details>
+</section>
+<section id="vpn-rules" class="vpn-view">
+<h2>Маршрутизация</h2>
+<div class="actions">
+EOF
+button vpn vpn_rules_overview "Что идет напрямую и через VPN" "read /etc/sing-box/rule-packs/enabled/*.rules" "Показывает активные домены, IP и наборы правил."
+button vpn vpn_rules_list "Включенные наборы правил" "/usr/bin/vpnctl rules list" "Список доступных и включенных наборов."
+cat <<'EOF'
+</div>
+<details class="advanced"><summary>Переключить только профиль правил</summary><div class="actions">
+EOF
+button vpn vpn_rules_black "Правила BLACK" "/usr/bin/vpnctl rules profile BLACK" "Меняет правила, сохраняя профиль подписок."
+button vpn vpn_rules_white "Правила WHITE" "/usr/bin/vpnctl rules profile WHITE" "Меняет правила, сохраняя профиль подписок."
+button vpn vpn_rules_apply "Применить файлы правил" "/etc/sing-box/rule-packs/apply-rules" "Проверяет и применяет изменения; соединения могут прерваться."
+cat <<'EOF'
+</div></details>
+<h3>Личные правила</h3>
+<p>`force proxy` выполняется раньше основных BLACK/WHITE правил и отправляет совпадения в VPN. `force direct` отправляет совпадения напрямую. После сохранения файл проверяется через apply-rules; при ошибке старое содержимое восстанавливается.</p>
+<div class="editor-grid">
+EOF
+rule_editor proxy "Обязательно через VPN" "Домены и IP с приоритетом перед основными правилами." vpn_rules_save_proxy
+rule_editor direct "Обязательно напрямую" "Домены и IP, которым не нужен прокси." vpn_rules_save_direct
+cat <<'EOF'
+</div>
+</section>
+<section id="vpn-settings" class="vpn-view">
+EOF
+vpn_interval_editor
+echo '</section>'
+case "$ACTION" in vpn_*) result_block ;; esac
+echo '<div id="vpn-result" class="ajax-result"></div>'
+cat <<'EOF'
+</section>
+EOF
+fi
+cat <<'EOF'
+</main>
+<script src="/vpn.js"></script>
+<script>
+(function () {
+  function resultTarget(form) {
+    var target = form.querySelector('.inline-result');
+    if (target) return target;
+    var tab = new FormData(form).get('tab') || 'overview';
+    return document.getElementById(tab + '-result');
+  }
+
+  function requestUrl(form) {
+    return form.getAttribute('action') || window.location.pathname;
+  }
+
+  document.addEventListener('submit', function (event) {
+    var form = event.target;
+    if (!form.matches('form')) return;
+    var target = resultTarget(form);
+    if (!target || !window.fetch || !window.FormData) return;
+
+    event.preventDefault();
+    var data = new FormData(form);
+    data.set('ajax', '1');
+    var controls = Array.from(form.elements).map(function (element) { return { element: element, disabled: element.disabled }; });
+    controls.forEach(function (entry) { entry.element.disabled = true; });
+    target.innerHTML = '<section class="result"><strong>Выполняется...</strong></section>';
+
+    fetch(requestUrl(form), {
+      method: 'POST',
+      body: new URLSearchParams(data),
+      credentials: 'same-origin'
+    }).then(function (response) {
+      return response.text().then(function (html) {
+        if (!response.ok) throw new Error('HTTP ' + response.status + ': ' + html.slice(0, 200));
+        return html;
+      });
+    }).then(function (html) {
+      target.innerHTML = html;
+      var saved = target.querySelector('[data-saved-revision]');
+      if (saved) {
+        form.querySelector('[name=revision]').value = saved.dataset.savedRevision;
+        form.dispatchEvent(new Event('subscription-saved'));
+      }
+      if (!target.querySelector('.result.bad') && form.closest('.tab-vpn')) {
+        fetch(requestUrl(form), { method: 'POST', body: 'action=vpn_snapshot&tab=vpn',
+          headers: {'Content-Type':'application/x-www-form-urlencoded'}, credentials:'same-origin'
+        }).then(function (response) { return response.text(); }).then(function (summary) {
+          var panel = document.getElementById('vpn-summary');
+          if (panel) panel.innerHTML = summary;
+        }).catch(function () {});
+      }
+      target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }).catch(function (error) {
+      target.innerHTML = '<section class="result bad"><strong>Ошибка AJAX</strong><pre>' +
+        String(error).replace(/[&<>]/g, function (c) { return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]; }) +
+        '</pre></section>';
+    }).finally(function () {
+      controls.forEach(function (entry) { entry.element.disabled = entry.disabled; });
+    });
+  });
+}());
+</script>
+</body>
+</html>
+EOF

@@ -1,0 +1,39 @@
+#!/bin/sh
+set -eu
+
+RULES_PROFILE_FILE="/etc/sing-box/vpn-config/vpn-rules-profile"
+LEGACY_MODE_FILE="/etc/sing-box/vpn-config/vpn-mode"
+
+usage() {
+  echo "Usage: $0 [BLACK|WHITE]" >&2
+  exit 2
+}
+
+upper() {
+  printf '%s' "$1" | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+}
+
+profile="${1:-}"
+if [ -z "$profile" ]; then
+  if [ -s "$RULES_PROFILE_FILE" ]; then
+    profile="$(sed -n '1p' "$RULES_PROFILE_FILE")"
+  elif [ -s "$LEGACY_MODE_FILE" ]; then
+    profile="$(sed -n '1p' "$LEGACY_MODE_FILE")"
+  else
+    profile="BLACK"
+  fi
+fi
+
+profile="$(upper "$profile")"
+case "$profile" in
+  BLACK|WHITE) ;;
+  *) usage ;;
+esac
+
+echo "Checking rule packs for $profile..."
+/usr/bin/vpn-subscriptions-update check "$profile"
+
+echo "Applying rule packs for $profile..."
+/usr/bin/vpn-subscriptions-update rebuild "$profile"
+
+echo "Done. Active rules profile: $profile"

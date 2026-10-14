@@ -1,0 +1,5 @@
+# Add your own subscription URLs in the panel or here.
+# Groups are ordered by priority; URLs in one group are mirrors.
+# [provider]
+# https://example.org/your-private-subscription
+# https://mirror.example.org/the-same-subscription

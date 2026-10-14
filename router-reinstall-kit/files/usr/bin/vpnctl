@@ -1,0 +1,1339 @@
+#!/bin/sh
+set -eu
+
+SUB_PROFILE_FILE="/etc/sing-box/vpn-config/vpn-subscription-profile"
+RULES_PROFILE_FILE="/etc/sing-box/vpn-config/vpn-rules-profile"
+LEGACY_MODE_FILE="/etc/sing-box/vpn-config/vpn-mode"
+GROUP_FILE="/etc/sing-box/vpn-config/vpn-group"
+NODE_FILE="/etc/sing-box/vpn-config/vpn-node"
+SUB_DIR="/etc/sing-box/subscriptions.d"
+CACHE_DIR="/etc/sing-box/subscriptions-cache"
+MANUAL_SUB_DIR="/etc/sing-box/manual-subscriptions"
+RULE_PACK_AVAILABLE="/etc/sing-box/rule-packs/available"
+RULE_PACK_ENABLED="/etc/sing-box/rule-packs/enabled"
+PREFERRED_NODE_DIR="/etc/sing-box/preferred-nodes"
+AUTO_UPDATE_STATE_FILE="/etc/sing-box/subscriptions-cache/last-auto-update"
+CHECK_URL="https://www.gstatic.com/generate_204"
+GEO_CACHE_FILE="/tmp/vpn-exit-geo"
+BENCH_URL_DEFAULT="https://cachefly.cachefly.net/1mb.test"
+
+upper() {
+  printf '%s' "$1" | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+}
+
+lower() {
+  printf '%s' "$1" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz'
+}
+
+valid_profile() {
+  case "$(upper "$1")" in
+    BLACK|WHITE) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+subscription_profile() {
+  if [ -s "$SUB_PROFILE_FILE" ]; then
+    profile="$(upper "$(sed -n '1p' "$SUB_PROFILE_FILE")")"
+  elif [ -s "$LEGACY_MODE_FILE" ]; then
+    profile="$(upper "$(sed -n '1p' "$LEGACY_MODE_FILE")")"
+  else
+    profile="BLACK"
+  fi
+  valid_profile "$profile" || profile="BLACK"
+  echo "$profile"
+}
+
+rules_profile() {
+  if [ -s "$RULES_PROFILE_FILE" ]; then
+    profile="$(upper "$(sed -n '1p' "$RULES_PROFILE_FILE")")"
+  elif [ -s "$LEGACY_MODE_FILE" ]; then
+    profile="$(upper "$(sed -n '1p' "$LEGACY_MODE_FILE")")"
+  else
+    profile="BLACK"
+  fi
+  case "$profile" in
+    BLACK|WHITE|CUSTOM) ;;
+    *) profile="BLACK" ;;
+  esac
+  echo "$profile"
+}
+
+profile_file() {
+  case "$(upper "$1")" in
+    BLACK) echo "$SUB_DIR/black.txt" ;;
+    WHITE) echo "$SUB_DIR/white.txt" ;;
+    *) echo "" ;;
+  esac
+}
+
+subscription_urls() {
+  file="$(profile_file "$1")"
+  [ -f "$file" ] || return 0
+  sed -n '/^[[:space:]]*#/d; /^[[:space:]]*$/d; s/^[[:space:]]*//; s/[[:space:]]*$//; p' "$file"
+}
+
+subscription_group_lines() {
+  profile="$1"
+  file="$(profile_file "$profile")"
+  [ -f "$file" ] || return 0
+  awk '
+    function trim(s) {
+      sub(/^[ \t]+/, "", s)
+      sub(/[ \t]+$/, "", s)
+      return s
+    }
+    function emit() {
+      if (group != "" && urls != "") print group " " urls
+    }
+    {
+      line = $0
+      sub(/[ \t]*#.*/, "", line)
+      line = trim(line)
+      if (line == "") next
+      if (line ~ /^\[[^]]+\]$/) {
+        emit()
+        group = line
+        sub(/^\[/, "", group)
+        sub(/\]$/, "", group)
+        urls = ""
+        next
+      }
+      if (line ~ /^https?:\/\// || line ~ /^file:\/\// || line ~ /^\//) {
+        if (group == "") {
+          auto += 1
+          printf "subscription-%02d %s\n", auto, line
+        } else {
+          urls = urls (urls == "" ? "" : " ") line
+        }
+      }
+    }
+    END { emit() }
+  ' "$file"
+}
+
+profile_groups() {
+  profile="$(upper "$1")"
+  prefix="$(lower "$profile")"
+  i=0
+  subscription_group_lines "$profile" | while IFS= read -r _line; do
+    i=$((i + 1))
+    printf '%s-%02d\n' "$prefix" "$i"
+  done
+}
+
+group_label() {
+  case "$1" in
+    black-*) printf 'BLACK subscription %s\n' "${1#black-}" ;;
+    white-*) printf 'WHITE subscription %s\n' "${1#white-}" ;;
+    auto) echo "auto" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+cache_count() {
+  group="$1"
+  [ -s "$CACHE_DIR/$group.count" ] || {
+    echo 0
+    return
+  }
+  sed -n '1p' "$CACHE_DIR/$group.count"
+}
+
+group_is_manual() {
+  group="$1"
+  name="$(sed -n '1p' "$CACHE_DIR/$group.name" 2>/dev/null || true)"
+  url="$(sed -n '1p' "$CACHE_DIR/$group.url" 2>/dev/null || true)"
+  case "$name" in
+    manual-*) return 0 ;;
+  esac
+  case "$url" in
+    file:///etc/sing-box/manual-subscriptions/*|/etc/sing-box/manual-subscriptions/*) return 0 ;;
+  esac
+  return 1
+}
+
+current_group() {
+  [ -s "$GROUP_FILE" ] && sed -n '1p' "$GROUP_FILE" || echo "auto"
+}
+
+current_node() {
+  [ -s "$NODE_FILE" ] && sed -n '1p' "$NODE_FILE" || echo "auto"
+}
+
+is_running() {
+  /etc/init.d/sing-box status >/dev/null 2>&1
+}
+
+set_group() {
+  printf '%s\n' "$1" > "$GROUP_FILE"
+}
+
+set_node() {
+  printf '%s\n' "$1" > "$NODE_FILE"
+}
+
+sanitize_name() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '-'
+}
+
+restart_from_cache() {
+  /usr/bin/vpn-subscriptions-update rebuild "$(subscription_profile)"
+}
+
+set_subscription_profile() {
+  profile="$(upper "$1")"
+  valid_profile "$profile" || usage
+  printf '%s\n' "$profile" > "$SUB_PROFILE_FILE"
+  printf '%s\n' "$profile" > "$LEGACY_MODE_FILE"
+  set_group auto
+  set_node auto
+  restart_from_cache
+}
+
+set_rules_profile_files() {
+  profile="$(upper "$1")"
+  valid_profile "$profile" || usage
+  mkdir -p "$RULE_PACK_ENABLED"
+  rm -f "$RULE_PACK_ENABLED"/*.rules 2>/dev/null || true
+  [ -f "$RULE_PACK_AVAILABLE/05-force-proxy.rules" ] && ln -sf ../available/05-force-proxy.rules "$RULE_PACK_ENABLED/05-force-proxy.rules"
+  [ -f "$RULE_PACK_AVAILABLE/06-force-direct.rules" ] && ln -sf ../available/06-force-direct.rules "$RULE_PACK_ENABLED/06-force-direct.rules"
+  case "$profile" in
+    BLACK)
+      [ -f "$RULE_PACK_AVAILABLE/10-subscription-proxy.rules" ] && ln -sf ../available/10-subscription-proxy.rules "$RULE_PACK_ENABLED/10-subscription-proxy.rules"
+      ln -sf ../available/00-private-direct.rules "$RULE_PACK_ENABLED/00-private-direct.rules"
+      [ ! -f "$RULE_PACK_AVAILABLE/20-jet-direct.rules" ] || ln -sf ../available/20-jet-direct.rules "$RULE_PACK_ENABLED/20-jet-direct.rules"
+      ln -sf ../available/30-black-main.rules "$RULE_PACK_ENABLED/30-black-main.rules"
+      ;;
+    WHITE)
+      [ -f "$RULE_PACK_AVAILABLE/10-subscription-proxy.rules" ] && ln -sf ../available/10-subscription-proxy.rules "$RULE_PACK_ENABLED/10-subscription-proxy.rules"
+      ln -sf ../available/00-private-direct.rules "$RULE_PACK_ENABLED/00-private-direct.rules"
+      [ ! -f "$RULE_PACK_AVAILABLE/20-jet-proxy.rules" ] || ln -sf ../available/20-jet-proxy.rules "$RULE_PACK_ENABLED/20-jet-proxy.rules"
+      [ -f "$RULE_PACK_AVAILABLE/25-white-direct.rules" ] && ln -sf ../available/25-white-direct.rules "$RULE_PACK_ENABLED/25-white-direct.rules"
+      ln -sf ../available/30-white-main.rules "$RULE_PACK_ENABLED/30-white-main.rules"
+      ;;
+  esac
+  printf '%s\n' "$profile" > "$RULES_PROFILE_FILE"
+}
+
+set_rules_profile() {
+  set_rules_profile_files "$1"
+  restart_from_cache
+}
+
+set_mode() {
+  profile="$(upper "$1")"
+  valid_profile "$profile" || usage
+  printf '%s\n' "$profile" > "$SUB_PROFILE_FILE"
+  printf '%s\n' "$profile" > "$RULES_PROFILE_FILE"
+  printf '%s\n' "$profile" > "$LEGACY_MODE_FILE"
+  set_group auto
+  set_node auto
+  set_rules_profile_files "$profile"
+  restart_from_cache
+}
+
+first_group() {
+  profile="$(subscription_profile)"
+  for group in $(profile_groups "$profile"); do
+    if [ "$(cache_count "$group")" -gt 0 ] && ! group_is_manual "$group"; then
+      echo "$group"
+      return 0
+    fi
+  done
+  for group in $(profile_groups "$profile"); do
+    if [ "$(cache_count "$group")" -gt 0 ]; then
+      echo "$group"
+      return 0
+    fi
+  done
+  profile_groups "$profile" | sed -n '1p'
+}
+
+nth_group() {
+  profile="$(subscription_profile)"
+  n="$1"
+  i=0
+  for group in $(profile_groups "$profile"); do
+    i=$((i + 1))
+    [ "$i" = "$n" ] && {
+      echo "$group"
+      return 0
+    }
+  done
+  return 1
+}
+
+next_group() {
+  direction="$1"
+  profile="$(subscription_profile)"
+  cur="$(current_group)"
+  [ "$cur" = "auto" ] && {
+    first_group
+    return
+  }
+
+  groups=""
+  for group in $(profile_groups "$profile"); do
+    group_is_manual "$group" && continue
+    groups="$groups $group"
+  done
+  [ -n "$groups" ] || groups="$(profile_groups "$profile")"
+  prev=""
+  first=""
+  found=0
+  for group in $groups; do
+    [ -z "$first" ] && first="$group"
+    if [ "$direction" = "prev" ] && [ "$group" = "$cur" ]; then
+      [ -n "$prev" ] && echo "$prev" || {
+        for last in $groups; do :; done
+        echo "$last"
+      }
+      return
+    fi
+    if [ "$found" = "1" ]; then
+      echo "$group"
+      return
+    fi
+    [ "$group" = "$cur" ] && found=1
+    prev="$group"
+  done
+  echo "$first"
+}
+
+subscription_list() {
+  profile="$(subscription_profile)"
+  cur="$(current_group)"
+  echo "subscription profile: $profile"
+  echo "subscription file: $(profile_file "$profile")"
+  echo "current subscription: $(group_label "$cur")"
+  echo "ids are generated from the active URL order: first URL is $(lower "$profile")-01"
+  i=0
+  subscription_group_lines "$profile" | while IFS= read -r line; do
+    i=$((i + 1))
+    group="$(printf '%s-%02d' "$(lower "$profile")" "$i")"
+    marker=" "
+    [ "$group" = "$cur" ] && marker="*"
+    set -- $line
+    source_name="$1"
+    shift
+    mirror_count="$#"
+    first_url="$1"
+    manual="no"
+    group_is_manual "$group" && manual="yes"
+    printf '%s %d. id=%-8s count=%-4s mirrors=%-2s manual=%-3s name=%s first=%s\n' "$marker" "$i" "$group" "$(cache_count "$group")" "$mirror_count" "$manual" "$source_name" "$first_url"
+  done
+}
+
+subscription_set() {
+  value="$1"
+  case "$value" in
+    auto)
+      set_group auto
+      set_node auto
+      ;;
+    [0-9]*)
+      group="$(nth_group "$value")" || {
+        echo "No subscription number $value in current subscription profile" >&2
+        exit 2
+      }
+      set_group "$group"
+      set_node auto
+      ;;
+    *)
+      profile="$(subscription_profile)"
+      ok=0
+      for group in $(profile_groups "$profile"); do
+        [ "$group" = "$value" ] && ok=1
+      done
+      [ "$ok" = "1" ] || {
+        echo "Subscription $value is not in subscription profile $profile" >&2
+        exit 2
+      }
+      set_group "$value"
+      set_node auto
+      ;;
+  esac
+  restart_from_cache
+}
+
+subscription_import() {
+  profile="$(upper "$1")"
+  src="$2"
+  name="${3:-manual-$(date +%Y%m%d-%H%M%S)}"
+  valid_profile "$profile" || usage
+  [ -f "$src" ] || {
+    echo "Subscription file not found: $src" >&2
+    exit 2
+  }
+
+  safe_name="$(sanitize_name "$name")"
+  [ -n "$safe_name" ] || safe_name="manual-$(date +%Y%m%d-%H%M%S)"
+  dest_dir="$MANUAL_SUB_DIR/$(lower "$profile")"
+  dest="$dest_dir/$safe_name.txt"
+  group_name="manual-$safe_name"
+  sub_file="$(profile_file "$profile")"
+
+  mkdir -p "$dest_dir" "$SUB_DIR"
+  cp "$src" "$dest"
+  chmod 600 "$dest" 2>/dev/null || true
+  [ -f "$sub_file" ] || : > "$sub_file"
+
+  if ! grep -qx "\[$group_name\]" "$sub_file" 2>/dev/null; then
+    {
+      echo
+      echo "[$group_name]"
+      echo "file://$dest"
+    } >> "$sub_file"
+  fi
+
+  pos_file="/tmp/vpnctl-import-pos.$$"
+  rm -f "$pos_file"
+  i=0
+  subscription_group_lines "$profile" | while IFS= read -r line; do
+    i=$((i + 1))
+    set -- $line
+    [ "${1:-}" = "$group_name" ] && printf '%s\n' "$i" > "$pos_file"
+  done
+  group_number="$(sed -n '1p' "$pos_file" 2>/dev/null || true)"
+  rm -f "$pos_file"
+  [ -n "$group_number" ] || {
+    echo "Cannot find imported subscription group $group_name" >&2
+    exit 2
+  }
+  group_id="$(printf '%s-%02d' "$(lower "$profile")" "$group_number")"
+
+  old_profile="$(subscription_profile)"
+  old_group="$(current_group)"
+  old_node="$(current_node)"
+
+  /usr/bin/vpn-subscriptions-update update-one "$profile" "$group_number"
+  printf '%s\n' "$old_profile" > "$SUB_PROFILE_FILE"
+  printf '%s\n' "$old_profile" > "$LEGACY_MODE_FILE"
+  set_group "$old_group"
+  set_node "$old_node"
+  restart_from_cache
+  echo "Imported $src as $dest"
+  echo "Cached manual subscription $group_id ($group_name)"
+  echo "To use it explicitly: /usr/bin/vpnctl subscription set $group_id"
+}
+
+node_group() {
+  group="$(current_group)"
+  if [ "$group" = "auto" ]; then
+    group="$(first_group)"
+    set_group "$group"
+  fi
+  echo "$group"
+}
+
+node_group_readonly() {
+  group="$(current_group)"
+  if [ "$group" = "auto" ]; then
+    first_group
+  else
+    echo "$group"
+  fi
+}
+
+node_list() {
+  group="$(node_group_readonly)"
+  cur="$(current_node)"
+  count="$(cache_count "$group")"
+  echo "subscription: $(group_label "$group")"
+  echo "current node: $cur"
+  echo "node count: $count"
+  [ -s "$CACHE_DIR/$group.tags" ] || return 0
+  awk -v cur="$cur" -v count="$count" -v titles="$CACHE_DIR/$group.titles" -v nodes="$CACHE_DIR/$group.nodes" '
+    function clean(line) {
+      sub(/^[^:]*:[ \t]*/, "", line)
+      gsub(/[",]/, "", line)
+      sub(/^[ \t]+/, "", line)
+      sub(/[ \t]+$/, "", line)
+      return line
+    }
+    FILENAME == titles {
+      tab = index($0, "\t")
+      if (tab > 0) title[substr($0, 1, tab - 1)] = substr($0, tab + 1)
+      next
+    }
+    FILENAME == nodes {
+      if ($0 ~ /^[ \t]*[{]/) { type = ""; tag = ""; server = ""; port = "" }
+      if ($0 ~ /"type":/ && type == "") type = clean($0)
+      if ($0 ~ /"tag":/) tag = clean($0)
+      if ($0 ~ /"server":/ && server == "") server = clean($0)
+      if ($0 ~ /"server_port":/ && port == "") port = clean($0)
+      if ($0 ~ /^[ \t]*[}]/ && tag != "") {
+        proto[tag] = type
+        endpoint[tag] = (server != "" ? server ":" port : "unknown")
+      }
+      next
+    }
+    {
+      i++
+      if (i > 80) {
+        print "... hidden " count - 80 " more nodes"
+        exit
+      }
+      tag = $0
+      marker = " "
+      if (cur == i || cur == tag) marker = "*"
+      printf "%s %d. tag=%s proto=%s endpoint=%s title=%s\n", marker, i, tag, (proto[tag] ? proto[tag] : "unknown"), (endpoint[tag] ? endpoint[tag] : "unknown"), (title[tag] ? title[tag] : "unknown")
+    }
+  ' "$CACHE_DIR/$group.titles" "$CACHE_DIR/$group.nodes" "$CACHE_DIR/$group.tags"
+}
+
+tag_group() {
+  printf '%s' "$1" | sed 's/-[0-9][0-9][0-9]$//'
+}
+
+tag_number() {
+  printf '%s' "$1" | sed 's/^.*-\([0-9][0-9][0-9]\)$/\1/' | sed 's/^0*//'
+}
+
+tag_from_number() {
+  group="$1"
+  number="$2"
+  sed -n "${number}p" "$CACHE_DIR/$group.tags" 2>/dev/null || true
+}
+
+current_effective_tag() {
+  is_running || return 1
+  curl -fsS --noproxy '*' --max-time 2 http://127.0.0.1:9090/proxies | jq -er '
+    .proxies as $proxies |
+    def leaf($tag; $seen):
+      if ($seen | index($tag)) != null or $proxies[$tag] == null then empty
+      elif ($proxies[$tag].now // "") != "" then leaf($proxies[$tag].now; $seen + [$tag])
+      elif $proxies[$tag].type == "URLTest" or $proxies[$tag].type == "Selector" then empty
+      else $tag end;
+    leaf("vpn-out"; [])'
+}
+
+node_info_by_tag() {
+  tag="$1"
+  group="$(tag_group "$tag")"
+  [ -s "$CACHE_DIR/$group.nodes" ] || return 1
+  awk -v wanted="$tag" '
+    function clean(line) {
+      sub(/^[^:]*:[ \t]*/, "", line)
+      gsub(/[",]/, "", line)
+      sub(/^[ \t]+/, "", line)
+      sub(/[ \t]+$/, "", line)
+      return line
+    }
+    $0 ~ "\"tag\": \"" wanted "\"" { found = 1 }
+    found && /"server":/ && server == "" { server = clean($0) }
+    found && /"server_port":/ && port == "" { port = clean($0) }
+    found && /"server_name":/ && sni == "" { sni = clean($0) }
+    found && /"transport":/ && transport == "" { transport = "transport" }
+    found && /"packet_encoding":/ {
+      print server "|" port "|" sni
+      printed = 1
+      exit
+    }
+    END {
+      if (found && printed != 1) print server "|" port "|" sni
+    }
+  ' "$CACHE_DIR/$group.nodes"
+}
+
+node_type_by_tag() {
+  tag="$1"
+  group="$(tag_group "$tag")"
+  [ -s "$CACHE_DIR/$group.nodes" ] || return 1
+  awk -v wanted="$tag" '
+    function clean(line) {
+      sub(/^[^:]*:[ \t]*/, "", line)
+      gsub(/[",]/, "", line)
+      sub(/^[ \t]+/, "", line)
+      sub(/[ \t]+$/, "", line)
+      return line
+    }
+    /^[ \t]*[{]/ { type = "" }
+    /"type":/ && type == "" { type = clean($0) }
+    $0 ~ "\"tag\": \"" wanted "\"" { print type; exit }
+  ' "$CACHE_DIR/$group.nodes"
+}
+
+ping_probe() {
+  server="$1"
+  out="$(ping -c 1 -W 1 "$server" 2>/dev/null || true)"
+  avg="$(printf '%s\n' "$out" | sed -n 's/.*round-trip min\/avg\/max[^=]*= [^/]*\/\([^/]*\)\/.*/\1/p; s/.*rtt min\/avg\/max[^=]*= [^/]*\/\([^/]*\)\/.*/\1/p' | sed -n '1p')"
+  if [ -n "$avg" ]; then
+    echo "${avg}ms"
+  else
+    echo "fail"
+  fi
+}
+
+node_probe_tag() {
+  tag="$1"
+  if [ "${2:-}" = active ]; then
+    info="$(jq -r --arg tag "$tag" '.outbounds[] | select(.tag == $tag and .server != null) | [.server, (.server_port | tostring), (.tls.server_name // "")] | join("|")' /etc/sing-box/config.json)"
+  else
+    info="$(node_info_by_tag "$tag" || true)"
+  fi
+  [ -n "$info" ] || {
+    echo "$tag: no cached node info"
+    return 1
+  }
+  server="$(printf '%s' "$info" | cut -d'|' -f1)"
+  port="$(printf '%s' "$info" | cut -d'|' -f2)"
+  sni="$(printf '%s' "$info" | cut -d'|' -f3)"
+  ping_result="$(ping_probe "$server")"
+  printf '%-14s ping=%-8s endpoint=%s:%s' "$tag" "$ping_result" "$server" "$port"
+  [ -n "$sni" ] && printf ' sni=%s' "$sni"
+  printf '\n'
+}
+
+node_test() {
+  group="$(node_group_readonly)"
+  value="${1:-}"
+  if [ -z "$value" ] || [ "$value" = "current" ]; then
+    cur="$(current_node)"
+    if printf '%s' "$cur" | grep -Eq '^[0-9]+$'; then
+      tag="$(tag_from_number "$group" "$cur")"
+    else
+      tag="$(current_effective_tag || true)"
+    fi
+  elif printf '%s' "$value" | grep -Eq '^[0-9]+$'; then
+    tag="$(tag_from_number "$group" "$value")"
+  else
+    tag="$value"
+  fi
+  [ -n "$tag" ] || {
+    echo "No node tag to test" >&2
+    exit 2
+  }
+  node_probe_tag "$tag"
+}
+
+node_scan() {
+  group="$(node_group_readonly)"
+  [ -s "$CACHE_DIR/$group.tags" ] || {
+    echo "No cached nodes for $group" >&2
+    exit 2
+  }
+  timeout_s="${NODE_SCAN_TIMEOUT:-3}"
+  echo "Scanning endpoint reachability for $group"
+  echo "This does not switch nodes and does not restart sing-box."
+  echo "TCP-like nodes are checked by TCP connect to endpoint; UDP protocols are ping-only."
+  node_list | sed -n '/^[* ][[:space:]]*[0-9][0-9]*\./p' | while IFS= read -r line; do
+    number="$(printf '%s\n' "$line" | sed 's/^[* ][[:space:]]*\([0-9][0-9]*\)\..*/\1/')"
+    tag="$(printf '%s\n' "$line" | sed 's/^.*tag=\([^ ]*\).*/\1/')"
+    proto="$(printf '%s\n' "$line" | sed 's/^.*proto=\([^ ]*\).*/\1/')"
+    endpoint="$(printf '%s\n' "$line" | sed 's/^.*endpoint=\([^ ]*\).*/\1/')"
+    title="$(printf '%s\n' "$line" | sed 's/^.*title=//')"
+    server="${endpoint%:*}"
+    port="${endpoint##*:}"
+    ping_result="$(ping_probe "$server")"
+    tcp="skip"
+    status="unknown"
+    case "$proto" in
+      hysteria2|hy2)
+        [ "$ping_result" != "fail" ] && status="maybe" || status="fail"
+        ;;
+      *)
+        if timeout "$timeout_s" nc "$server" "$port" </dev/null >/dev/null 2>&1; then
+          tcp="ok"
+          status="ok"
+        else
+          tcp="fail"
+          status="fail"
+        fi
+        ;;
+    esac
+    clean_title="$(printf '%s\n' "$title" | sed 's/^[^ ]* //')"
+    if printf '%s\n' "$clean_title" | grep -q ','; then
+      city="$(printf '%s\n' "$clean_title" | cut -d, -f1 | sed 's/^ *//; s/ *$//')"
+      country="$(printf '%s\n' "$clean_title" | cut -d, -f2 | sed 's/^ *//; s/ *$//')"
+    else
+      city="unknown"
+      country="$(printf '%s\n' "$clean_title" | sed 's/[|[].*//; s/,.*//; s/^ *//; s/ *$//')"
+    fi
+    printf '%s. tag=%s proto=%s status=%s ping=%s tcp=%s endpoint=%s country=%s city=%s title=%s\n' "$number" "$tag" "$proto" "$status" "$ping_result" "$tcp" "$endpoint" "${country:-unknown}" "${city:-unknown}" "$title"
+  done
+}
+
+download_probe() {
+  url="$1"
+  timeout_s="${2:-3}"
+  tmp="/tmp/vpnctl-bench.$$"
+  start="$(date +%s)"
+  if timeout "$timeout_s" wget -q -T "$timeout_s" -O "$tmp" "$url" 2>/dev/null; then
+    rc=0
+  else
+    rc=$?
+  fi
+  end="$(date +%s)"
+  elapsed=$((end - start))
+  [ "$elapsed" -lt 1 ] && elapsed=1
+  bytes=0
+  [ -f "$tmp" ] && bytes="$(wc -c < "$tmp" | tr -d ' ')"
+  rm -f "$tmp"
+  kbps=$((bytes * 8 / elapsed / 1000))
+  echo "rc=$rc bytes=$bytes seconds=$elapsed speed_kbps=$kbps"
+  return "$rc"
+}
+
+node_bench() {
+  limit="${1:-60}"
+  url="${2:-$BENCH_URL_DEFAULT}"
+  case "$limit" in
+    ''|*[!0-9]*) limit=60 ;;
+  esac
+  [ "$limit" -gt 0 ] || limit=60
+  [ "$limit" -gt 60 ] && limit=60
+  case "$url" in
+    *://ya.ru/*|*://*.ya.ru/*|*://yandex.ru/*|*://*.yandex.ru/*|*://mirror.yandex.ru/*)
+      echo "Refusing to benchmark a DIRECT allowlist URL: $url" >&2
+      echo "Use a non-direct URL so speed bench measures VPN, not direct routing." >&2
+      exit 2
+      ;;
+  esac
+
+  group="$(node_group_readonly)"
+  orig_node="$(current_node)"
+  echo "Dangerous speed bench for $group"
+  echo "This switches nodes and restarts sing-box during the test."
+  echo "Limit: $limit nodes; URL: $url"
+  echo "Use only a non-direct URL here; direct allowlist URLs are rejected."
+  best_ru_node=""
+  best_ru_speed=0
+  i=0
+
+  node_list | sed -n '/^[* ][[:space:]]*[0-9][0-9]*\./p' | while IFS= read -r line; do
+    i=$((i + 1))
+    [ "$i" -le "$limit" ] || break
+    number="$(printf '%s\n' "$line" | sed 's/^[* ][[:space:]]*\([0-9][0-9]*\)\..*/\1/')"
+    tag="$(printf '%s\n' "$line" | sed 's/^.*tag=\([^ ]*\).*/\1/')"
+    proto="$(printf '%s\n' "$line" | sed 's/^.*proto=\([^ ]*\).*/\1/')"
+    endpoint="$(printf '%s\n' "$line" | sed 's/^.*endpoint=\([^ ]*\).*/\1/')"
+    title="$(printf '%s\n' "$line" | sed 's/^.*title=//')"
+    clean_title="$(printf '%s\n' "$title" | sed 's/^[^ ]* //')"
+    if printf '%s\n' "$clean_title" | grep -q ','; then
+      city="$(printf '%s\n' "$clean_title" | cut -d, -f1 | sed 's/^ *//; s/ *$//')"
+      country="$(printf '%s\n' "$clean_title" | cut -d, -f2 | sed 's/^ *//; s/ *$//')"
+    else
+      city="unknown"
+      country="$(printf '%s\n' "$clean_title" | sed 's/[|[].*//; s/,.*//; s/^ *//; s/ *$//')"
+    fi
+    server="${endpoint%:*}"
+    ping_result="$(ping_probe "$server")"
+
+    set_node "$number"
+    restart_from_cache >/dev/null
+    sleep "${NODE_BENCH_SETTLE:-1}"
+    probe="$(download_probe "$url" "${NODE_BENCH_TIMEOUT:-3}" || true)"
+    rc="$(printf '%s\n' "$probe" | sed -n 's/^rc=\([^ ]*\).*/\1/p')"
+    speed="$(printf '%s\n' "$probe" | sed -n 's/^.*speed_kbps=\([^ ]*\).*/\1/p')"
+    bytes="$(printf '%s\n' "$probe" | sed -n 's/^.*bytes=\([^ ]*\).*/\1/p')"
+    seconds="$(printf '%s\n' "$probe" | sed -n 's/^.*seconds=\([^ ]*\).*/\1/p')"
+    status="fail"
+    [ "${bytes:-0}" -gt 0 ] && status="ok"
+    printf '%s. tag=%s proto=%s status=%s speed_kbps=%s bytes=%s seconds=%s ping=%s endpoint=%s country=%s city=%s title=%s\n' "$number" "$tag" "$proto" "$status" "${speed:-0}" "${bytes:-0}" "${seconds:-0}" "$ping_result" "$endpoint" "${country:-unknown}" "${city:-unknown}" "$title"
+
+    if [ "$status" = "ok" ] && printf '%s\n' "$title" | grep -Eiq '🇷🇺|россия|russia|москва|moscow'; then
+      if [ "${speed:-0}" -gt "$best_ru_speed" ]; then
+        best_ru_node="$number"
+        best_ru_speed="$speed"
+        echo "$best_ru_node $best_ru_speed" > "/tmp/vpnctl-bench-best-ru.$$"
+      fi
+    fi
+  done
+
+  if [ -s "/tmp/vpnctl-bench-best-ru.$$" ]; then
+    read -r best_ru_node best_ru_speed < "/tmp/vpnctl-bench-best-ru.$$"
+    rm -f "/tmp/vpnctl-bench-best-ru.$$"
+    set_node "$best_ru_node"
+    restart_from_cache >/dev/null
+    echo "Selected best Russian node from this bench: node=$best_ru_node speed_kbps=$best_ru_speed"
+  else
+    rm -f "/tmp/vpnctl-bench-best-ru.$$"
+    set_node "$orig_node"
+    restart_from_cache >/dev/null
+    echo "No working Russian node found by bench; restored node=$orig_node"
+  fi
+}
+
+node_verify() {
+  url="${1:-$CHECK_URL}"
+  if vpn_request "$url" >/dev/null; then
+    rc=0
+  else
+    rc=$?
+  fi
+  after_tag="$(current_effective_tag || true)"
+  if [ "$rc" = "0" ]; then
+    echo "HTTP probe OK: $url"
+  else
+    echo "HTTP probe FAILED rc=$rc: $url"
+  fi
+  [ -n "$after_tag" ] && node_probe_tag "$after_tag" active
+  return "$rc"
+}
+
+node_find() {
+  url="${1:-$CHECK_URL}"
+  orig_group="$(current_group)"
+  orig_node="$(current_node)"
+  group="$(node_group)"
+  count="$(cache_count "$group")"
+  [ "$count" -gt 0 ] || {
+    echo "No cached nodes for $group" >&2
+    exit 2
+  }
+  best_pref_node=""
+  best_pref_score=""
+  best_any_node=""
+  best_any_score=""
+  result_file="/tmp/vpnctl-node-find-best.$$"
+  : > "$result_file"
+
+  node_try_order "$group" "$count" | while IFS= read -r i; do
+    [ -n "$i" ] || continue
+    echo "Trying $group node $i/$count"
+    set_node "$i"
+    restart_from_cache >/dev/null
+    sleep 2
+    if node_verify "$url"; then
+      tag="$(tag_from_number "$group" "$i")"
+      info="$(node_info_by_tag "$tag" || true)"
+      server="$(printf '%s' "$info" | cut -d'|' -f1)"
+      score="$(ping_probe "$server" | sed 's/ms$//; s/fail/999999/')"
+      preferred=0
+      if grep -qx "$i" "$PREFERRED_NODE_DIR/$group" 2>/dev/null || grep -qx "$i" "$CACHE_DIR/$group.preferred" 2>/dev/null; then
+        preferred=1
+      fi
+      if [ "$(subscription_profile)" = "BLACK" ]; then
+        preferred=1
+        grep -qx "$i" "$CACHE_DIR/$group.preferred" 2>/dev/null && preferred=0
+      fi
+      printf '%s %s %s\n' "$preferred" "$score" "$i" >> "$result_file"
+      echo "Working candidate: node=$i preferred=$preferred score=${score}ms"
+    fi
+  done
+
+  while read -r preferred score node; do
+    [ -n "$node" ] || continue
+    if [ "$preferred" = "1" ]; then
+      if [ -z "$best_pref_node" ] || awk -v a="$score" -v b="$best_pref_score" 'BEGIN { exit !(a + 0 < b + 0) }'; then
+        best_pref_node="$node"
+        best_pref_score="$score"
+      fi
+    fi
+    if [ -z "$best_any_node" ] || awk -v a="$score" -v b="$best_any_score" 'BEGIN { exit !(a + 0 < b + 0) }'; then
+      best_any_node="$node"
+      best_any_score="$score"
+    fi
+  done < "$result_file"
+  rm -f "$result_file"
+
+  if [ -n "$best_pref_node" ]; then
+    set_node "$best_pref_node"
+    restart_from_cache >/dev/null
+    echo "Selected best preferred node: $best_pref_node score=${best_pref_score}ms"
+    return 0
+  fi
+  if [ -n "$best_any_node" ]; then
+    set_node "$best_any_node"
+    restart_from_cache >/dev/null
+    echo "Selected best node: $best_any_node score=${best_any_score}ms"
+    return 0
+  fi
+
+  echo "No working node found in $group" >&2
+  set_group "$orig_group"
+  set_node "$orig_node"
+  restart_from_cache >/dev/null
+  echo "Restored previous selection: subscription=$orig_group node=$orig_node" >&2
+  return 1
+}
+
+node_pin() {
+  tag="$(current_effective_tag || true)"
+  [ -n "$tag" ] || {
+    echo "No current effective node to pin; run traffic through VPN or use 'vpnctl node set <number>'" >&2
+    exit 2
+  }
+  group="$(tag_group "$tag")"
+  number="$(tag_number "$tag")"
+  [ -n "$group" ] && [ -n "$number" ] || {
+    echo "Cannot parse node tag: $tag" >&2
+    exit 2
+  }
+  profile="$(subscription_profile)"
+  ok=0
+  for candidate in $(profile_groups "$profile"); do
+    [ "$candidate" = "$group" ] && ok=1
+  done
+  [ "$ok" = "1" ] || {
+    echo "Current node $tag is not in subscription profile $profile" >&2
+    exit 2
+  }
+  set_group "$group"
+  set_node "$number"
+  restart_from_cache
+  echo "Pinned node: subscription=$group node=$number tag=$tag"
+}
+
+emit_node_order_file() {
+  file="$1"
+  count="$2"
+  seen="$3"
+  [ -s "$file" ] || return 0
+  sed 's/#.*//; s/[^0-9]/ /g' "$file" | tr ' ' '\n' | while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    [ "$n" -ge 1 ] 2>/dev/null || continue
+    [ "$n" -le "$count" ] 2>/dev/null || continue
+    grep -qx "$n" "$seen" 2>/dev/null && continue
+    printf '%s\n' "$n" >> "$seen"
+    printf '%s\n' "$n"
+  done
+}
+
+node_try_order() {
+  group="$1"
+  count="$2"
+  seen="/tmp/vpnctl-node-order.$$"
+  : > "$seen"
+
+  emit_node_order_file "$PREFERRED_NODE_DIR/$group" "$count" "$seen"
+  if [ "$(subscription_profile)" = "BLACK" ]; then
+    n=1
+    while [ "$n" -le "$count" ]; do
+      if ! grep -qx "$n" "$CACHE_DIR/$group.preferred" 2>/dev/null && ! grep -qx "$n" "$seen"; then
+        printf '%s\n' "$n"
+        printf '%s\n' "$n" >> "$seen"
+      fi
+      n=$((n + 1))
+    done
+  fi
+  case "$group" in
+    white-*) emit_node_order_file "$CACHE_DIR/$group.preferred" "$count" "$seen" ;;
+  esac
+
+  case "$group" in
+    white-*) n="$count"; step=-1 ;;
+    *) n=1; step=1 ;;
+  esac
+  while [ "$n" -ge 1 ] && [ "$n" -le "$count" ]; do
+    if ! grep -qx "$n" "$seen" 2>/dev/null; then
+      printf '%s\n' "$n"
+    fi
+    n=$((n + step))
+  done
+  rm -f "$seen"
+}
+
+json_string_field() {
+  key="$1"
+  printf '%s\n' "$2" | sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" | sed -n '1p'
+}
+
+node_title_by_tag() {
+  tag="$1"
+  group="$(tag_group "$tag")"
+  active="$(jq -cS --arg tag "$tag" '.outbounds[] | select(.tag == $tag)' /etc/sing-box/config.json)"
+  if [ -n "$active" ]; then
+    cached="$( { printf '[\n'; cat "$CACHE_DIR/$group.nodes"; printf '{}]\n'; } | jq -cS --arg tag "$tag" '.[] | select(.tag == $tag)' 2>/dev/null || true)"
+    [ "$active" = "$cached" ] || return 0
+  fi
+  awk -F '\t' -v tag="$tag" '$1 == tag { print $2; exit }' "$CACHE_DIR/$group.titles" 2>/dev/null || true
+}
+
+title_geo_hint() {
+  title="$1"
+  clean_title="$(printf '%s\n' "$title" | sed 's/^[^ ]* //')"
+  code="unknown"
+  printf '%s\n' "$title" | grep -Eiq '🇷🇺|россия|russia|москва|moscow' && code="RU"
+  first="$(printf '%s\n' "$clean_title" | cut -d, -f1 | sed 's/[|[].*//; s/^ *//; s/ *$//')"
+  second="$(printf '%s\n' "$clean_title" | cut -s -d, -f2 | sed 's/[|[].*//; s/^ *//; s/ *$//')"
+  if [ -n "$second" ] && ! printf '%s\n' "$first" | grep -Eiq 'russia|netherlands|germany|italy|france|spain|poland|finland|sweden|turkey|serbia|singapore|japan|usa|united states|united kingdom|uk'; then
+    city="$first"
+    country="$second"
+  else
+    city="unknown"
+    country="$first"
+  fi
+  printf '%s|%s|%s\n' "${country:-unknown}" "${code:-unknown}" "${city:-unknown}"
+}
+
+geo_real_probe() {
+  source="geo-service"
+  json="$(vpn_request https://ipwho.is/ 2>/dev/null || true)"
+  ip="$(printf '%s' "$json" | jq -r '.ip // empty' 2>/dev/null || true)"
+  country="$(printf '%s' "$json" | jq -r '.country // empty' 2>/dev/null || true)"
+  country_code="$(printf '%s' "$json" | jq -r '.country_code // empty' 2>/dev/null || true)"
+  city="$(printf '%s' "$json" | jq -r '.city // empty' 2>/dev/null || true)"
+  isp="$(printf '%s' "$json" | jq -r '.connection.isp // .isp // empty' 2>/dev/null || true)"
+
+  if [ -z "$ip" ]; then
+    json="$(vpn_request https://ifconfig.co/json 2>/dev/null || true)"
+    ip="$(json_string_field ip "$json")"
+    country="$(json_string_field country "$json")"
+    country_code="$(json_string_field country_iso "$json")"
+    city="$(json_string_field city "$json")"
+    isp="$(json_string_field asn_org "$json")"
+  fi
+
+  if [ -z "$ip" ]; then
+    ip="$(vpn_request https://api.ipify.org 2>/dev/null || true)"
+    country="unknown"
+    country_code="unknown"
+    city="unknown"
+    source="ip-only"
+  fi
+
+  printf '%s' "$ip" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || ip=""
+  tag="$(current_effective_tag || true)"
+  line="ip=${ip:-unknown} country=${country:-unknown} code=${country_code:-unknown} city=${city:-unknown}"
+  [ -n "$isp" ] && line="$line isp=$isp"
+  [ -n "$source" ] && line="$line source=$source"
+  [ -n "$tag" ] && line="$line node=$tag"
+  echo "$line"
+  [ -n "$ip" ]
+}
+
+vpn_request() {
+  is_running || { echo 'VPN is stopped; probe skipped' >&2; return 1; }
+  curl -4 --silent --show-error --fail --connect-timeout 4 --max-time 8 \
+    --noproxy '' --proxy socks5h://127.0.0.1:2080 "$1"
+}
+
+status_check() {
+  if ! is_running; then
+    status
+    echo 'VPN checks: skipped (VPN is stopped)'
+    return
+  fi
+  check_rc=0
+  health_output="$(/usr/bin/vpn-health-check 2>&1)" || check_rc=1
+  exit_output="$(exit_check 2>&1)" || check_rc=1
+  status
+  printf '%s\n%s\n' "$health_output" "$exit_output"
+  return "$check_rc"
+}
+
+geo_probe() {
+  if line="$(geo_real_probe)"; then
+    echo "$line" | tee "$GEO_CACHE_FILE"
+  else
+    echo "$line" | tee "$GEO_CACHE_FILE"
+    return 1
+  fi
+}
+
+exit_check() {
+  if line="$(geo_real_probe)"; then
+    echo "VPN_EXIT_OK $line" | tee "$GEO_CACHE_FILE"
+    return 0
+  fi
+  echo "VPN_EXIT_FAILED $line" | tee "$GEO_CACHE_FILE"
+  return 1
+}
+
+node_set() {
+  value="$1"
+  if [ "$value" = "auto" ]; then
+    set_node auto
+    restart_from_cache
+    return
+  fi
+
+  group="$(node_group)"
+  count="$(cache_count "$group")"
+  printf '%s' "$value" | grep -Eq '^[0-9]+$' || {
+    echo "Node must be a number or auto" >&2
+    exit 2
+  }
+  [ "$value" -ge 1 ] && [ "$value" -le "$count" ] || {
+    echo "Node $value is outside 1..$count for $group" >&2
+    exit 2
+  }
+  set_node "$value"
+  restart_from_cache
+}
+
+node_nextprev() {
+  direction="$1"
+  group="$(node_group)"
+  count="$(cache_count "$group")"
+  [ "$count" -gt 0 ] || {
+    echo "No cached nodes for $group" >&2
+    exit 2
+  }
+  cur="$(current_node)"
+  if ! printf '%s' "$cur" | grep -Eq '^[0-9]+$'; then
+    cur=0
+  fi
+  if [ "$direction" = "prev" ]; then
+    next=$((cur - 1))
+    [ "$next" -lt 1 ] && next="$count"
+  else
+    next=$((cur + 1))
+    [ "$next" -gt "$count" ] && next=1
+  fi
+  set_node "$next"
+  restart_from_cache
+}
+
+rules_list() {
+  echo "rules profile: $(rules_profile)"
+  echo "available rule packs:"
+  for pack in "$RULE_PACK_AVAILABLE"/*.rules; do
+    [ -e "$pack" ] || continue
+    file_name="$(basename "$pack" .rules)"
+    name="$(printf '%s' "$file_name" | sed 's/^[0-9][0-9]-//')"
+    marker="disabled"
+    [ -e "$RULE_PACK_ENABLED/$file_name.rules" ] && marker="enabled"
+    printf '  %-20s %-8s file=%s.rules\n' "$name" "$marker" "$file_name"
+  done
+}
+
+rule_pack_file() {
+  name="$1"
+  if [ -f "$RULE_PACK_AVAILABLE/$name.rules" ]; then
+    echo "$RULE_PACK_AVAILABLE/$name.rules"
+    return 0
+  fi
+  for pack in "$RULE_PACK_AVAILABLE"/*-"$name".rules; do
+    [ -f "$pack" ] || continue
+    echo "$pack"
+    return 0
+  done
+  return 1
+}
+
+rules_enable() {
+  name="$1"
+  pack="$(rule_pack_file "$name")" || {
+    echo "No such rule pack: $name" >&2
+    exit 2
+  }
+  file_name="$(basename "$pack")"
+  mkdir -p "$RULE_PACK_ENABLED"
+  ln -sf "../available/$file_name" "$RULE_PACK_ENABLED/$file_name"
+  printf 'CUSTOM\n' > "$RULES_PROFILE_FILE"
+  restart_from_cache
+}
+
+rules_disable() {
+  name="$1"
+  if [ -e "$RULE_PACK_ENABLED/$name.rules" ]; then
+    rm -f "$RULE_PACK_ENABLED/$name.rules"
+  else
+    for pack in "$RULE_PACK_ENABLED"/*-"$name".rules; do
+      [ -e "$pack" ] || continue
+      rm -f "$pack"
+    done
+  fi
+  printf 'CUSTOM\n' > "$RULES_PROFILE_FILE"
+  restart_from_cache
+}
+
+status() {
+  sub_profile="$(subscription_profile)"
+  rule_profile="$(rules_profile)"
+  group="$(current_group)"
+  node="$(current_node)"
+  running="stopped"
+  is_running && running="running"
+  route_final="$(sed -n 's/[[:space:]]*"final": "\([^"]*\)".*/\1/p' /etc/sing-box/config.json 2>/dev/null | tail -n 1)"
+  last_tag="$(current_effective_tag || true)"
+
+  echo "VPN: $running"
+  echo "profiles: subscriptions=$sub_profile rules=$rule_profile"
+  echo "selected: subscription=$group node=$node route_final=${route_final:-unknown}"
+  echo "cache: /etc/sing-box/subscriptions-cache"
+  echo "manual imports: /etc/sing-box/manual-subscriptions/$(lower "$sub_profile")"
+  echo
+
+  if [ -n "$last_tag" ]; then
+    echo "last used node:"
+    node_probe_tag "$last_tag" active || true
+    title="$(node_title_by_tag "$last_tag")"
+    if [ -n "$title" ]; then
+      hint="$(title_geo_hint "$title")"
+      echo "node title: $title"
+      echo "node location: country=$(printf '%s' "$hint" | cut -d'|' -f1) code=$(printf '%s' "$hint" | cut -d'|' -f2) city=$(printf '%s' "$hint" | cut -d'|' -f3)"
+    fi
+  else
+    echo "last used node:"
+    echo "unknown (sing-box API has no selected node)"
+  fi
+
+  recent_errors="$(logread 2>/dev/null | grep 'sing-box' | tail -n 300 | grep -c 'ERROR' || true)"
+  recent_proxy="$(logread 2>/dev/null | sed -n 's/.*outbound\/\(vless\|hysteria2\)\[\([^]]*\)\].*/\2/p' | tail -n 300 | wc -l | tr -d ' ')"
+  if [ -s "$GEO_CACHE_FILE" ]; then
+    echo "exit: $(cat "$GEO_CACHE_FILE")"
+  else
+    echo "exit: unknown; run 'vpnctl geo'"
+  fi
+  echo "recent sing-box: proxy_events=$recent_proxy errors=$recent_errors"
+  echo
+  echo "More: vpnctl health | vpnctl node scan | vpnctl node verify | vpnctl node find"
+}
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  vpnctl on|off|toggle|status
+  vpnctl update [BLACK|WHITE]
+  vpnctl mode BLACK|WHITE
+  vpnctl subscriptions profile BLACK|WHITE
+  vpnctl subscription list|auto|next|prev|set <name-or-number>
+  vpnctl subscription import BLACK|WHITE <file> [name]
+  vpnctl node list|auto|next|prev|set <number>
+  vpnctl node test [current|number|tag]
+  vpnctl node scan
+  vpnctl node bench [limit] [url]
+  vpnctl node verify [url]
+  vpnctl node find [url]
+  vpnctl node pin
+  vpnctl health [url]
+  vpnctl geo
+  vpnctl exit-check
+  vpnctl rules profile BLACK|WHITE
+  vpnctl rules list
+  vpnctl rules enable <pack>
+  vpnctl rules disable <pack>
+EOF
+  exit 2
+}
+
+case "${1:-status}" in
+  on|off|toggle)
+    /usr/bin/vpn-toggle "$1"
+    ;;
+  status)
+    if [ "${2:-}" = "check" ]; then status_check; else status; fi
+    ;;
+  update)
+    if is_running; then
+      /usr/bin/vpn-subscriptions-update update "${2:-}"
+      mkdir -p "$(dirname "$AUTO_UPDATE_STATE_FILE")"
+      date +%s > "$AUTO_UPDATE_STATE_FILE"
+    else
+      logger -t vpnctl "VPN is off; subscription update skipped"
+      echo "VPN is off; subscription update skipped"
+    fi
+    ;;
+  mode)
+    [ $# -eq 2 ] || usage
+    set_mode "$2"
+    ;;
+  subscriptions|subscription-profile)
+    [ $# -eq 3 ] || usage
+    [ "$2" = "profile" ] || usage
+    set_subscription_profile "$3"
+    ;;
+  subscription)
+    [ $# -ge 2 ] || usage
+    case "$2" in
+      list)
+        subscription_list
+        ;;
+      auto)
+        subscription_set auto
+        ;;
+      next|prev)
+        subscription_set "$(next_group "$2")"
+        ;;
+      set)
+        [ $# -eq 3 ] || usage
+        subscription_set "$3"
+        ;;
+      import)
+        [ $# -ge 4 ] && [ $# -le 5 ] || usage
+        subscription_import "$3" "$4" "${5:-}"
+        ;;
+      *)
+        usage
+        ;;
+    esac
+    ;;
+  node)
+    [ $# -ge 2 ] || usage
+    case "$2" in
+      list)
+        node_list
+        ;;
+      auto)
+        node_set auto
+        ;;
+      next|prev)
+        node_nextprev "$2"
+        ;;
+      set)
+        [ $# -eq 3 ] || usage
+        node_set "$3"
+        ;;
+      test)
+        [ $# -le 3 ] || usage
+        node_test "${3:-current}"
+        ;;
+      scan)
+        [ $# -eq 2 ] || usage
+        node_scan
+        ;;
+      bench)
+        [ $# -le 4 ] || usage
+        node_bench "${3:-60}" "${4:-$BENCH_URL_DEFAULT}"
+        ;;
+      verify)
+        [ $# -le 3 ] || usage
+        node_verify "${3:-$CHECK_URL}"
+        ;;
+      find)
+        [ $# -le 3 ] || usage
+        node_find "${3:-$CHECK_URL}"
+        ;;
+      pin)
+        [ $# -eq 2 ] || usage
+        node_pin
+        ;;
+      *)
+        usage
+        ;;
+    esac
+    ;;
+  rules)
+    [ $# -ge 2 ] || usage
+    case "$2" in
+      profile)
+        [ $# -eq 3 ] || usage
+        set_rules_profile "$3"
+        ;;
+      list)
+        rules_list
+        ;;
+      enable)
+        [ $# -eq 3 ] || usage
+        rules_enable "$3"
+        ;;
+      disable)
+        [ $# -eq 3 ] || usage
+        rules_disable "$3"
+        ;;
+      *)
+        usage
+        ;;
+    esac
+    ;;
+  geo)
+    [ $# -eq 1 ] || usage
+    geo_probe
+    ;;
+  exit-check)
+    [ $# -eq 1 ] || usage
+    exit_check
+    ;;
+  health)
+    [ $# -le 2 ] || usage
+    /usr/bin/vpn-health-check "${2:-$CHECK_URL}"
+    ;;
+  *)
+    usage
+    ;;
+esac

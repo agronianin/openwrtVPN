@@ -1,0 +1,6 @@
+# Starter list, not a complete list of blocked services.
+rule blocked-services
+outbound vpn-out
+domain_suffix youtube.com youtu.be googlevideo.com ytimg.com telegram.org t.me whatsapp.com whatsapp.net openai.com chatgpt.com oaiusercontent.com github.com githubusercontent.com
+ip_cidr 91.108.4.0/22 91.108.8.0/22 91.108.12.0/22 91.108.16.0/22 91.108.20.0/22 91.108.56.0/22 149.154.160.0/20
+final direct

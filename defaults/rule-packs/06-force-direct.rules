@@ -1,0 +1,3 @@
+rule mirror-yandex-direct
+outbound direct
+domain_suffix mirror.yandex.ru

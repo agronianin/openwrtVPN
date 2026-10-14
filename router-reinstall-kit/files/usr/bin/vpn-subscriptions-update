@@ -1,0 +1,1295 @@
+#!/bin/sh
+set -eu
+
+if [ "${VPN_SUBSCRIPTIONS_LOCKED:-}" != 1 ] && [ "${1:-}" != status ]; then
+  exec flock -n -E 75 /tmp/vpn-subscriptions.lock env VPN_SUBSCRIPTIONS_LOCKED=1 "$0" "$@"
+fi
+
+CONFIG="/etc/sing-box/config.json"
+SETTINGS_FILE="/etc/sing-box/vpn-config/vpn-settings.conf"
+SUB_PROFILE_FILE="/etc/sing-box/vpn-config/vpn-subscription-profile"
+RULES_PROFILE_FILE="/etc/sing-box/vpn-config/vpn-rules-profile"
+LEGACY_MODE_FILE="/etc/sing-box/vpn-config/vpn-mode"
+GROUP_FILE="/etc/sing-box/vpn-config/vpn-group"
+NODE_FILE="/etc/sing-box/vpn-config/vpn-node"
+SUB_DIR="/etc/sing-box/subscriptions.d"
+CACHE_DIR="/etc/sing-box/subscriptions-cache"
+RULE_PACK_AVAILABLE="/etc/sing-box/rule-packs/available"
+RULE_PACK_ENABLED="/etc/sing-box/rule-packs/enabled"
+WORKDIR="/tmp/vpn-subscriptions-update.$$"
+
+CHECK_URL="https://www.gstatic.com/generate_204"
+VPN_BOOTSTRAP=0
+MIN_NODES=1
+BLACK_FAILOVER_TOLERANCE_MS=1500
+WHITE_FAILOVER_TOLERANCE_MS=60000
+
+log() {
+  logger -t vpn-subscriptions-update "$*"
+  echo "$*"
+}
+
+warn() {
+  logger -t vpn-subscriptions-update "$*"
+  echo "$*" >&2
+}
+
+fail() {
+  log "ERROR: $*"
+  exit 1
+}
+
+cleanup() {
+  rm -rf "$WORKDIR"
+}
+trap cleanup EXIT INT TERM
+
+load_settings() {
+  CHECK_URL="https://www.gstatic.com/generate_204"
+  MIN_NODES=1
+  BLACK_FAILOVER_TOLERANCE_MS=1500
+  WHITE_FAILOVER_TOLERANCE_MS=60000
+  UPDATE_INTERVAL_HOURS=6
+  [ -f "$SETTINGS_FILE" ] && . "$SETTINGS_FILE"
+}
+
+upper() {
+  printf '%s' "$1" | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+}
+
+lower() {
+  printf '%s' "$1" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz'
+}
+
+valid_profile() {
+  case "$(upper "$1")" in
+    BLACK|WHITE) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+subscription_profile() {
+  if [ "${1:-}" ]; then
+    profile="$(upper "$1")"
+  elif [ -s "$SUB_PROFILE_FILE" ]; then
+    profile="$(upper "$(sed -n '1p' "$SUB_PROFILE_FILE")")"
+  elif [ -s "$LEGACY_MODE_FILE" ]; then
+    profile="$(upper "$(sed -n '1p' "$LEGACY_MODE_FILE")")"
+  else
+    profile="BLACK"
+  fi
+  valid_profile "$profile" || fail "unsupported subscription profile: $profile"
+  printf '%s\n' "$profile"
+}
+
+rules_profile() {
+  if [ -s "$RULES_PROFILE_FILE" ]; then
+    profile="$(upper "$(sed -n '1p' "$RULES_PROFILE_FILE")")"
+  elif [ -s "$LEGACY_MODE_FILE" ]; then
+    profile="$(upper "$(sed -n '1p' "$LEGACY_MODE_FILE")")"
+  else
+    profile="BLACK"
+  fi
+  case "$profile" in
+    BLACK|WHITE|CUSTOM) ;;
+    *) profile="BLACK" ;;
+  esac
+  printf '%s\n' "$profile"
+}
+
+profile_file() {
+  case "$(upper "$1")" in
+    BLACK) echo "$SUB_DIR/black.txt" ;;
+    WHITE) echo "$SUB_DIR/white.txt" ;;
+    *) fail "unsupported profile: $1" ;;
+  esac
+}
+
+profile_prefix() {
+  lower "$(subscription_profile "$1")"
+}
+
+profile_tolerance() {
+  case "$(upper "$1")" in
+    BLACK) echo "$BLACK_FAILOVER_TOLERANCE_MS" ;;
+    WHITE) echo "$WHITE_FAILOVER_TOLERANCE_MS" ;;
+  esac
+}
+
+trim_file_lines() {
+  file="$(profile_file "$1")"
+  [ -f "$file" ] || return 0
+  sed -n '/^[[:space:]]*#/d; /^[[:space:]]*$/d; s/^[[:space:]]*//; s/[[:space:]]*$//; p' "$file"
+}
+
+url_decode() {
+  value="$1"
+  encoded="$(printf '%s' "$value" | sed 's/+/ /g; s/%/\\x/g')"
+  printf '%b' "$encoded" 2>/dev/null || printf '%s' "$value"
+}
+
+link_title() {
+  link="$1"
+  title="${link#*#}"
+  [ "$title" != "$link" ] || {
+    echo ""
+    return
+  }
+  url_decode "$title"
+}
+
+is_ru_title() {
+  title="$(lower "$1")"
+  case "$title" in
+    *russia*|*russian*|*россия*|*москва*|*🇷🇺*|*"[ru]"*|*"[ ru]"*|*" ru "|*" ru]"*|*"[ru "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+subscription_group_lines() {
+  profile="$1"
+  file="$(profile_file "$profile")"
+  [ -f "$file" ] || return 0
+  awk '
+    function trim(s) {
+      sub(/^[ \t]+/, "", s)
+      sub(/[ \t]+$/, "", s)
+      return s
+    }
+    function emit() {
+      if (group != "" && urls != "") print group " " urls
+    }
+    {
+      line = $0
+      sub(/[ \t]*#.*/, "", line)
+      line = trim(line)
+      if (line == "") next
+      if (line ~ /^\[[^]]+\]$/) {
+        emit()
+        group = line
+        sub(/^\[/, "", group)
+        sub(/\]$/, "", group)
+        urls = ""
+        next
+      }
+      if (line ~ /^https?:\/\// || line ~ /^file:\/\// || line ~ /^\//) {
+        if (group == "") {
+          auto += 1
+          printf "subscription-%02d %s\n", auto, line
+        } else {
+          urls = urls (urls == "" ? "" : " ") line
+        }
+      }
+    }
+    END { emit() }
+  ' "$file"
+}
+
+profile_groups() {
+  profile="$(subscription_profile "$1")"
+  prefix="$(profile_prefix "$profile")"
+  i=0
+  subscription_group_lines "$profile" | while IFS= read -r _line; do
+    i=$((i + 1))
+    printf '%s-%02d\n' "$prefix" "$i"
+  done
+}
+
+current_group() {
+  [ -s "$GROUP_FILE" ] && sed -n '1p' "$GROUP_FILE" || echo "auto"
+}
+
+current_node() {
+  [ -s "$NODE_FILE" ] && sed -n '1p' "$NODE_FILE" || echo "auto"
+}
+
+group_auto_tag() {
+  echo "$1-auto"
+}
+
+group_label() {
+  group="$1"
+  case "$group" in
+    black-*) printf 'BLACK subscription %s\n' "${group#black-}" ;;
+    white-*) printf 'WHITE subscription %s\n' "${group#white-}" ;;
+    auto) echo "auto" ;;
+    *) echo "$group" ;;
+  esac
+}
+
+fetch_to() {
+  url="$1"
+  out="$2"
+  case "$url" in
+    file://*)
+      cp "${url#file://}" "$out"
+      ;;
+    /*)
+      cp "$url" "$out"
+      ;;
+    *)
+      if [ "${VPN_BOOTSTRAP:-0}" = 1 ]; then
+        curl -fLsS --connect-timeout 5 --max-time 35 --noproxy '*' -o "$out" "$url"
+        return
+      fi
+      curl -fLsS --connect-timeout 5 --max-time 35 --noproxy '' \
+        --proxy socks5h://127.0.0.1:2080 -o "$out" "$url"
+      ;;
+  esac
+}
+
+decode_subscription() {
+  raw="$1"
+  links="$2"
+  tr -d '\r' < "$raw" > "$links"
+  if grep -Eq '^(vless|hysteria2|hy2)://' "$links"; then
+    grep -E '^(vless|hysteria2|hy2)://' "$links" > "$links.nodes"
+    return 0
+  fi
+  base64 -d "$raw" > "$links.decoded" 2>/dev/null || return 1
+  tr -d '\r' < "$links.decoded" > "$links"
+  grep -E '^(vless|hysteria2|hy2)://' "$links" > "$links.nodes"
+}
+
+query_get() {
+  key="$1"
+  printf '%s' "$query" | tr '&' '\n' | sed -n "s/^${key}=//p" | sed -n '1p'
+}
+
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+parse_group() {
+  group="$1"
+  links_file="$2"
+
+  tags="$WORKDIR/$group.tags"
+  nodes="$WORKDIR/$group.nodes"
+  titles="$WORKDIR/$group.titles"
+  preferred="$WORKDIR/$group.preferred"
+  seen="$WORKDIR/$group.seen"
+  : > "$tags"
+  : > "$nodes"
+  : > "$titles"
+  : > "$preferred"
+  : > "$seen"
+  count=0
+
+  while IFS= read -r link; do
+    title="$(link_title "$link")"
+    case "$link" in
+      hysteria2://*|hy2://*)
+        body="${link#hysteria2://}"
+        [ "$body" = "$link" ] && body="${link#hy2://}"
+        no_fragment="${body%%#*}"
+        password="${no_fragment%@*}"
+        after_at="${no_fragment#*@}"
+        [ "$after_at" != "$no_fragment" ] || continue
+        server_port="${after_at%%\?*}"
+        server_port="${server_port%%/*}"
+        server_port="${server_port%/}"
+        if [ "$after_at" != "${after_at#*\?}" ]; then
+          query="${after_at#*\?}"
+        else
+          query=""
+        fi
+
+        server="${server_port%:*}"
+        port="${server_port##*:}"
+        sni="$(query_get sni)"
+        insecure="$(query_get insecure)"
+        obfs="$(query_get obfs)"
+        obfs_password="$(query_get obfs-password)"
+        [ -n "$obfs_password" ] || obfs_password="$(query_get obfs_password)"
+
+        [ -n "$password" ] || continue
+        [ -n "$server" ] || continue
+        printf '%s' "$port" | grep -Eq '^[0-9]+$' || continue
+        [ -n "$sni" ] || sni="$server"
+
+        server_key="$(lower "$server")"
+        sni_key="$(lower "$sni")"
+        dedupe_key="hysteria2|$server_key|$port|$password|$sni_key|$insecure|$obfs|$obfs_password"
+        if grep -Fxq "$dedupe_key" "$seen"; then
+          continue
+        fi
+        printf '%s\n' "$dedupe_key" >> "$seen"
+
+        count=$((count + 1))
+        tag="$(printf '%s-%03d' "$group" "$count")"
+        printf '%s\n' "$tag" >> "$tags"
+        printf '%s\t%s\n' "$tag" "$title" >> "$titles"
+        is_ru_title "$title" && printf '%s\n' "$count" >> "$preferred"
+
+        tag_json="$(json_escape "$tag")"
+        server_json="$(json_escape "$server")"
+        password_json="$(json_escape "$password")"
+        sni_json="$(json_escape "$sni")"
+        obfs_json="$(json_escape "$obfs")"
+        obfs_password_json="$(json_escape "$obfs_password")"
+        tls_insecure=false
+        case "$insecure" in
+          1|true|TRUE|True) tls_insecure=true ;;
+        esac
+
+        cat >> "$nodes" <<EOF
+    {
+      "type": "hysteria2",
+      "tag": "$tag_json",
+      "server": "$server_json",
+      "server_port": $port,
+      "routing_mark": 32768,
+      "password": "$password_json",
+      "tls": {
+        "enabled": true,
+        "server_name": "$sni_json",
+        "insecure": $tls_insecure
+      }
+EOF
+        if [ -n "$obfs" ] && [ -n "$obfs_password" ]; then
+          cat >> "$nodes" <<EOF
+      ,
+      "obfs": {
+        "type": "$obfs_json",
+        "password": "$obfs_password_json"
+      }
+EOF
+        fi
+        cat >> "$nodes" <<EOF
+    },
+EOF
+        continue
+        ;;
+    esac
+
+    body="${link#vless://}"
+    no_fragment="${body%%#*}"
+    uuid="${no_fragment%@*}"
+    after_at="${no_fragment#*@}"
+    [ "$after_at" != "$no_fragment" ] || continue
+    server_port="${after_at%%\?*}"
+    server_port="${server_port%/}"
+    query="${after_at#*\?}"
+    [ "$query" != "$after_at" ] || continue
+
+    server="${server_port%:*}"
+    port="${server_port##*:}"
+    security="$(query_get security)"
+    transport="$(query_get type)"
+    sni="$(query_get sni)"
+    host="$(query_get host)"
+    path="$(query_get path)"
+    service_name="$(query_get serviceName)"
+    [ -n "$service_name" ] || service_name="$(query_get service_name)"
+    fp="$(query_get fp)"
+    flow="$(query_get flow)"
+    pbk="$(query_get pbk)"
+    sid="$(query_get sid)"
+
+    [ -n "$security" ] || security="none"
+    [ "$security" = "false" ] && security="none"
+    [ -n "$transport" ] || transport="tcp"
+    case "$security" in
+      reality|tls|none) ;;
+      *) continue ;;
+    esac
+    case "$transport" in
+      tcp|ws|grpc) ;;
+      *) continue ;;
+    esac
+    [ -n "$uuid" ] || continue
+    [ -n "$server" ] || continue
+    printf '%s' "$port" | grep -Eq '^[0-9]+$' || continue
+
+    if [ "$security" = "reality" ]; then
+      [ "$transport" = "tcp" ] || continue
+      [ -n "$sni" ] || continue
+      [ -n "$pbk" ] || continue
+      [ -n "$flow" ] || flow="xtls-rprx-vision"
+      [ -n "$fp" ] || fp="firefox"
+    elif [ "$security" = "tls" ]; then
+      [ -n "$sni" ] || sni="$host"
+    fi
+    if [ "$transport" = "ws" ] && [ -z "$path" ]; then
+      path="/"
+    fi
+
+    server_key="$(lower "$server")"
+    sni_key="$(lower "$sni")"
+    host_key="$(lower "$host")"
+    dedupe_key="vless|$server_key|$port|$uuid|$security|$transport|$sni_key|$host_key|$path|$service_name|$flow|$pbk|$sid"
+    if grep -Fxq "$dedupe_key" "$seen"; then
+      continue
+    fi
+    printf '%s\n' "$dedupe_key" >> "$seen"
+
+    count=$((count + 1))
+    tag="$(printf '%s-%03d' "$group" "$count")"
+    printf '%s\n' "$tag" >> "$tags"
+    printf '%s\t%s\n' "$tag" "$title" >> "$titles"
+    is_ru_title "$title" && printf '%s\n' "$count" >> "$preferred"
+
+    tag_json="$(json_escape "$tag")"
+    server_json="$(json_escape "$server")"
+    uuid_json="$(json_escape "$uuid")"
+    flow_json="$(json_escape "$flow")"
+    sni_json="$(json_escape "$sni")"
+    fp_json="$(json_escape "$fp")"
+    pbk_json="$(json_escape "$pbk")"
+    sid_json="$(json_escape "$sid")"
+    host_json="$(json_escape "$host")"
+    path_json="$(json_escape "$path")"
+    service_name_json="$(json_escape "$service_name")"
+
+    cat >> "$nodes" <<EOF
+    {
+      "type": "vless",
+      "tag": "$tag_json",
+      "server": "$server_json",
+      "server_port": $port,
+      "routing_mark": 32768,
+      "uuid": "$uuid_json"
+EOF
+    if [ "$security" = "reality" ] && [ "$transport" = "tcp" ] && [ -n "$flow" ]; then
+      cat >> "$nodes" <<EOF
+      ,
+      "flow": "$flow_json"
+EOF
+    fi
+    if [ "$security" = "reality" ]; then
+      cat >> "$nodes" <<EOF
+      ,
+      "tls": {
+        "enabled": true,
+        "server_name": "$sni_json",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "$fp_json"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "$pbk_json",
+          "short_id": "$sid_json"
+        }
+      }
+EOF
+    elif [ "$security" = "tls" ]; then
+      cat >> "$nodes" <<EOF
+      ,
+      "tls": {
+        "enabled": true,
+        "server_name": "$sni_json"
+EOF
+      if [ -n "$fp" ]; then
+        cat >> "$nodes" <<EOF
+        ,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "$fp_json"
+        }
+EOF
+      fi
+      cat >> "$nodes" <<EOF
+      }
+EOF
+    fi
+    if [ "$transport" = "ws" ]; then
+      cat >> "$nodes" <<EOF
+      ,
+      "transport": {
+        "type": "ws",
+        "path": "$path_json"
+EOF
+      if [ -n "$host" ]; then
+        cat >> "$nodes" <<EOF
+        ,
+        "headers": {
+          "Host": "$host_json"
+        }
+EOF
+      fi
+      cat >> "$nodes" <<EOF
+      }
+EOF
+    elif [ "$transport" = "grpc" ]; then
+      cat >> "$nodes" <<EOF
+      ,
+      "transport": {
+        "type": "grpc",
+        "service_name": "$service_name_json"
+      }
+EOF
+    fi
+    cat >> "$nodes" <<EOF
+      ,
+      "packet_encoding": "xudp"
+    },
+EOF
+  done < "$links_file"
+
+  parsed_count="$count"
+}
+
+try_refresh_group_url() {
+  group="$1"
+  label="$2"
+  url="$3"
+  source_name="$4"
+  raw="$WORKDIR/$group.raw"
+  links="$WORKDIR/$group.links"
+
+  if ! fetch_to "$url" "$raw"; then
+    warn "$label: mirror download failed: $url"
+    return 1
+  fi
+
+  if ! decode_subscription "$raw" "$links"; then
+    warn "$label: mirror cannot decode subscription: $url"
+    return 1
+  fi
+
+  parse_group "$group" "$links.nodes"
+  if [ "$parsed_count" -lt "$MIN_NODES" ]; then
+    warn "$label: mirror has only $parsed_count usable nodes: $url"
+    return 1
+  fi
+
+  mkdir -p "$CACHE_DIR"
+  cp "$WORKDIR/$group.tags" "$CACHE_DIR/$group.tags"
+  cp "$WORKDIR/$group.nodes" "$CACHE_DIR/$group.nodes"
+  cp "$WORKDIR/$group.titles" "$CACHE_DIR/$group.titles"
+  cp "$WORKDIR/$group.preferred" "$CACHE_DIR/$group.preferred"
+  printf '%s\n' "$parsed_count" > "$CACHE_DIR/$group.count"
+  date '+%Y-%m-%d %H:%M:%S %z' > "$CACHE_DIR/$group.updated"
+  printf '%s\n' "$url" > "$CACHE_DIR/$group.url"
+  printf '%s\n' "$source_name" > "$CACHE_DIR/$group.name"
+  log "$label: cache updated with $parsed_count usable nodes from $source_name"
+}
+
+refresh_group() {
+  group="$1"
+  source_name="$2"
+  shift 2
+  label="$(group_label "$group")"
+
+  for url in "$@"; do
+    if try_refresh_group_url "$group" "$label" "$url" "$source_name"; then
+      return 0
+    fi
+  done
+  warn "$label: all mirrors failed, keeping previous cache if present"
+  return 1
+}
+
+refresh_profile() {
+  profile="$(subscription_profile "$1")"
+  file="$(profile_file "$profile")"
+  prefix="$(profile_prefix "$profile")"
+  ok=0
+  failed=0
+  i=0
+
+  [ -f "$file" ] || {
+    warn "$profile: subscription file not found: $file"
+    return 1
+  }
+
+  subscription_group_lines "$profile" | while IFS= read -r line; do
+    i=$((i + 1))
+    group="$(printf '%s-%02d' "$prefix" "$i")"
+    set -- $line
+    source_name="$1"
+    shift
+    if refresh_group "$group" "$source_name" "$@"; then
+      ok=$((ok + 1))
+    else
+      failed=$((failed + 1))
+    fi
+    printf '%s %s\n' "$ok" "$failed" > "$WORKDIR/$profile.refresh-result"
+  done
+
+  if [ -s "$WORKDIR/$profile.refresh-result" ]; then
+    set -- $(sed -n '$p' "$WORKDIR/$profile.refresh-result")
+    ok="$1"
+    failed="$2"
+  fi
+  log "$profile subscription refresh complete: updated=$ok failed=$failed"
+}
+
+refresh_all() {
+  mkdir -p "$WORKDIR" "$CACHE_DIR"
+  refresh_profile BLACK || true
+  refresh_profile WHITE || true
+}
+
+refresh_selected() {
+  mkdir -p "$WORKDIR" "$CACHE_DIR"
+  if [ -n "${1:-}" ]; then
+    refresh_profile "$(subscription_profile "$1")" || true
+  else
+    refresh_all
+  fi
+}
+
+refresh_one_group_number() {
+  profile="$(subscription_profile "$1")"
+  number="$2"
+  file="$(profile_file "$profile")"
+  prefix="$(profile_prefix "$profile")"
+  i=0
+
+  printf '%s' "$number" | grep -Eq '^[0-9]+$' || fail "group number must be numeric"
+  mkdir -p "$WORKDIR" "$CACHE_DIR"
+  [ -f "$file" ] || fail "$profile: subscription file not found: $file"
+
+  subscription_group_lines "$profile" | while IFS= read -r line; do
+    i=$((i + 1))
+    [ "$i" = "$number" ] || continue
+    group="$(printf '%s-%02d' "$prefix" "$i")"
+    set -- $line
+    source_name="$1"
+    shift
+    refresh_group "$group" "$source_name" "$@" || true
+    printf '%s\n' "$group" > "$WORKDIR/refreshed-one-group"
+  done
+
+  [ -s "$WORKDIR/refreshed-one-group" ] || fail "$profile: no subscription group number $number"
+}
+
+cache_count() {
+  group="$1"
+  [ -s "$CACHE_DIR/$group.count" ] || {
+    echo 0
+    return
+  }
+  sed -n '1p' "$CACHE_DIR/$group.count"
+}
+
+cache_available() {
+  group="$1"
+  [ -s "$CACHE_DIR/$group.tags" ] || return 1
+  [ -s "$CACHE_DIR/$group.nodes" ] || return 1
+  count="$(cache_count "$group")"
+  [ "$count" -ge "$MIN_NODES" ] 2>/dev/null
+}
+
+cache_manual_group() {
+  group="$1"
+  name="$(sed -n '1p' "$CACHE_DIR/$group.name" 2>/dev/null || true)"
+  url="$(sed -n '1p' "$CACHE_DIR/$group.url" 2>/dev/null || true)"
+  case "$name" in
+    manual-*) return 0 ;;
+  esac
+  case "$url" in
+    file://"$SUB_DIR"/manual-subscriptions/*|file:///etc/sing-box/manual-subscriptions/*|/etc/sing-box/manual-subscriptions/*) return 0 ;;
+  esac
+  return 1
+}
+
+group_in_profile() {
+  wanted="$1"
+  profile="$2"
+  for group in $(profile_groups "$profile"); do
+    [ "$group" = "$wanted" ] && return 0
+  done
+  return 1
+}
+
+first_available_group() {
+  profile="$1"
+  for group in $(profile_groups "$profile"); do
+    if cache_available "$group" && ! cache_manual_group "$group"; then
+      echo "$group"
+      return 0
+    fi
+  done
+  for group in $(profile_groups "$profile"); do
+    if cache_available "$group"; then
+      echo "$group"
+      return 0
+    fi
+  done
+  return 1
+}
+
+write_tag_array() {
+  tags_file="$1"
+  indent="$2"
+  total="$(wc -l < "$tags_file" | tr -d ' ')"
+  i=0
+  while IFS= read -r tag; do
+    i=$((i + 1))
+    if [ "$i" -lt "$total" ]; then
+      printf '%s"%s",\n' "$indent" "$tag"
+    else
+      printf '%s"%s"\n' "$indent" "$tag"
+    fi
+  done < "$tags_file"
+}
+
+write_urltest_group() {
+  tag="$1"
+  tags_file="$2"
+  interval="$3"
+  tolerance="$4"
+  cat <<EOF
+    {
+      "type": "urltest",
+      "tag": "$tag",
+      "outbounds": [
+EOF
+  write_tag_array "$tags_file" "        "
+  cat <<EOF
+      ],
+      "url": "$CHECK_URL",
+      "interval": "$interval",
+      "tolerance": $tolerance,
+      "interrupt_exist_connections": false
+    },
+EOF
+}
+
+write_auto_group() {
+  profile="$1"
+  group="$2"
+  if [ "$profile" != "BLACK" ]; then
+    write_urltest_group "$(group_auto_tag "$group")" "$(group_urltest_tags_file "$profile" "$group")" "10m" 50
+    return
+  fi
+  non_ru="$WORKDIR/$group.non-ru-tags"
+  awk 'FILENAME==ARGV[1] {ru[$1]=1; next} !(FNR in ru)' "$CACHE_DIR/$group.preferred" "$CACHE_DIR/$group.tags" > "$non_ru"
+  if [ ! -s "$non_ru" ]; then
+    write_urltest_group "$(group_auto_tag "$group")" "$CACHE_DIR/$group.tags" "10m" 50
+    return
+  fi
+  write_urltest_group "$group-non-ru-auto" "$non_ru" "10m" 50
+  write_urltest_group "$group-fallback-auto" "$CACHE_DIR/$group.tags" "10m" 50
+  printf '%s\n' "$group-non-ru-auto" "$group-fallback-auto" > "$WORKDIR/$group.priority-tags"
+  write_urltest_group "$(group_auto_tag "$group")" "$WORKDIR/$group.priority-tags" "10m" 60000
+}
+
+group_urltest_tags_file() {
+  profile="$1"
+  group="$2"
+  tags_file="$CACHE_DIR/$group.tags"
+  preferred_file="$CACHE_DIR/$group.preferred"
+  out="$WORKDIR/$group.urltest-tags"
+
+  if [ "$profile" = "WHITE" ] && [ -s "$preferred_file" ]; then
+    : > "$out"
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      tag="$(sed -n "${n}p" "$tags_file" 2>/dev/null || true)"
+      [ -n "$tag" ] && printf '%s\n' "$tag" >> "$out"
+    done < "$preferred_file"
+    if [ -s "$out" ]; then
+      echo "$out"
+      return 0
+    fi
+  fi
+
+  echo "$tags_file"
+}
+
+prepare_build_inputs() {
+  profile="$1"
+  selected_group="$(current_group)"
+  selected_node="$(current_node)"
+  effective_group=""
+  effective_node="auto"
+
+  : > "$WORKDIR/included-groups"
+  : > "$WORKDIR/top-tags"
+  : > "$WORKDIR/all-nodes"
+  : > "$WORKDIR/available-groups"
+
+  available_count=0
+  normal_available_count=0
+  for group in $(profile_groups "$profile"); do
+    if cache_available "$group"; then
+      available_count=$((available_count + 1))
+      if ! cache_manual_group "$group"; then
+        printf '%s\n' "$group" >> "$WORKDIR/available-groups"
+        normal_available_count=$((normal_available_count + 1))
+      fi
+    fi
+  done
+  [ "$available_count" -gt 0 ] || fail "$profile: no cached subscription groups available; run update while VPN is on"
+  if [ "$normal_available_count" -eq 0 ]; then
+    for group in $(profile_groups "$profile"); do
+      cache_available "$group" && printf '%s\n' "$group" >> "$WORKDIR/available-groups"
+    done
+  fi
+
+  if [ "$selected_group" != "auto" ]; then
+    if group_in_profile "$selected_group" "$profile" && cache_available "$selected_group"; then
+      effective_group="$selected_group"
+    else
+      warn "$profile: selected subscription $selected_group is unavailable, falling back to auto"
+      selected_group="auto"
+    fi
+  fi
+
+  if [ "$selected_node" != "auto" ]; then
+    if [ -z "$effective_group" ]; then
+      effective_group="$(first_available_group "$profile")"
+      warn "$profile: node override requires a subscription; using $effective_group"
+    fi
+    count="$(cache_count "$effective_group")"
+    if printf '%s' "$selected_node" | grep -Eq '^[0-9]+$' && [ "$selected_node" -ge 1 ] && [ "$selected_node" -le "$count" ]; then
+      effective_node="$selected_node"
+    else
+      warn "$profile: selected node $selected_node is invalid for $effective_group, falling back to auto"
+      effective_node="auto"
+    fi
+  fi
+
+  if [ "$effective_node" != "auto" ]; then
+    printf '%s\n' "$effective_group" > "$WORKDIR/included-groups"
+    sed -n "${effective_node}p" "$CACHE_DIR/$effective_group.tags" > "$WORKDIR/top-tags"
+  elif [ -n "$effective_group" ]; then
+    printf '%s\n' "$effective_group" > "$WORKDIR/included-groups"
+    group_auto_tag "$effective_group" > "$WORKDIR/top-tags"
+  else
+    cp "$WORKDIR/available-groups" "$WORKDIR/included-groups"
+    while IFS= read -r group; do
+      group_auto_tag "$group"
+    done < "$WORKDIR/included-groups" > "$WORKDIR/top-tags"
+  fi
+
+  while IFS= read -r group; do
+    cat "$CACHE_DIR/$group.nodes" >> "$WORKDIR/all-nodes"
+  done < "$WORKDIR/included-groups"
+
+  printf '%s\n' "$effective_group" > "$WORKDIR/effective-group"
+  printf '%s\n' "$effective_node" > "$WORKDIR/effective-node"
+}
+
+reset_rule() {
+  RULE_NAME=""
+  RULE_OUTBOUND=""
+  RULE_DOMAIN=""
+  RULE_DOMAIN_SUFFIX=""
+  RULE_DOMAIN_KEYWORD=""
+  RULE_IP_CIDR=""
+  RULE_RULE_SET=""
+}
+
+append_values() {
+  old="$1"
+  shift
+  if [ -n "$old" ]; then
+    printf '%s %s\n' "$old" "$*"
+  else
+    printf '%s\n' "$*"
+  fi
+}
+
+append_rule_set_json() {
+  tag="$1"
+  format="$2"
+  path="$3"
+  grep -qx "$tag" "$WORKDIR/ruleset-tags" 2>/dev/null && return 0
+  printf '%s\n' "$tag" >> "$WORKDIR/ruleset-tags"
+  RULE_SET_COUNT=$((RULE_SET_COUNT + 1))
+  [ "$RULE_SET_COUNT" -gt 1 ] && printf ',\n' >> "$RULE_SET_JSON"
+  tag_json="$(json_escape "$tag")"
+  format_json="$(json_escape "$format")"
+  path_json="$(json_escape "$path")"
+  cat >> "$RULE_SET_JSON" <<EOF
+      {
+        "type": "local",
+        "tag": "$tag_json",
+        "format": "$format_json",
+        "path": "$path_json"
+      }
+EOF
+}
+
+prop_prefix() {
+  if [ "$PROP_FIRST" = "1" ]; then
+    PROP_FIRST=0
+  else
+    printf ',\n' >> "$ROUTE_RULES_JSON"
+  fi
+}
+
+write_array_prop() {
+  name="$1"
+  values="$2"
+  [ -n "$values" ] || return 0
+  prop_prefix
+  printf '        "%s": [\n' "$name" >> "$ROUTE_RULES_JSON"
+  total="$(printf '%s\n' $values | wc -l | tr -d ' ')"
+  i=0
+  for value in $values; do
+    i=$((i + 1))
+    value_json="$(json_escape "$value")"
+    if [ "$i" -lt "$total" ]; then
+      printf '          "%s",\n' "$value_json" >> "$ROUTE_RULES_JSON"
+    else
+      printf '          "%s"\n' "$value_json" >> "$ROUTE_RULES_JSON"
+    fi
+  done
+  printf '        ]' >> "$ROUTE_RULES_JSON"
+}
+
+write_scalar_prop() {
+  name="$1"
+  value="$2"
+  prop_prefix
+  value_json="$(json_escape "$value")"
+  printf '        "%s": "%s"' "$name" "$value_json" >> "$ROUTE_RULES_JSON"
+}
+
+flush_rule() {
+  [ -n "$RULE_NAME" ] || return 0
+  [ -n "$RULE_OUTBOUND" ] || {
+    warn "rule pack: rule $RULE_NAME has no outbound, skipped"
+    reset_rule
+    return 0
+  }
+  [ -n "$RULE_DOMAIN$RULE_DOMAIN_SUFFIX$RULE_DOMAIN_KEYWORD$RULE_IP_CIDR$RULE_RULE_SET" ] || {
+    warn "rule pack: rule $RULE_NAME has no match criteria, skipped"
+    reset_rule
+    return 0
+  }
+
+  RULE_COUNT=$((RULE_COUNT + 1))
+  [ "$RULE_COUNT" -gt 1 ] && printf ',\n' >> "$ROUTE_RULES_JSON"
+  printf '      {\n' >> "$ROUTE_RULES_JSON"
+  PROP_FIRST=1
+  write_array_prop domain "$RULE_DOMAIN"
+  write_array_prop domain_suffix "$RULE_DOMAIN_SUFFIX"
+  write_array_prop domain_keyword "$RULE_DOMAIN_KEYWORD"
+  write_array_prop ip_cidr "$RULE_IP_CIDR"
+  write_array_prop rule_set "$RULE_RULE_SET"
+  write_scalar_prop outbound "$RULE_OUTBOUND"
+  printf '\n      }' >> "$ROUTE_RULES_JSON"
+  reset_rule
+}
+
+parse_rule_pack() {
+  file="$1"
+  reset_rule
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"
+    line="$(printf '%s' "$line" | tr -d '\r')"
+    set -- $line
+    [ "$#" -gt 0 ] || continue
+    key="$1"
+    shift
+    case "$key" in
+      ruleset)
+        [ "$#" -ge 3 ] || {
+          warn "$file: invalid ruleset line"
+          continue
+        }
+        append_rule_set_json "$1" "$2" "$3"
+        ;;
+      rule)
+        flush_rule
+        [ "$#" -ge 1 ] || {
+          warn "$file: invalid rule line"
+          continue
+        }
+        RULE_NAME="$1"
+        ;;
+      outbound)
+        [ "$#" -ge 1 ] && RULE_OUTBOUND="$1"
+        ;;
+      domain)
+        [ "$#" -ge 1 ] && RULE_DOMAIN="$(append_values "$RULE_DOMAIN" "$@")"
+        ;;
+      domain_suffix)
+        [ "$#" -ge 1 ] && RULE_DOMAIN_SUFFIX="$(append_values "$RULE_DOMAIN_SUFFIX" "$@")"
+        ;;
+      domain_keyword)
+        [ "$#" -ge 1 ] && RULE_DOMAIN_KEYWORD="$(append_values "$RULE_DOMAIN_KEYWORD" "$@")"
+        ;;
+      ip_cidr)
+        [ "$#" -ge 1 ] && RULE_IP_CIDR="$(append_values "$RULE_IP_CIDR" "$@")"
+        ;;
+      rule_set)
+        [ "$#" -ge 1 ] && RULE_RULE_SET="$(append_values "$RULE_RULE_SET" "$@")"
+        ;;
+      final)
+        [ "$#" -ge 1 ] && ROUTE_FINAL="$1"
+        ;;
+      *)
+        warn "$file: unknown key $key"
+        ;;
+    esac
+  done < "$file"
+  flush_rule
+}
+
+prepare_route() {
+  RULE_SET_JSON="$WORKDIR/rule-sets.json"
+  ROUTE_RULES_JSON="$WORKDIR/route-rules.json"
+  : > "$RULE_SET_JSON"
+  : > "$ROUTE_RULES_JSON"
+  : > "$WORKDIR/ruleset-tags"
+  RULE_SET_COUNT=0
+  RULE_COUNT=0
+  ROUTE_FINAL="direct"
+  reset_rule
+
+  if [ -d "$RULE_PACK_ENABLED" ]; then
+    ls "$RULE_PACK_ENABLED"/*.rules > "$WORKDIR/enabled-rule-packs" 2>/dev/null || true
+    sort "$WORKDIR/enabled-rule-packs" > "$WORKDIR/enabled-rule-packs.sorted"
+    while IFS= read -r pack; do
+      [ -n "$pack" ] || continue
+      parse_rule_pack "$pack"
+    done < "$WORKDIR/enabled-rule-packs.sorted"
+  fi
+
+  printf '%s\n' "$ROUTE_FINAL" > "$WORKDIR/route-final"
+}
+
+write_config() {
+  profile="$1"
+  out="$WORKDIR/config.json"
+  top_tolerance="$(profile_tolerance "$profile")"
+  dns_rule_server="yandex-direct"
+  dns_final="yandex-direct"
+  # Keep WHITE DNS direct. If the current VPN node dies, allowlisted sites must
+  # still resolve and work directly; non-allowlisted traffic is still routed by
+  # final=vpn-out below.
+  if [ "$(cat "$WORKDIR/effective-node")" != "auto" ] || [ -n "$(cat "$WORKDIR/effective-group")" ]; then
+    top_tolerance=50
+  fi
+
+  {
+    cat <<EOF
+{
+  "log": {
+    "level": "info"
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "yandex-direct",
+        "type": "udp",
+        "server": "77.88.8.8"
+      },
+      {
+        "tag": "yandex-secondary-direct",
+        "type": "udp",
+        "server": "77.88.8.1"
+      },
+      {
+        "tag": "alidns-direct",
+        "type": "https",
+        "server": "223.5.5.5"
+      },
+      {
+        "tag": "cloudflare-proxy",
+        "type": "https",
+        "server": "1.1.1.1",
+        "detour": "vpn-out"
+      },
+      {
+        "tag": "google-proxy",
+        "type": "https",
+        "server": "8.8.8.8",
+        "detour": "vpn-out"
+      }
+    ],
+    "rules": [
+      {
+        "domain_suffix": [
+          "ru",
+          "su",
+          "xn--p1ai"
+        ],
+        "server": "$dns_rule_server"
+      }
+    ],
+    "final": "$dns_final",
+    "strategy": "ipv4_only"
+  },
+  "experimental": {
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "access_control_allow_origin": ["http://127.0.0.1"],
+      "access_control_allow_private_network": false
+    }
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "vpn-check-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    },
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "tun0",
+      "address": [
+        "172.19.0.1/30"
+      ],
+      "mtu": 1500,
+      "stack": "gvisor",
+      "auto_route": true,
+      "strict_route": false
+    }
+  ],
+  "outbounds": [
+EOF
+    write_urltest_group "vpn-out" "$WORKDIR/top-tags" "5m" "$top_tolerance"
+    while IFS= read -r group; do
+      write_auto_group "$profile" "$group"
+    done < "$WORKDIR/included-groups"
+    cat "$WORKDIR/all-nodes"
+    cat <<EOF
+    {
+      "type": "direct",
+      "tag": "direct",
+      "routing_mark": 32768
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "default_domain_resolver": {
+      "server": "$dns_final",
+      "strategy": "ipv4_only"
+    },
+    "rule_set": [
+EOF
+    cat "$RULE_SET_JSON"
+    cat <<'EOF'
+    ],
+    "rules": [
+      {
+        "inbound": ["vpn-check-in"],
+        "action": "route",
+        "outbound": "vpn-out"
+      },
+      {
+        "action": "sniff"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      }
+EOF
+    if [ -s "$ROUTE_RULES_JSON" ]; then
+      printf ',\n'
+      cat "$ROUTE_RULES_JSON"
+    fi
+    cat <<EOF
+    ],
+    "final": "$(cat "$WORKDIR/route-final")"
+  }
+}
+EOF
+  } > "$out"
+}
+
+is_running() {
+  /etc/init.d/sing-box status >/dev/null 2>&1
+}
+
+build_config() {
+  profile="$(subscription_profile "${1:-}")"
+  mkdir -p "$WORKDIR"
+  prepare_build_inputs "$profile"
+  prepare_route
+  write_config "$profile"
+  printf '%s\n' "$profile" > "$WORKDIR/build-profile"
+}
+
+install_config() {
+  tmp_config="$WORKDIR/config.json"
+  sing-box check -c "$tmp_config"
+  cp "$CONFIG" /tmp/sing-box-config.previous 2>/dev/null || true
+  cp "$tmp_config" "$CONFIG"
+  if is_running; then
+    /etc/init.d/sing-box restart
+  else
+    log "active config installed; sing-box is stopped"
+  fi
+}
+
+status() {
+  sub_profile="$(subscription_profile)"
+  rule_profile="$(rules_profile)"
+  load_settings
+  echo "subscription profile: $sub_profile"
+  echo "rules profile: $rule_profile"
+  echo "selected subscription: $(current_group)"
+  echo "selected node: $(current_node)"
+  echo "update interval hours: $UPDATE_INTERVAL_HOURS"
+  echo "subscription files:"
+  echo "  BLACK: $(profile_file BLACK)"
+  echo "  WHITE: $(profile_file WHITE)"
+  echo
+  echo "cache:"
+  for profile in BLACK WHITE; do
+    for group in $(profile_groups "$profile"); do
+      count="$(cache_count "$group")"
+      updated="$(sed -n '1p' "$CACHE_DIR/$group.updated" 2>/dev/null || true)"
+      name="$(sed -n '1p' "$CACHE_DIR/$group.name" 2>/dev/null || true)"
+      printf '  %-8s count=%-4s updated=%s %s\n' "$group" "$count" "$updated" "$name"
+    done
+  done
+  echo
+  echo "enabled rule packs:"
+  if ls "$RULE_PACK_ENABLED"/*.rules >/dev/null 2>&1; then
+    for pack in $(ls "$RULE_PACK_ENABLED"/*.rules 2>/dev/null | sort); do
+      name="$(basename "$pack" .rules | sed 's/^[0-9][0-9]-//')"
+      echo "  $name ($(basename "$pack"))"
+    done
+  else
+    echo "  none"
+  fi
+}
+
+load_settings
+
+case "${1:-update}" in
+  bootstrap)
+    if is_running; then fail 'Stop VPN before bootstrap; active connection not changed'; fi
+    VPN_BOOTSTRAP=1
+    refresh_selected "${2:-}"
+    build_config "$(subscription_profile "${2:-}")"
+    install_config
+    log 'Bootstrap complete; VPN remains stopped. Run vpnctl on when ready.'
+    ;;
+  refresh)
+    refresh_selected "${2:-}"
+    ;;
+  update)
+    refresh_selected "${2:-}"
+    log 'Subscription cache refreshed; active connection unchanged'
+    ;;
+  update-one)
+    [ $# -eq 3 ] || {
+      echo "Usage: $0 update-one BLACK|WHITE <group-number>" >&2
+      exit 2
+    }
+    refresh_one_group_number "$2" "$3"
+    log 'Subscription cache refreshed; active connection unchanged'
+    ;;
+  rebuild)
+    build_config "$(subscription_profile "${2:-}")"
+    install_config
+    log "$(cat "$WORKDIR/build-profile") config rebuilt from cache"
+    ;;
+  check)
+    build_config "$(subscription_profile "${2:-}")"
+    sing-box check -c "$WORKDIR/config.json"
+    log "$(cat "$WORKDIR/build-profile") config is valid; active config not changed"
+    ;;
+  status)
+    status
+    ;;
+  *)
+    echo "Usage: $0 {update|refresh|rebuild|check|status} [BLACK|WHITE]" >&2
+    echo "       $0 update-one BLACK|WHITE <group-number>" >&2
+    exit 2
+    ;;
+esac

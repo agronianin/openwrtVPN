@@ -1,0 +1,199 @@
+#!/bin/sh
+
+TAG="vpn-toggle"
+LAN_INTERFACE="$(uci -q get openwrtvpn.main.lan_interface || echo lan)"
+LAN_DEV="$(ubus call "network.interface.$LAN_INTERFACE" status 2>/dev/null | jsonfilter -e '@.l3_device')"
+LAN_IP="$(ubus call "network.interface.$LAN_INTERFACE" status 2>/dev/null | jsonfilter -e '@["ipv4-address"][0].address')"
+VPN_MARK="0x8000/0xf000"
+
+log() {
+    logger -t "$TAG" "$*"
+    echo "$*"
+}
+
+set_baseline_dns() {
+    uci -q delete dhcp.@dnsmasq[0].server
+    uci add_list dhcp.@dnsmasq[0].server='77.88.8.8'
+    uci add_list dhcp.@dnsmasq[0].server='77.88.8.1'
+    uci set dhcp.@dnsmasq[0].noresolv='1'
+    if uci -q get network.wan.proto >/dev/null; then
+        uci set network.wan.peerdns='0'
+        uci -q delete network.wan.dns
+        uci add_list network.wan.dns='77.88.8.8'
+        uci add_list network.wan.dns='77.88.8.1'
+    fi
+    uci -q set network.wan6.peerdns='0'
+    uci -q delete network.wan6.dns
+    uci commit dhcp
+    uci commit network
+    mkdir -p /tmp/resolv.conf.d
+    {
+        echo '# Static VPN baseline DNS'
+        echo 'nameserver 77.88.8.8'
+        echo 'nameserver 77.88.8.1'
+    } > /tmp/resolv.conf.d/resolv.conf.auto
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+}
+
+set_gl_vpn_rules_disabled() {
+    disabled="$1"
+    changed=0
+    for section in $(uci show network | sed -n "s/^network\.\([^.]*\)\.gl_vpn_rules='1'.*/\1/p"); do
+        uci set network."$section".disabled="$disabled"
+        changed=1
+    done
+    [ "$changed" = "1" ] && uci commit network
+}
+
+set_default_novpn_policy_enabled() {
+    enabled="$1"
+    if [ "$(uci -q get route_policy.@default[0].via)" = "novpn" ]; then
+        uci set route_policy.@default[0].enabled="$enabled"
+        uci commit route_policy
+        /etc/init.d/vpn-client start >/dev/null 2>&1 || true
+    fi
+}
+
+del_prio4() {
+    while ip rule del priority "$1" 2>/dev/null; do :; done
+}
+
+del_prio6() {
+    while ip -6 rule del priority "$1" 2>/dev/null; do :; done
+}
+
+cleanup_runtime_rules() {
+    priorities='800 6000'
+    if uci -q get route_policy.@default[0] >/dev/null; then
+        priorities="$priorities 9000 9001 9002 9010 9910 9920"
+    fi
+    for prio in $priorities; do
+        del_prio4 "$prio"
+        del_prio6 "$prio"
+    done
+    ip route flush table 2022 2>/dev/null || true
+    ip route flush table 9910 2>/dev/null || true
+    ip -6 route flush table 2022 2>/dev/null || true
+    ip -6 route flush table 9910 2>/dev/null || true
+}
+
+add_support_rules() {
+    del_prio4 800
+    del_prio4 6000
+    del_prio6 800
+    del_prio6 6000
+    if uci -q get route_policy.@default[0] >/dev/null; then
+        del_prio4 9910
+        del_prio4 9920
+        del_prio6 9910
+        del_prio6 9920
+    fi
+
+    [ -n "$LAN_DEV" ] && [ -n "$LAN_IP" ] || { log 'LAN interface not ready'; return 1; }
+    # Preserve connected networks, including SSH, without assuming a LAN subnet.
+    ip route show table main scope link | while IFS= read -r route; do
+        case " $route " in *' dev tun0 '*) continue ;; esac
+        ip route replace table 9910 $route 2>/dev/null || true
+    done
+    ip rule add priority 800 table 9910 suppress_prefixlength 0 2>/dev/null || true
+    ip rule add priority 6000 fwmark "$VPN_MARK" table main 2>/dev/null || true
+
+    ip -6 rule add priority 800 table 9910 suppress_prefixlength 0 2>/dev/null || true
+    ip -6 rule add priority 6000 fwmark "$VPN_MARK" table main 2>/dev/null || true
+}
+
+vpn_on() {
+    if ! jq -e 'any(.outbounds[]?; .tag == "vpn-out")' /etc/sing-box/config.json >/dev/null 2>&1; then
+        log 'No VPN nodes configured; run vpn-subscriptions-update bootstrap first'
+        return 1
+    fi
+    log "enabling VPN"
+    set_baseline_dns
+    uci set firewall.@defaults[0].flow_offloading='0'
+    uci set firewall.@defaults[0].flow_offloading_hw='0'
+    uci commit firewall
+    set_default_novpn_policy_enabled 0
+    set_gl_vpn_rules_disabled 0
+    add_support_rules
+    /etc/init.d/sing-box enable >/dev/null 2>&1 || true
+    if /etc/init.d/sing-box status >/dev/null 2>&1; then
+        log "VPN is already on; sing-box was not restarted"
+        return 0
+    fi
+    /etc/init.d/sing-box restart
+    sleep 2
+    set_default_novpn_policy_enabled 0
+    add_support_rules
+    /etc/init.d/sing-box status >/dev/null 2>&1 && log "VPN is on" || log "VPN start failed"
+}
+
+vpn_off() {
+    log "disabling VPN"
+    set_baseline_dns
+    /etc/init.d/sing-box disable >/dev/null 2>&1 || true
+    /etc/init.d/sing-box stop >/dev/null 2>&1 || true
+    sleep 1
+    cleanup_runtime_rules
+    set_default_novpn_policy_enabled 1
+    set_gl_vpn_rules_disabled 1
+    log "VPN is off; routing should use WAN/main table"
+}
+
+vpn_status() {
+    echo "vpn subscription profile: $(cat /etc/sing-box/vpn-config/vpn-subscription-profile 2>/dev/null || cat /etc/sing-box/vpn-config/vpn-mode 2>/dev/null || echo BLACK)"
+    echo "vpn rules profile: $(cat /etc/sing-box/vpn-config/vpn-rules-profile 2>/dev/null || cat /etc/sing-box/vpn-config/vpn-mode 2>/dev/null || echo BLACK)"
+    echo "vpn subscription: $(cat /etc/sing-box/vpn-config/vpn-group 2>/dev/null || echo auto)"
+    echo "vpn node: $(cat /etc/sing-box/vpn-config/vpn-node 2>/dev/null || echo auto)"
+
+    if /etc/init.d/sing-box status >/dev/null 2>&1; then
+        echo "sing-box: running"
+    else
+        echo "sing-box: stopped"
+    fi
+
+    if ip link show tun0 >/dev/null 2>&1; then
+        echo "tun0: present"
+    else
+        echo "tun0: absent"
+    fi
+
+    echo "route_policy default novpn: $(uci -q get route_policy.@default[0].enabled 2>/dev/null)"
+
+    echo "ipv4 route to 1.1.1.1:"
+    ip route get 1.1.1.1 2>/dev/null || true
+
+    echo "ipv4 route from LAN sample:"
+    ip route get 1.1.1.1 from "$LAN_IP" iif "$LAN_DEV" 2>/dev/null || true
+
+    echo "marked/bypass route sample:"
+    ip route get 1.1.1.1 mark 0x8000 2>/dev/null || true
+
+    echo "vpn policy rules:"
+    ip rule show | grep -E '(^800:|^6000:|^9000:|^9001:|^9002:|^9010:|^9910:|^9920:)' || true
+}
+
+case "$1" in
+    prepare)
+        add_support_rules
+        ;;
+    on)
+        vpn_on
+        ;;
+    off)
+        vpn_off
+        ;;
+    status)
+        vpn_status
+        ;;
+    toggle)
+        if /etc/init.d/sing-box status >/dev/null 2>&1; then
+            vpn_off
+        else
+            vpn_on
+        fi
+        ;;
+    *)
+        echo "Usage: $0 {on|off|status|toggle}" >&2
+        exit 2
+        ;;
+esac

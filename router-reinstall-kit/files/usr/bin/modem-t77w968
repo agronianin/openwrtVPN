@@ -1,0 +1,137 @@
+#!/bin/sh
+
+VID=413c
+PID=81d7
+IFACE=modem_mm
+BOOT_WAIT_SECONDS=120
+
+log() {
+	logger -t modem-t77w968 "$*"
+	echo "$*"
+}
+
+dev_path() {
+	for d in /sys/bus/usb/devices/*; do
+		[ -f "$d/idVendor" ] || continue
+		[ "$(cat "$d/idVendor" 2>/dev/null)" = "$VID" ] || continue
+		[ "$(cat "$d/idProduct" 2>/dev/null)" = "$PID" ] || continue
+		echo "$d"
+		return 0
+	done
+	return 1
+}
+
+usb_config() {
+	d="$(dev_path)" || return 1
+	cat "$d/bConfigurationValue" 2>/dev/null
+}
+
+drivers() {
+	d="$(dev_path)" || return 1
+	for l in "$d":*/driver; do
+		[ -e "$l" ] || continue
+		printf '%s -> %s\n' "${l%/driver}" "$(basename "$(readlink "$l")")"
+	done
+}
+
+status() {
+	d="$(dev_path)" || {
+		echo "modem: not found ($VID:$PID)"
+		return 1
+	}
+	echo "modem: $d"
+	echo "usb_config=$(cat "$d/bConfigurationValue" 2>/dev/null)"
+	echo "drivers:"
+	drivers | sed 's/^/  /'
+	echo "devices:"
+	ls -l /dev/cdc-wdm* /dev/ttyUSB* 2>/dev/null | sed 's/^/  /'
+	echo "ModemManager:"
+	mmcli -L 2>&1 | sed 's/^/  /'
+	echo "ifstatus $IFACE:"
+	ifstatus "$IFACE" 2>&1 | sed -n '1,40p' | sed 's/^/  /'
+}
+
+wait_modem() {
+	i=0
+	while [ "$i" -lt "${1:-60}" ]; do
+		dev_path >/dev/null && return 0
+		sleep 1
+		i=$((i + 1))
+	done
+	return 1
+}
+
+set_config() {
+	cfg="$1"
+	d="$(dev_path)" || {
+		log "modem not found ($VID:$PID)"
+		return 1
+	}
+
+	cur="$(cat "$d/bConfigurationValue" 2>/dev/null)"
+	[ "$cur" = "$cfg" ] && {
+		log "already usb_config=$cfg"
+		return 0
+	}
+
+	log "switch usb_config $cur -> $cfg"
+	ifdown "$IFACE" 2>/dev/null || true
+	/etc/init.d/modemmanager stop 2>/dev/null || true
+	sleep 2
+
+	timeout 12 sh -c "echo '$cfg' > '$d/bConfigurationValue'" || {
+		log "failed to set usb_config=$cfg"
+		return 1
+	}
+
+	sleep 8
+	/etc/init.d/modemmanager start 2>/dev/null || true
+	sleep 15
+	ifup "$IFACE" 2>/dev/null || true
+	sleep 8
+	status
+}
+
+boot() {
+	wait_modem "$BOOT_WAIT_SECONDS" || {
+		log "modem not found during boot wait"
+		return 0
+	}
+	set_config 1
+}
+
+connect() {
+	/etc/init.d/modemmanager restart 2>/dev/null || /etc/init.d/modemmanager start 2>/dev/null || true
+	sleep 15
+	ifup "$IFACE" 2>/dev/null || true
+	sleep 8
+	status
+}
+
+case "$1" in
+	status|"")
+		status
+		;;
+	qmi)
+		set_config 1
+		;;
+	mbim)
+		set_config 2
+		;;
+	connect|restart)
+		connect
+		;;
+	recover)
+		set_config 1
+		;;
+	boot)
+		boot
+		;;
+	at)
+		echo "Run: picocom -b 115200 /dev/ttyUSB0"
+		;;
+	*)
+		echo "Usage: $0 {status|qmi|mbim|connect|restart|recover|boot|at}"
+		exit 2
+		;;
+esac

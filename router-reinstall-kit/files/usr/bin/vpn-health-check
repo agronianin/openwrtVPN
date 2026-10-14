@@ -1,0 +1,73 @@
+#!/bin/sh
+set -eu
+
+SETTINGS_FILE=/etc/sing-box/vpn-config/vpn-settings.conf
+HEALTH_STATE=/tmp/vpn-health-auto.state
+CHECK_URL=https://www.google.com/generate_204
+WHITE_DIRECT_TEST_URL=https://ya.ru
+VPN_HEALTH_INTERVAL_MINUTES=5
+[ ! -f "$SETTINGS_FILE" ] || . "$SETTINGS_FILE"
+MODE=check
+case "${1:-}" in
+  auto|repair) MODE="$1"; URL="${2:-$CHECK_URL}" ;;
+  *) URL="${1:-$CHECK_URL}" ;;
+esac
+log() { logger -t vpn-health-check "$*"; echo "$*"; }
+
+if [ "$MODE" = auto ] && [ "${VPN_HEALTH_LOCKED:-}" != 1 ]; then
+  exec flock -n -E 75 /tmp/vpn-health-auto.lock env VPN_HEALTH_LOCKED=1 "$0" auto
+fi
+if ! /etc/init.d/sing-box status >/dev/null 2>&1; then
+  [ "$MODE" != auto ] || rm -f "$HEALTH_STATE"
+  log 'VPN is off; health check skipped'
+  exit 0
+fi
+
+now=$(date +%s)
+last=0 failures=0 last_repair=0
+if [ "$MODE" = auto ]; then
+  case "$VPN_HEALTH_INTERVAL_MINUTES" in ''|*[!0-9]*) exit 2 ;; esac
+  [ "$VPN_HEALTH_INTERVAL_MINUTES" -gt 0 ] || exit 0
+  [ ! -s "$HEALTH_STATE" ] || read -r last failures last_repair < "$HEALTH_STATE" || true
+  for value in "$last" "$failures" "$last_repair"; do
+    case "$value" in ''|*[!0-9]*) last=0 failures=0 last_repair=0; break ;; esac
+  done
+  [ "$((now-last))" -ge "$((VPN_HEALTH_INTERVAL_MINUTES*60))" ] || exit 0
+fi
+save_state() {
+  printf '%s %s %s\n' "$now" "$failures" "$last_repair" > "$HEALTH_STATE.new"
+  mv "$HEALTH_STATE.new" "$HEALTH_STATE"
+}
+
+if /usr/bin/vpnctl node verify "$URL"; then
+  if [ "$MODE" = auto ]; then failures=0; save_state; fi
+  log 'OK: current VPN connection works; selection unchanged'
+  exit 0
+fi
+if [ "$MODE" = check ]; then
+  log 'FAILED: VPN probe failed; read-only check did not change selection'
+  exit 1
+fi
+if [ "$MODE" = auto ]; then
+  failures=$((failures+1))
+  save_state
+  log "FAILED: consecutive probes=$failures/3"
+  [ "$failures" -ge 3 ] || exit 1
+  # Allow native URLTest to finish selecting after the previous cache rebuild.
+  [ "$last_repair" = 0 ] || [ "$((now-last_repair))" -ge 600 ] || exit 1
+fi
+if ! curl -4 -fsS -I --connect-timeout 4 --max-time 8 "$WHITE_DIRECT_TEST_URL" >/dev/null; then
+  log 'FAILED: direct control site is unavailable; preserving selection until WAN recovers'
+  exit 1
+fi
+
+log 'Recovering: load current subscription cache once; sing-box URLTest selects the node'
+if /usr/bin/vpnctl node auto; then
+  last_repair="$now"
+  failures=0
+  save_state
+  log 'Recovery started; next scheduled check will verify the connection'
+else
+  log 'FAILED: cache rebuild failed or subscription operation is busy; retained current config'
+  exit 1
+fi

@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+
+case "${1:-status}" in
+  status)
+    exec /usr/bin/vpnctl status
+    ;;
+  BLACK|black|WHITE|white)
+    exec /usr/bin/vpnctl mode "$1"
+    ;;
+  *)
+    echo "Usage: $0 {BLACK|WHITE|status}" >&2
+    exit 2
+    ;;
+esac
