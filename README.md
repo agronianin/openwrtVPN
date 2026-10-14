@@ -51,6 +51,7 @@ https://other.example.org/another-subscription
 vpn-subscriptions-update bootstrap BLACK
 vpnctl on
 vpnctl status check
+vpnctl update                    # заполнить кэш всех настроенных профилей
 ```
 
 Если ссылки недоступны напрямую, скачайте файл на другом устройстве, создайте на роутере `/etc/sing-box/bootstrap/`, загрузите туда `provider.txt` и временно укажите зеркало `file:///etc/sing-box/bootstrap/provider.txt` через SSH в `subscriptions.d/black.txt`. Запустите `bootstrap`, включите VPN, затем замените временный адрес реальной ссылкой и обновите подписки. Веб-редактор допускает локальные файлы только из `manual-subscriptions/{black,white}/`; такие ручные группы выбираются явно, не автоматически.

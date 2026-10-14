@@ -2,7 +2,7 @@
 
 Для WAN, Wi-Fi или штатно поддерживаемого модема этот модуль не нужен. Публичный default: `/etc/config/openwrtvpn`, `option modem_enabled '0'`.
 
-Установка: остановить VPN на время установки, затем `INSTALL_MODEM=1 sh install.sh`. Подписки, правила и settings сохраняются. ModemManager обслуживает мобильное соединение. Скрипт находит USB `413c:81d7` и при необходимости устанавливает временную USB configuration 1 (QMI), повторяя это при загрузке. Прошивка/NV не меняются. Сам установщик не запускает модем: при готовности `/etc/init.d/modem-t77w968-qmi start`, затем `ifup modem_mm`.
+Установка: остановить VPN на время установки, затем `INSTALL_MODEM=1 sh install.sh`. Подписки, правила и settings сохраняются. ModemManager обслуживает мобильное соединение. Скрипт находит USB `413c:81d7` и при необходимости устанавливает временную USB configuration 1 (QMI), повторяя это при загрузке. Прошивка/NV не меняются. Сам установщик не запускает модем: при готовности `/etc/init.d/modemmanager start`, `/etc/init.d/modem-t77w968-qmi start`, затем `ifup modem_mm`.
 
 APN нового интерфейса: `uci set openwrtvpn.main.modem_apn='internet'`, `uci commit openwrtvpn` перед установкой. Для существующего интерфейса менять `network.modem_mm.apn` в LuCI/UCI. Ожидание при старте: `BOOT_WAIT_SECONDS=120` в `/usr/bin/modem-t77w968`.
 

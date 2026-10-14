@@ -36,3 +36,10 @@ grep -q '^route replace table 9910 10.42.0.0/24 dev br-test' "$work/ip-calls"
 ! grep -q '^route replace table 9910 .*dev tun0' "$work/ip-calls"
 grep -q 'vpn-toggle prepare' router-reinstall-kit/files/etc/init.d/sing-box
 echo 'PASS: service startup prepares the marked WAN bypass'
+sed -n '/^vpn_on() {/,/^vpn_off() {/p' router-reinstall-kit/files/usr/bin/vpn-toggle | sed '$d' > "$work/on"
+. "$work/on"
+jq() { return 1; }
+log() { :; }
+set_baseline_dns() { echo 'Unexpected DNS mutation before bootstrap' >&2; exit 99; }
+if vpn_on; then exit 99; fi
+echo 'PASS: unconfigured VPN cannot change DNS or routes before bootstrap'
