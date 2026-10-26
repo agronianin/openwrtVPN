@@ -406,7 +406,6 @@ EOF
       [ "$transport" = "tcp" ] || continue
       [ -n "$sni" ] || continue
       [ -n "$pbk" ] || continue
-      [ -n "$flow" ] || flow="xtls-rprx-vision"
       [ -n "$fp" ] || fp="firefox"
     elif [ "$security" = "tls" ]; then
       [ -n "$sni" ] || sni="$host"

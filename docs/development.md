@@ -4,6 +4,8 @@
 
 `vpn-subscriptions-update` читает BLACK/WHITE manifests, обходит зеркала до первого успеха, разбирает VLESS/hy2, дедуплицирует узлы и обновляет кэш. `update/refresh` не пересобирают конфигурацию. `bootstrap` только при остановленном VPN явно загружает начальные данные напрямую. `rebuild` собирает config.json, проверяет его и перезапускает работающий sing-box. Кэш/ключи/URLs не коммитить.
 
+VLESS `flow` берется только из URI: отсутствие или пустое значение не включает Vision автоматически. SNI и flow независимы; наличие REALITY/SNI не означает необходимость `xtls-rprx-vision`.
+
 `vpnctl` — команды пользователя/профили. `vpn-toggle` — procd и marked WAN bypass. LAN определяется через netifd, подключенные сети через ip. Не удалять `vpn-toggle prepare` из init: иначе marked соединения могут снова попасть в TUN. GL.iNet route_policy обрабатывается только при наличии.
 
 `vpn-health-check` проверяет соединение через SOCKS с принудительным `vpn-out`, считает неудачи. `vpn-auto-update` читает интервал при каждом cron tick. При выключенном VPN фоновые сетевые задачи не выполняются. `sing-box-update` — opt-in обновление официального бинарника с SHA256 и проверкой config, может рестартовать VPN. Автоархитектуры arm64/amd64/armv6/armv7; другие — `SING_BOX_ARCH` по имени official asset или ручная установка.
