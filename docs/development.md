@@ -6,6 +6,8 @@
 
 `vpn-subscriptions-update` читает BLACK/WHITE manifests, обходит зеркала до первого успеха, разбирает VLESS/hy2, дедуплицирует узлы и обновляет кэш. `update/refresh` не пересобирают конфигурацию. `bootstrap` только при остановленном VPN явно загружает начальные данные напрямую. `rebuild` собирает config.json, проверяет его и перезапускает работающий sing-box. Кэш/ключи/URLs не коммитить.
 
+`SUBSCRIPTION_FETCH_MODE` в vpn-settings.conf задает транспорт: `vpn` (default), `direct`, `vpn-first`. Последний после ошибки curl через SOCKS делает прямую попытку того же URL. `fetch_direct` отключает прокси окружения/.curlrc, привязывается к реальному uplink из main-маршрута с WAN-mark и не меняет firewall. HTTP(S) обновления при OFF не выполняются, кроме явного bootstrap. Fallback относится к ошибке загрузки, а не к успешно скачанному неподдерживаемому формату: тот по-прежнему отклоняется парсером и запускает проверку следующего зеркала.
+
 VLESS `flow` берется только из URI: отсутствие или пустое значение не включает Vision автоматически. SNI и flow независимы; наличие REALITY/SNI не означает необходимость `xtls-rprx-vision`.
 
 `vpnctl` — команды пользователя/профили. `vpn-toggle` — procd и marked WAN bypass. LAN определяется через netifd, подключенные сети через ip. Не удалять `vpn-toggle prepare` из init: иначе marked соединения могут снова попасть в TUN. GL.iNet route_policy обрабатывается только при наличии.

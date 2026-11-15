@@ -379,6 +379,12 @@ save_subscriptions() {
 save_vpn_intervals() {
   hours="$(url_decode "$(field update_hours)")"
   minutes="$(url_decode "$(field health_minutes)")"
+  fetch_mode="$(url_decode "$(field subscription_fetch_mode)")"
+  if [ -z "$fetch_mode" ]; then
+    fetch_mode=$(sed -n 's/^SUBSCRIPTION_FETCH_MODE=//p' /etc/sing-box/vpn-config/vpn-settings.conf | head -n 1)
+    fetch_mode="${fetch_mode:-vpn}"
+  fi
+  case "$fetch_mode" in vpn|direct|vpn-first) ;; *) echo 'ERROR: invalid subscription download mode'; return 2 ;; esac
   for value in "$hours" "$minutes"; do
     case "$value" in ''|*[!0-9]*) echo 'ERROR: periods must be whole numbers'; return 2 ;; esac
     [ "${#value}" -le 4 ] || { echo 'ERROR: period is too large'; return 2; }
@@ -388,14 +394,17 @@ save_vpn_intervals() {
   [ "$hours" -le 720 ] && [ "$minutes" -le 1440 ] || { echo 'ERROR: subscription period 0..720 hours, check period 0..1440 minutes'; return 2; }
   settings=/etc/sing-box/vpn-config/vpn-settings.conf
   umask 077
-  awk -v hours="$hours" -v minutes="$minutes" '
+  awk -v hours="$hours" -v minutes="$minutes" -v mode="$fetch_mode" '
     /^UPDATE_INTERVAL_HOURS=/ { print "UPDATE_INTERVAL_HOURS=" hours; update=1; next }
     /^VPN_HEALTH_INTERVAL_MINUTES=/ { print "VPN_HEALTH_INTERVAL_MINUTES=" minutes; health=1; next }
+    /^SUBSCRIPTION_FETCH_MODE=/ { print "SUBSCRIPTION_FETCH_MODE=" mode; transport=1; next }
     { print }
-    END { if (!update) print "UPDATE_INTERVAL_HOURS=" hours; if (!health) print "VPN_HEALTH_INTERVAL_MINUTES=" minutes }
+    END { if (!update) print "UPDATE_INTERVAL_HOURS=" hours; if (!health) print "VPN_HEALTH_INTERVAL_MINUTES=" minutes;
+      if (!transport) print "SUBSCRIPTION_FETCH_MODE=" mode }
   ' "$settings" > "$settings.new.$$" || { rm -f "$settings.new.$$"; return 1; }
   mv "$settings.new.$$" "$settings" || return 1
   printf 'UPDATE_INTERVAL_HOURS=%s\nVPN_HEALTH_INTERVAL_MINUTES=%s\n' "$hours" "$minutes"
+  printf 'SUBSCRIPTION_FETCH_MODE=%s\n' "$fetch_mode"
   echo 'Settings saved; scheduler reads them on the next minute tick. Active VPN was not restarted.'
 }
 
@@ -593,6 +602,9 @@ result_summary() {
         echo '<div class="status-grid">'
         result_summary_item "Подписки" "$hours ч" "Период обновления кэша; 0 означает выключено."
         result_summary_item "Проверка VPN" "$minutes мин" "Три неудачи подряд запускают выбор из актуального кэша; 0 означает выключено."
+        transport=$(printf '%s\n' "$OUTPUT" | sed -n 's/^SUBSCRIPTION_FETCH_MODE=//p')
+        case "$transport" in vpn) transport='Только через VPN' ;; direct) transport='Только напрямую' ;; vpn-first) transport='VPN → напрямую при ошибке' ;; esac
+        result_summary_item "Загрузка подписок" "$transport" "Не меняет маршрут клиентского трафика или текущий узел."
         result_summary_item "Настройки" "Сохранены и применены" "Планировщик читает значения каждую минуту. Рабочее соединение не перезапущено."
         echo '</div>'
       fi
@@ -1011,7 +1023,7 @@ mmcli -m \"\$mid\" --set-current-bands=\"\$orig\""; OUTPUT="$(modem_band_probe "
 
     vpn_status) CMD="/usr/bin/vpnctl status check"; OUTPUT="$(run_limited /usr/bin/vpnctl status check)" ;;
     vpn_subscriptions_save) CMD="validate and atomically save /etc/sing-box/subscriptions.d/{black,white}.txt; no restart"; OUTPUT="$(save_subscriptions 2>&1)" ;;
-    vpn_settings_save) CMD="update UPDATE_INTERVAL_HOURS and VPN_HEALTH_INTERVAL_MINUTES in /etc/sing-box/vpn-config/vpn-settings.conf"; OUTPUT="$(save_vpn_intervals 2>&1)" ;;
+    vpn_settings_save) CMD="update subscription download mode and intervals in /etc/sing-box/vpn-config/vpn-settings.conf"; OUTPUT="$(save_vpn_intervals 2>&1)" ;;
     vpn_on) CMD="/usr/bin/vpnctl on"; OUTPUT="$(run_limited /usr/bin/vpnctl on)" ;;
     vpn_off) CMD="/usr/bin/vpnctl off"; OUTPUT="$(run_limited /usr/bin/vpnctl off)" ;;
     vpn_repair) CMD="/usr/bin/vpn-health-check repair"; OUTPUT="$(run_limited /usr/bin/vpn-health-check repair)" ;;
@@ -1156,6 +1168,8 @@ vpn_interval_editor() {
   settings=/etc/sing-box/vpn-config/vpn-settings.conf
   hours="$(sed -n 's/^UPDATE_INTERVAL_HOURS=//p' "$settings" | head -n 1)"
   minutes="$(sed -n 's/^VPN_HEALTH_INTERVAL_MINUTES=//p' "$settings" | head -n 1)"
+  transport="$(sed -n 's/^SUBSCRIPTION_FETCH_MODE=//p' "$settings" | head -n 1)"
+  transport="${transport:-vpn}"
   cat <<EOF
 <section class="section">
 <div class="panel-title"><h2>Автоматизация VPN</h2></div>
@@ -1164,8 +1178,14 @@ vpn_interval_editor() {
 <input type="hidden" name="tab" value="vpn">
 <label>Обновление подписок, часов <input type="number" name="update_hours" min="0" max="720" required value="$(esc "${hours:-1}")"></label>
 <label>Проверка соединения, минут <input type="number" name="health_minutes" min="0" max="1440" required value="$(esc "${minutes:-5}")"></label>
+<label>Загружать подписки
+<select name="subscription_fetch_mode">
+<option value="vpn"$([ "$transport" != vpn ] || printf ' selected')>Только через VPN</option>
+<option value="direct"$([ "$transport" != direct ] || printf ' selected')>Только напрямую</option>
+<option value="vpn-first"$([ "$transport" != vpn-first ] || printf ' selected')>VPN, затем напрямую</option>
+</select></label>
 <p>0 отключает соответствующую задачу. Обновление сохраняет подключение. Три неудачные проверки подряд запускают автоматический выбор из актуальных узлов.</p>
-<button type="submit">Сохранить периоды</button>
+<button type="submit">Сохранить настройки</button>
 <div class="inline-result"></div>
 </form>
 </section>

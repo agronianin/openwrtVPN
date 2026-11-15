@@ -16,9 +16,21 @@ for action in refresh update update-one; do
   ' sh "$action" BLACK 1
 done
 [ "$(wc -l < "$TEST_LOG" | tr -d ' ')" = 3 ]
-sed -n '/^fetch_to() {/,/^decode_subscription() {/p' router-reinstall-kit/files/usr/bin/vpn-subscriptions-update | sed '$d' > "$work/fetch"
+sed -n '/^fetch_direct() {/,/^decode_subscription() {/p' router-reinstall-kit/files/usr/bin/vpn-subscriptions-update | sed '$d' > "$work/fetch"
 . "$work/fetch"
-curl() { printf '%s\n' "$@" > "$work/arguments"; }
+is_running() { [ "${TEST_OFF:-0}" != 1 ]; }
+ip() { echo '77.88.8.8 via 192.0.2.1 dev testwan src 192.0.2.2'; }
+warn() { echo "$*" >> "$work/warnings"; }
+curl() {
+  printf '%s\n' "$@" > "$work/arguments"
+  if printf '%s\n' "$@" | grep -q '^socks5h:'; then
+    echo vpn >> "$work/fetch-attempts"
+    [ "${TEST_OFF_AFTER_PROXY:-0}" != 1 ] || TEST_OFF=1
+    return "${TEST_PROXY_RC:-0}"
+  fi
+  echo direct >> "$work/fetch-attempts"
+  return "${TEST_DIRECT_RC:-0}"
+}
 fetch_to https://example.invalid/subscription "$work/data"
 grep -q '^socks5h://127.0.0.1:2080$' "$work/arguments"
 grep -q '^35$' "$work/arguments"
@@ -26,6 +38,33 @@ VPN_BOOTSTRAP=1
 fetch_to https://example.invalid/subscription "$work/data"
 ! grep -q '^socks5h://' "$work/arguments"
 grep -q '^\*$' "$work/arguments"
+grep -q '^if!testwan$' "$work/arguments"
+# VPN-first не уходит напрямую после успеха; при ошибке выполняет ровно одну direct-попытку.
+VPN_BOOTSTRAP=0 SUBSCRIPTION_FETCH_MODE=vpn-first
+: > "$work/fetch-attempts"
+fetch_to https://example.invalid/subscription "$work/data"
+[ "$(cat "$work/fetch-attempts")" = vpn ]
+TEST_PROXY_RC=28
+fetch_to https://example.invalid/subscription "$work/data"
+[ "$(tail -n 2 "$work/fetch-attempts")" = "$(printf 'vpn\ndirect')" ]
+SUBSCRIPTION_FETCH_MODE=vpn
+fetch_to https://example.invalid/subscription "$work/data" && exit 99
+[ "$(tail -n 1 "$work/fetch-attempts")" = vpn ]
+SUBSCRIPTION_FETCH_MODE=direct
+fetch_to https://example.invalid/subscription "$work/data"
+[ "$(tail -n 1 "$work/fetch-attempts")" = direct ]
+TEST_DIRECT_RC=22
+fetch_to https://example.invalid/subscription "$work/data" && exit 99
+# OFF запрещает сеть во всех режимах; выключение во время VPN-попытки отменяет direct fallback.
+before=$(wc -l < "$work/fetch-attempts")
+TEST_OFF=1
+for SUBSCRIPTION_FETCH_MODE in vpn direct vpn-first; do fetch_to https://example.invalid/subscription "$work/data" && exit 99; done
+[ "$(wc -l < "$work/fetch-attempts")" = "$before" ]
+TEST_OFF=0 TEST_OFF_AFTER_PROXY=1 SUBSCRIPTION_FETCH_MODE=vpn-first
+fetch_to https://example.invalid/subscription "$work/data" && exit 99
+[ "$(tail -n 1 "$work/fetch-attempts")" = vpn ]
+unset TEST_OFF TEST_OFF_AFTER_PROXY TEST_PROXY_RC TEST_DIRECT_RC
+SUBSCRIPTION_FETCH_MODE=vpn
 export TEST_BOOTSTRAP="$work/bootstrap"
 sh -c '
   is_running() { return 0; }
@@ -66,4 +105,4 @@ TEST_TIME=13601; sh "$work/auto" || true
 TEST_TIME=17202 TEST_REFRESH_RC=75; export TEST_REFRESH_RC
 sh "$work/auto" || true
 [ "$(cat "$work/data/subscriptions-cache/last-auto-update")" = 13601 ]
-echo 'PASS: all refresh commands preserve live config; downloads force VPN with timeout'
+echo 'PASS: refresh preserves config; VPN/direct/fallback routing, timeout, OFF and partial-failure intervals'

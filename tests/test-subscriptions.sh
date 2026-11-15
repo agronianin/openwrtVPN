@@ -53,4 +53,22 @@ LOCK_BUSY=0
 CONTENT=''
 save_subscriptions > "$work/result"
 grep -q 'groups=0' "$work/result"
+# Способ загрузки сохраняется вместе с периодами, применяется сразу и не принимает произвольные shell-значения.
+sed -n '/^save_vpn_intervals() {/,/^save_force_rule() {/p' "$source" | sed '$d' \
+  | sed "s|/etc/sing-box/vpn-config/vpn-settings.conf|$work/settings|g" > "$work/intervals"
+. "$work/intervals"
+printf 'UPDATE_INTERVAL_HOURS=1\nVPN_HEALTH_INTERVAL_MINUTES=5\nOTHER_SETTING=keep\n' > "$work/settings"
+field() { case "$1" in update_hours) echo 2 ;; health_minutes) echo 7 ;; subscription_fetch_mode) printf '%s' "$mode_input" ;; esac; }
+for mode_input in vpn direct vpn-first; do
+  save_vpn_intervals > "$work/result"
+  grep -q "^SUBSCRIPTION_FETCH_MODE=$mode_input$" "$work/settings"
+  grep -q '^OTHER_SETTING=keep$' "$work/settings"
+done
+before=$(sha256sum "$work/settings" | cut -d' ' -f1)
+mode_input='bad; command'
+if save_vpn_intervals > "$work/result"; then exit 99; fi
+[ "$(sha256sum "$work/settings" | cut -d' ' -f1)" = "$before" ]
+mode_input=''
+save_vpn_intervals > "$work/result"
+grep -q '^SUBSCRIPTION_FETCH_MODE=vpn-first$' "$work/settings"
 echo 'PASS: create/edit/delete, comments, stale revision, invalid data, busy lock, empty list'

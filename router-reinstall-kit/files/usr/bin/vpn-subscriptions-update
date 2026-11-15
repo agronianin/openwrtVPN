@@ -50,6 +50,7 @@ load_settings() {
   BLACK_FAILOVER_TOLERANCE_MS=1500
   WHITE_FAILOVER_TOLERANCE_MS=60000
   UPDATE_INTERVAL_HOURS=6
+  SUBSCRIPTION_FETCH_MODE=vpn
   [ ! -f "$SETTINGS_FILE" ] || . "$SETTINGS_FILE"
 }
 
@@ -217,6 +218,14 @@ group_label() {
   esac
 }
 
+fetch_direct() {
+  # Binding the real uplink prevents a 'direct' request from being captured by the main TUN.
+  direct_device=$(ip -4 route get 77.88.8.8 mark 0x8000 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev") {print $(i+1);exit}}')
+  case "$direct_device" in ''|tun*|lo) warn 'Direct subscription download: no physical uplink route'; return 1 ;; esac
+  curl -q -4 -fLsS --connect-timeout 5 --max-time 35 --proxy '' --noproxy '*' \
+    --interface "if!$direct_device" -o "$2" "$1"
+}
+
 fetch_to() {
   url="$1"
   out="$2"
@@ -229,11 +238,25 @@ fetch_to() {
       ;;
     *)
       if [ "${VPN_BOOTSTRAP:-0}" = 1 ]; then
-        curl -fLsS --connect-timeout 5 --max-time 35 --noproxy '*' -o "$out" "$url"
+        fetch_direct "$url" "$out"
         return
       fi
-      curl -fLsS --connect-timeout 5 --max-time 35 --noproxy '' \
-        --proxy socks5h://127.0.0.1:2080 -o "$out" "$url"
+      is_running || { warn 'VPN is off; subscription download skipped'; return 1; }
+      case "${SUBSCRIPTION_FETCH_MODE:-vpn}" in
+        vpn)
+          curl -q -4 -fLsS --connect-timeout 5 --max-time 35 --noproxy '' \
+            --proxy socks5h://127.0.0.1:2080 -o "$out" "$url"
+          ;;
+        direct) fetch_direct "$url" "$out" ;;
+        vpn-first)
+          if curl -q -4 -fLsS --connect-timeout 5 --max-time 35 --noproxy '' \
+            --proxy socks5h://127.0.0.1:2080 -o "$out" "$url"; then return 0; fi
+          is_running || { warn 'VPN switched off; direct retry cancelled'; return 1; }
+          warn 'Subscription download via VPN failed; retrying directly'
+          fetch_direct "$url" "$out"
+          ;;
+        *) warn 'Invalid SUBSCRIPTION_FETCH_MODE; expected vpn, direct or vpn-first'; return 2 ;;
+      esac
       ;;
   esac
 }
