@@ -182,11 +182,15 @@ snapshot() (
   active=$(cat "$ACTIVE" 2>/dev/null || true)
   managed=false; [ ! -s "$MANAGED" ] || managed=true
   echo null > "$TMP/effective.json"
+  echo null > "$TMP/selection.json"
   echo null > "$TMP/job.json"
   echo '{"revision":"","items":[]}' > "$TMP/test-targets.json"
   if [ -x /usr/bin/vpn-node-tests ]; then /usr/bin/vpn-node-tests targets > "$TMP/test-targets.json"; fi
   [ ! -f "$BASE/profiles/update-job.json" ] || cp "$BASE/profiles/update-job.json" "$TMP/job.json"
   if running && curl -fsS --max-time 2 http://127.0.0.1:9090/proxies > "$TMP/api.json"; then
+    jq '.proxies["vpn-out"].now as $tag | if ($tag|type)!="string" or $tag=="" then null else
+      {tag:$tag,mode:(if $tag=="profile-auto" then "auto" else "manual" end)} end' \
+      "$TMP/api.json" > "$TMP/selection.json" || echo null > "$TMP/selection.json"
     jq 'def follow($tag;$n): if $n>12 then null else .proxies[$tag].now as $next
       | if $next!=null and $next!="" then follow($next;$n+1) else $tag end end;
       follow("vpn-out";0) as $tag | if $tag==null then null else
@@ -199,10 +203,11 @@ snapshot() (
   jq -n --arg revision "$(revision)" --slurpfile data "$DB" --arg active "$active" --argjson running "$on" \
     --slurpfile nodes "$TMP/nodes.json" --slurpfile rules "$TMP/rules.json" --argjson managed "$managed" \
     --slurpfile effective "$TMP/effective.json" \
+    --slurpfile selection "$TMP/selection.json" \
     --slurpfile job "$TMP/job.json" \
     --slurpfile targets "$TMP/test-targets.json" \
     '{revision:$revision,data:$data[0],active:(if $active=="" then null else $active end),running:$running,managed:$managed,
-      effective:$effective[0],updateJob:$job[0],testTargets:$targets[0],nodes:$nodes[0],rules:$rules[0]}'
+      effective:$effective[0],selection:$selection[0],updateJob:$job[0],testTargets:$targets[0],nodes:$nodes[0],rules:$rules[0]}'
 )
 
 refresh_sources() {
@@ -464,6 +469,15 @@ case "${1:-snapshot}" in
       || error 'Node does not belong to the active profile/configuration'
     jq -n --arg name "$tag" '{name:$name}' | curl -fsS --max-time 8 -X PUT -H 'Content-Type: application/json' \
       --data-binary @- http://127.0.0.1:9090/proxies/vpn-out
+    curl -fsS --max-time 8 http://127.0.0.1:9090/proxies > "$TMP/selection-confirm.json" \
+      || error 'Selection was sent, but its state could not be confirmed; refresh status before retrying'
+    jq -e -s --arg tag "$tag" 'length==1 and (.[0].proxies["vpn-out"].now==$tag)' "$TMP/selection-confirm.json" >/dev/null \
+      || error 'sing-box did not confirm the requested selection; refresh status'
+    if [ "$tag" = profile-auto ]; then
+      echo 'Automatic selection enabled for loaded nodes; subscriptions were not updated and VPN was not restarted'
+    else
+      echo 'Manual node selection confirmed; VPN was not restarted'
+    fi
     ;;
   test)
     if [ -n "${2:-}" ]; then

@@ -31,7 +31,10 @@
 #vpn-app .vp-error { color: #a51d2b; }
 #vpn-app .vp-status { font-weight: 700; }
 #vpn-app p, #vpn-app strong { overflow-wrap: anywhere; }
-#vpn-app .vp-reapply { width: 44px; height: 44px; font-size: 22px; padding: 0; }
+#vpn-app .vp-pending::before { content: ''; display: inline-block; width: 14px; height: 14px; margin-right: 8px;
+  border: 2px solid #bac6cf; border-top-color: #145b91; border-radius: 50%; animation: vp-spin .8s linear infinite; }
+@keyframes vp-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { #vpn-app .vp-pending::before { animation: none; } }
 #vpn-app .vp-warning { color: #8a4300; font-weight: 600; }
 #vpn-app .vp-count { color: #52616d; font-size: 13px; }
 #vpn-app .vp-compact { border-bottom: 1px solid #c7d3dd; margin-top: 8px; }

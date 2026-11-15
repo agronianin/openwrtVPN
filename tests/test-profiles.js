@@ -110,5 +110,34 @@ try {
   assert.equal(failed.status, 1);
   assert.match(failed.stderr, /Cannot stage profile files/);
   assert.equal(fs.readFileSync(path.join(root, 'profiles/active'), 'utf8'), 'old-profile\n');
+  // Native selector подтверждает auto/manual через API; ни одна команда не пересобирает рабочий конфиг.
+  write('profiles/managed', '1\n');
+  const selector = path.join(work, 'selector.json');
+  fs.writeFileSync(selector, JSON.stringify({proxies: {
+    'vpn-out': {all: ['profile-auto', 'loaded-node'], now: 'loaded-node'},
+    'profile-auto': {now: 'loaded-node', type: 'URLTest'},
+    'loaded-node': {type: 'VLESS', history: [{delay: 123}]}
+  }}));
+  mock('service', 'exit 0\n');
+  const curl = mock('curl', '');
+  fs.writeFileSync(curl, `#!/usr/bin/env node
+const fs=require('node:fs'), file=process.env.TEST_SELECTOR, state=JSON.parse(fs.readFileSync(file));
+if(process.argv.includes('PUT')) {
+  const value=JSON.parse(fs.readFileSync(0,'utf8')).name;
+  if(!process.env.TEST_REJECT_SELECTION) { state.proxies['vpn-out'].now=value; fs.writeFileSync(file,JSON.stringify(state)); }
+} else console.log(JSON.stringify(state));
+`);
+  const selectorEnv = {...env, TEST_SELECTOR: selector};
+  const select = tag => spawnSync('sh', [safeCli, 'node', tag], {env: selectorEnv, encoding: 'utf8'});
+  assert.equal(select('auto').status, 0);
+  let state = spawnSync('sh', [safeCli, 'snapshot'], {env: selectorEnv, encoding: 'utf8'});
+  assert.deepEqual(JSON.parse(state.stdout).selection, {tag: 'profile-auto', mode: 'auto'});
+  assert.equal(select('loaded-node').status, 0);
+  state = spawnSync('sh', [safeCli, 'snapshot'], {env: selectorEnv, encoding: 'utf8'});
+  assert.deepEqual(JSON.parse(state.stdout).selection, {tag: 'loaded-node', mode: 'manual'});
+  selectorEnv.TEST_REJECT_SELECTION = '1';
+  assert.equal(select('auto').status, 1);
+  assert.equal(select('not-loaded').status, 1);
+  assert.equal(fs.readFileSync(path.join(root, 'config.json'), 'utf8'), '{"old":"working-config"}');
   console.log('PASS: profile migration, stable node IDs, arbitrary profiles, stale revision, invalid refs, rule CRUD, no config restart');
 } finally { fs.rmSync(work, {recursive: true, force: true}); }

@@ -33,7 +33,11 @@
   function button(text, action, title) {
     var node = el('button', text);
     node.type = 'button';
-    if (title) { node.title = title; node.setAttribute('aria-label', title); }
+    if (title) {
+      node.title = title;
+      if (text.length <= 2) node.setAttribute('aria-label', title);
+      else node.setAttribute('aria-description', title);
+    }
     node.addEventListener('click', action);
     return node;
   }
@@ -141,30 +145,61 @@
     if (!check.https || Object.keys(check).some(function (key) { return !['https', 'delay_ms'].includes(key); })) text += '\n' + raw;
     return text;
   }
+  function operationStart(action, arg) {
+    if (action === 'vpn_profiles_node') return arg === 'auto' ? 'Включаю автовыбор узла...' : 'Фиксирую выбранный узел...';
+    if (action === 'vpn_profiles_activate') return arg === 'off' ? 'Выключаю VPN...' : 'Применяю профиль; возможен краткий разрыв соединений...';
+    if (action === 'vpn_profiles_test') return 'Проверяю HTTPS через VPN и определяю выходной IP...';
+    return 'Выполняется...';
+  }
+  function selectionOutput(arg) {
+    if (!snapshot.selection || snapshot.selection.tag !== (arg === 'auto' ? 'profile-auto' : arg)) {
+      return 'Команда отправлена, но режим выбора не подтверждён. Обновите состояние перед повтором.';
+    }
+    var text = arg === 'auto' ? 'Автовыбор включён. sing-box управляет выбором среди уже загруженных узлов.' : 'Узел зафиксирован вручную.';
+    var node = snapshot.effective;
+    if (node && typeof node.type === 'string' && !['Selector', 'URLTest'].includes(node.type) && node.tag !== 'profile-auto') {
+      text += '\nСейчас выбран: ' + (node.title || node.tag) + '.';
+    } else text += '\nВыбранный выходной узел пока не определён.';
+    return text + '\nVPN не перезапускался. Доступность интернета этой командой не проверяется.';
+  }
   async function request(action, arg, target, extra, saving, savedDrafts) {
     if (busy) return false;
     var otherDrafts = Array.from(drafts.keys()).some(function (key) { return !(savedDrafts || []).includes(key); });
     var discarding = JSON.stringify(data) !== baseline || otherDrafts;
     if (!saving && discarding && !window.confirm('Несохраненные изменения будут потеряны после успешной операции. Продолжить?')) return false;
     busy = true;
-    root.inert = true;
     root.setAttribute('aria-busy', 'true');
     var controls = Array.from(root.querySelectorAll('button, input, select, textarea'));
     var disabled = controls.map(function (node) { return node.disabled; });
     controls.forEach(function (node) { node.disabled = true; });
-    target.classList.remove('vp-error'); target.textContent = 'Выполняется...';
+    target.classList.remove('vp-error'); target.classList.add('vp-pending');
+    target.textContent = operationStart(action, arg);
+    var controller = new AbortController(), timeout;
+    var waitMs = action === 'vpn_profiles_node' ? 45000 : 90000;
     try {
       var params = new URLSearchParams({ action: action, ajax: '1', tab: 'vpn' });
       if (arg !== undefined) params.set('arg', arg);
       Object.keys(extra || {}).forEach(function (key) { params.set(key, extra[key]); });
-      var response = await fetch(window.location.pathname, {
-        method: 'POST', credentials: 'same-origin', headers: { Accept: 'application/json' }, body: params
-      });
-      var httpError = 'HTTP ' + response.status + (response.statusText ? ': ' + response.statusText : '');
-      var payload;
-      try { payload = await response.json(); } catch (_) {
-        throw new Error(response.ok ? 'Сервер вернул некорректный JSON' : httpError);
-      }
+      var reply = await Promise.race([
+        (async function () {
+          var response = await fetch(window.location.pathname, {
+            method: 'POST', credentials: 'same-origin', headers: { Accept: 'application/json' }, body: params, signal: controller.signal
+          });
+          var httpError = 'HTTP ' + response.status + (response.statusText ? ': ' + response.statusText : ''), payload;
+          try { payload = await response.json(); } catch (_) {
+            throw new Error(response.ok ? 'Сервер вернул некорректный JSON' : httpError);
+          }
+          return { response: response, payload: payload, httpError: httpError };
+        }()),
+        new Promise(function (_, reject) {
+          timeout = setTimeout(function () {
+            controller.abort();
+            reject(new Error('Сервер не подтвердил результат за ' + waitMs / 1000 + ' секунд. Операция могла выполниться; обновите состояние перед повтором.'));
+          }, waitMs);
+        })
+      ]);
+      var response = reply.response, payload = reply.payload, httpError = reply.httpError;
+      if (!payload || typeof payload !== 'object') throw new Error('Сервер вернул некорректный ответ');
       var testDetails = action === 'vpn_profiles_test' && payload.output !== undefined ? '\n' + testOutput(payload.output) : '';
       if (!response.ok) throw new Error(httpError + (payload.error ? ': ' + payload.error : '') + testDetails);
       if (!payload.ok) throw new Error((payload.error || 'Операция отклонена сервером') + testDetails);
@@ -173,13 +208,20 @@
       data = JSON.parse(JSON.stringify(snapshot.data)); baseline = JSON.stringify(data); drafts.clear();
       render();
       var output = action === 'vpn_profiles_test' ? testOutput(payload.output) : String(payload.output);
+      if (action === 'vpn_profiles_node') output = selectionOutput(arg);
       notice.textContent = payload.output === undefined ? 'Готово' : output;
+      if (action === 'vpn_profiles_node') notice.textContent = output;
+      if (action === 'vpn_profiles_node' && (!snapshot.selection || snapshot.selection.tag !== (arg === 'auto' ? 'profile-auto' : arg))) {
+        notice.classList.add('vp-warning');
+      }
       return true;
     } catch (error) {
       fail(target, error.message || 'Не удалось связаться с сервером');
       return false;
     } finally {
-      busy = false; root.inert = false; root.removeAttribute('aria-busy');
+      clearTimeout(timeout);
+      busy = false; root.removeAttribute('aria-busy');
+      target.classList.remove('vp-pending');
       controls.forEach(function (node, index) { if (node.isConnected) node.disabled = disabled[index]; });
       changed();
     }
@@ -255,6 +297,10 @@
     var legacy = snapshot.running && !current;
     if (legacy) area.append(el('p', 'Старое подключение: выберите профиль', 'vp-warning'));
     if (current) area.append(el('p', 'Профиль: ' + current.name));
+    if (snapshot.running && current) {
+      var mode = snapshot.selection && snapshot.selection.mode;
+      area.append(el('p', 'Выбор узла: ' + (mode === 'auto' ? 'автоматически' : mode === 'manual' ? 'вручную' : 'не определён')));
+    }
     if (snapshot.effective) {
       var effective = snapshot.effective;
       area.append(el('p', 'Текущий узел: ' + (effective.title || effective.tag) + (effective.type ? ' · ' + effective.type : '')));
@@ -268,13 +314,17 @@
     var chooser = field(area, 'Профиль', select(profiles, selectedProfile, async function (id) {
       if (!id || !await request('vpn_profiles_activate', id, target)) chooser.value = selectedProfile;
     }));
-    var reapply = button('↻', function () {
-      if (chooser.value) request('vpn_profiles_activate', chooser.value, target);
-    }, 'Применить выбранный профиль заново; возможен краткий разрыв соединений');
-    reapply.classList.add('vp-reapply'); area.append(reapply);
+    var reapply = button('Применить профиль', function () {
+      if (chooser.value && window.confirm('Применить сохранённые настройки профиля? VPN может кратко прерваться; ручная фиксация узла сбросится на автовыбор.')) {
+        request('vpn_profiles_activate', chooser.value, target);
+      }
+    }, 'Повторно собирает выбранный профиль из сохранённых подписок и правил и применяет его. Возможен краткий разрыв соединений. Подписки не скачивает; ручная фиксация узла сбрасывается на автовыбор.');
+    reapply.disabled = !chooser.value || chooser.value === 'off'; area.append(reapply);
     var actions = el('div', undefined, 'vp-actions');
-    actions.append(button('Проверить подключение', function () { request('vpn_profiles_test', '', target); }));
-    var auto = button('Автовыбор узла', function () { request('vpn_profiles_node', 'auto', target); });
+    actions.append(button('Проверить подключение', function () { request('vpn_profiles_test', '', target); },
+      'Проверяет HTTPS через текущий VPN-выход и запрашивает его внешний IP и геолокацию. Узел не переключает и VPN не перезапускает. Ошибка геолокации сама по себе не означает отказ VPN.'));
+    var auto = button('Автовыбор узла', function () { request('vpn_profiles_node', 'auto', target); },
+      'Включает автоматический режим sing-box среди уже загруженных узлов профиля. Не запускает отдельный поиск, загрузку подписок или перезапуск VPN. Это режим работы, а не разовый поиск с процентом выполнения; доступность проверяется отдельно.');
     auto.disabled = !snapshot.running || !current; actions.append(auto); area.append(actions);
     var options = [['', 'Выберите узел']].concat(allowedNodes(current).map(function (node) { return [node.tag, node.title || node.tag]; }));
     var manual = field(area, 'Узел вручную', select(options, '', async function (tag) {
@@ -282,6 +332,8 @@
       manual.value = '';
     }));
     manual.disabled = !snapshot.running || !current;
+    manual.title = 'Фиксирует выбранный узел вместо автоматического выбора, без перезапуска VPN. Узел должен уже присутствовать в работающей конфигурации; доступность этой командой не проверяется.';
+    chooser.title = 'Выбор профиля применяет его сохранённые настройки и может кратко прервать соединения. Выключен возвращает обычную маршрутизацию.';
   }
   function profiles() {
     var area = section('Профили');
@@ -573,11 +625,19 @@
     drawProbe = null;
     root.replaceChildren();
     var nav = el('nav', undefined, 'vp-nav'); nav.setAttribute('aria-label', 'VPN');
-    [['VPN', 'VPN'], ['Profiles', 'Профили'], ['Subscriptions', 'Подписки'], ['Rules', 'Правила'], ['Nodes', 'Узлы']].forEach(function (item) {
-      var link = button(item[1], function () { view = item[0]; render(); });
+    [
+      ['VPN', 'VPN', 'Статус подключения, выбор профиля и ручной или автоматический режим узла.'],
+      ['Profiles', 'Профили', 'Состав профилей: подписки, узлы, правила и приоритеты. Сохранение не применяет профиль автоматически.'],
+      ['Subscriptions', 'Подписки', 'Редактирование источников и обновление кэша узлов без разрыва текущего подключения.'],
+      ['Rules', 'Правила', 'Редактирование наборов маршрутизации. Для применения сохранённых изменений нужно применить профиль.'],
+      ['Nodes', 'Узлы', 'Поиск, независимые HTTPS-тесты и замер скорости. Тесты не переключают текущий узел.']
+    ].forEach(function (item) {
+      var link = button(item[1], function () { view = item[0]; render(); }, item[2]);
       if (view === item[0]) link.setAttribute('aria-current', 'page'); nav.append(link);
     });
-    nav.append(button('\u21bb', function () { request('vpn_profiles_snapshot', undefined, notice); }, 'Обновить состояние'));
+    var refresh = button('Обновить', function () { request('vpn_profiles_snapshot', undefined, notice); },
+      'Перечитывает состояние роутера и фактический выбор sing-box. Не применяет профиль, не тестирует интернет и не перезапускает VPN. Несохранённые правки потребуют подтверждения перед сбросом.');
+    refresh.setAttribute('aria-label', 'Обновить состояние'); nav.append(refresh);
     root.append(nav);
     var toolbar = el('div', undefined, 'vp-save');
     save = button('Сохранить изменения', function () {

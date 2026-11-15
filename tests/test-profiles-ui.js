@@ -32,6 +32,7 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
 let root, context, requests, confirmAnswer, replies, unload, timers;
 const initial = {
   revision: 'revision-1', active: 'work', running: true,
+  selection: {mode: 'auto', tag: 'profile-auto'}, effective: {tag: 'b', title: 'Node B', type: 'Hysteria2'},
   testTargets: { revision: 'targets-1', items: [
     { id: 'google', name: 'Google', url: 'https://www.google.com/generate_204', status: 204 },
     { id: 'youtube', name: 'YouTube', url: 'https://www.youtube.com/generate_204', status: 204 }
@@ -291,6 +292,44 @@ async function testReadableOutput() {
   assert.ok(root.textContent.includes('Connection refused'));
 }
 
+// Автовыбор показывает реальное включение режима, ожидание/ошибку и не выдает его за завершенный поиск узлов.
+async function testSelectionFeedback() {
+  boot();
+  const apply = named('Применить профиль');
+  assert.ok(apply.title.includes('разрыв')); assert.ok(apply.title.includes('ручная фиксация'));
+  assert.ok(named('Автовыбор узла').title.includes('Не запускает отдельный поиск'));
+  assert.ok(named('Проверить подключение').title.includes('геолокации'));
+  assert.ok(named('Обновить состояние').title.includes('Не применяет профиль'));
+  assert.ok(buttons().every(node => !['↻', '↺'].includes(node.textContent)));
+  assert.ok(root.textContent.includes('Выбор узла: автоматически'));
+  let complete;
+  context.fetch = (url, options) => {
+    requests.push({url, options, fields: Object.fromEntries(options.body)});
+    return new Promise(resolve => { complete = resolve; });
+  };
+  const pending = named('Автовыбор узла').fire('click'); await settle();
+  assert.ok(root.textContent.includes('Включаю автовыбор узла...'));
+  assert.equal(root.attributes['aria-busy'], 'true'); assert.ok(named('Автовыбор узла').disabled);
+  complete({ok: true, json: async () => ({ok: true, snapshot: initial, output: ''})}); await pending;
+  assert.ok(root.textContent.includes('Автовыбор включён.'));
+  assert.ok(root.textContent.includes('Сейчас выбран: Node B.'));
+  assert.ok(root.textContent.includes('этой командой не проверяется'));
+  assert.equal(root.attributes['aria-busy'], undefined); assert.equal(named('Автовыбор узла').disabled, false);
+  // Явная ошибка и превышение времени ожидания разблокируют интерфейс и не показывают успех.
+  boot(); replies.push({ok: false, error: 'Selector unavailable'}); await click('Автовыбор узла');
+  assert.ok(root.textContent.includes('Selector unavailable')); assert.ok(!root.textContent.includes('Автовыбор включён.'));
+  boot(); replies.push({hang: true});
+  const timed = named('Автовыбор узла').fire('click'); await settle(); await tick(45000); await timed;
+  assert.ok(root.textContent.includes('45 секунд')); assert.equal(named('Автовыбор узла').disabled, false);
+  assert.equal(root.attributes['aria-busy'], undefined);
+  // Фиксация и неизвестное состояние различаются; отсутствие ответа API не маскируется под автоматический режим.
+  boot({...initial, selection: {mode: 'manual', tag: 'b'}});
+  assert.ok(root.textContent.includes('Выбор узла: вручную'));
+  boot({...initial, selection: null}); assert.ok(root.textContent.includes('Выбор узла: не определён'));
+  replies.push({ok: true, snapshot: {...initial, selection: null}, output: ''}); await click('Автовыбор узла');
+  assert.ok(root.textContent.includes('режим выбора не подтверждён'));
+}
+
 // Ответы заданий и виртуальное время позволяют проверить polling без реальной сети и ожидания.
 function probeJob(state = 'running', done = 0, results = []) {
   return { id: 'job-1', state, total: 60, done, target: initial.testTargets.items[0], speed: false, results };
@@ -389,8 +428,8 @@ async function testTargetEditing() {
 (async function () {
   const tests = [testAtomicSaveAndOrdering, testFailuresAndDiscard, testConnectionAndSearch, testCatalogCrud, testRuleActions,
     testLargeCatalog, testEffectiveAndRuleGuard, testImportAndRefresh, testUpdateJob, testReadableOutput,
-    testFilteredProbeAndProgress, testProbeErrorsAndSpeed, testTargetEditing];
+    testFilteredProbeAndProgress, testProbeErrorsAndSpeed, testTargetEditing, testSelectionFeedback];
   for (const test of tests) await test();
   assert.ok(!source.includes('innerHTML'));
-  console.log('PASS: 13 profiles UI scenarios: legacy, filtered/background probes, polling/errors/timeouts, target CRUD and draft preservation');
+  console.log('PASS: 14 profiles UI scenarios, including selection feedback, tooltips, busy state and bounded timeout');
 })().catch(error => { console.error(error); process.exitCode = 1; });
