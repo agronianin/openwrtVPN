@@ -1,0 +1,490 @@
+#!/bin/sh
+set -eu
+umask 077
+BASE="${VPN_DATA_ROOT:-/etc/sing-box}"
+LIB="${VPN_PROFILE_LIBRARY:-/usr/bin/vpn-subscriptions-update}"
+DB="$BASE/profiles/catalog.json"
+ACTIVE="$BASE/profiles/active"
+MANAGED="$BASE/profiles/managed"
+STORE="$BASE/profiles/cache"
+PACKS="$BASE/rule-packs/available"
+error() { echo "$*" >&2; exit 1; }
+valid_id() { printf '%s' "$1" | grep -Eq '^[a-zA-Z0-9_-][a-zA-Z0-9_.-]{0,79}$'; }
+revision() { sha256sum "$DB" | cut -d' ' -f1; }
+set_job() {
+  printf '%s\n' "$1" > "$BASE/profiles/update-job.json.new.$$"
+  mv "$BASE/profiles/update-job.json.new.$$" "$BASE/profiles/update-job.json"
+}
+running() { /etc/init.d/sing-box status >/dev/null 2>&1; }
+readonly=0
+[ "${1:-snapshot}" != snapshot ] || [ ! -f "$DB" ] || readonly=1
+if [ "${VPN_PROFILES_LOCKED:-0}" != 1 ] && [ "$readonly" != 1 ]; then
+  lock=/tmp/vpn-subscriptions.lock
+  case "${1:-}" in update|update-queued) lock=/tmp/vpn-profiles-update.lock ;; esac
+  exec flock -n -E 75 "$lock" env VPN_PROFILES_LOCKED=1 "$0" "$@"
+fi
+
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/vpn-profiles.XXXXXX")
+trap 'rm -rf "$TMP"' EXIT HUP INT TERM
+
+# Reuse the existing subscription parser and config writer, without running its dispatcher.
+VPN_LIBRARY_ONLY=1
+. "$LIB"
+trap 'rm -rf "$TMP"' EXIT HUP INT TERM
+CONFIG="$BASE/config.json"
+SETTINGS_FILE="$BASE/vpn-config/vpn-settings.conf"
+CACHE_DIR="$STORE"
+WORKDIR="$TMP/build"
+mkdir -p "$WORKDIR" "$STORE" "$BASE/profiles"
+
+cache_json() {
+  file="$1"
+  { printf '[\n'; sed '$s/,[[:space:]]*$//' "$file"; printf '\n]\n'; } | jq .
+}
+
+stable_cache() (
+  source_id="$1"
+  cache_json "$STORE/$source_id.nodes" > "$TMP/old.json" || exit 1
+  : > "$TMP/new.nodes"; : > "$TMP/new.tags"; : > "$TMP/new.titles"
+  jq -c '.[]' "$TMP/old.json" | while IFS= read -r node; do
+    old_tag=$(printf '%s' "$node" | jq -r .tag)
+    hash=$(printf '%s' "$node" | jq -cS 'del(.tag)' | sha256sum | cut -c1-24)
+    tag="$source_id-$hash"
+    printf '%s' "$node" | jq --arg tag "$tag" '.tag=$tag' >> "$TMP/new.nodes"
+    printf ',\n' >> "$TMP/new.nodes"
+    printf '%s\n' "$tag" >> "$TMP/new.tags"
+    title=$(awk -F '\t' -v tag="$old_tag" '$1==tag {sub(/^[^\t]*\t/, ""); print; exit}' "$STORE/$source_id.titles")
+    printf '%s\t%s\n' "$tag" "$title" >> "$TMP/new.titles"
+  done
+  for ext in nodes tags titles; do mv "$TMP/new.$ext" "$STORE/$source_id.$ext"; done
+)
+
+import_legacy_cache() (
+  id="$1"; name="$2"; mode="$3"; urls_file="$4"
+  chosen=''
+  for metadata in "$BASE/subscriptions-cache/$(lower "$mode")-"*.url; do
+    [ -f "$metadata" ] || continue
+    url=$(cat "$metadata")
+    if jq -e --arg url "$url" 'index($url)!=null' "$urls_file" >/dev/null; then chosen="${metadata%.url}"; break; fi
+  done
+  if [ -z "$chosen" ]; then
+    for metadata in "$BASE/subscriptions-cache/$(lower "$mode")-"*.name; do
+      [ -f "$metadata" ] || continue
+      [ "$(cat "$metadata")" != "$name" ] || { chosen="${metadata%.name}"; break; }
+    done
+  fi
+  [ -n "$chosen" ] && [ -s "$chosen.nodes" ] || return 1
+  for ext in nodes tags titles preferred count; do
+    [ ! -f "$chosen.$ext" ] || cp "$chosen.$ext" "$STORE/$id.$ext"
+  done
+  [ -e "$STORE/$id.preferred" ] || : > "$STORE/$id.preferred"
+  [ -e "$STORE/$id.titles" ] || : > "$STORE/$id.titles"
+  stable_cache "$id" || exit 1
+)
+
+migrate() (
+  [ ! -f "$DB" ] || exit 0
+  echo '[]' > "$TMP/sources.json"
+  echo '[]' > "$TMP/profiles.json"
+  for mode in BLACK WHITE; do
+    SUB_DIR="$BASE/subscriptions.d"
+    index=0
+    subscription_group_lines "$mode" > "$TMP/legacy-lines"
+    : > "$TMP/ids"
+    while IFS= read -r entry; do
+      index=$((index+1))
+      old=$(printf '%s-%02d' "$(lower "$mode")" "$index")
+      id="source-$old"
+      set -- $entry; name="$1"; shift
+      printf '%s\n' "$id" >> "$TMP/ids"
+      printf '%s\n' "$@" | jq -R . | jq -s . > "$TMP/urls.json"
+      jq --arg id "$id" --arg name "$name" --slurpfile urls "$TMP/urls.json" \
+        '. + [{id:$id,name:$name,urls:$urls[0]}]' "$TMP/sources.json" > "$TMP/next.json"
+      mv "$TMP/next.json" "$TMP/sources.json"
+      import_legacy_cache "$id" "$name" "$mode" "$TMP/urls.json" || true
+    done < "$TMP/legacy-lines"
+    cat "$TMP/ids" | jq -R . | jq -s . > "$TMP/ids.json"
+    if [ "$mode" = BLACK ]; then final=direct; preference=non-ru; else final=vpn-out; preference=ru; fi
+    printf '%s\n' 00-private-direct 05-force-proxy 06-force-direct 10-subscription-proxy 20-jet-direct 30-black-main \
+      | while IFS= read -r rule; do [ ! -f "$PACKS/$rule.rules" ] || echo "$rule"; done > "$TMP/rules"
+    if [ "$mode" = WHITE ]; then
+      printf '%s\n' 00-private-direct 05-force-proxy 06-force-direct 10-subscription-proxy 20-jet-proxy 25-white-direct 30-white-main \
+        | while IFS= read -r rule; do [ ! -f "$PACKS/$rule.rules" ] || echo "$rule"; done > "$TMP/rules"
+    fi
+    jq -Rn '[inputs]' < "$TMP/rules" > "$TMP/rules.json"
+    jq --arg id "$(lower "$mode")" --arg name "$mode" --arg final "$final" --arg preference "$preference" \
+      --slurpfile subs "$TMP/ids.json" --slurpfile rules "$TMP/rules.json" \
+      '. + [{id:$id,name:$name,subscriptions:$subs[0],nodes:[],rules:$rules[0],final:$final,preference:$preference}]' \
+      "$TMP/profiles.json" > "$TMP/next.json"
+    mv "$TMP/next.json" "$TMP/profiles.json"
+  done
+  jq -n --slurpfile subscriptions "$TMP/sources.json" --slurpfile profiles "$TMP/profiles.json" \
+    '{version:1,subscriptions:$subscriptions[0],profiles:$profiles[0]}' > "$DB.new"
+  mv "$DB.new" "$DB"
+)
+
+validate() {
+  jq -e '
+    def id: type=="string" and length>0 and length<=80;
+    def ids: type=="array" and length<=500 and all(.[]; id) and (unique|length)==length;
+    . as $d | .version==1 and (.subscriptions|type)=="array" and (.profiles|type)=="array"
+    and (.subscriptions|length)<=100 and (.profiles|length)<=100
+    and ([.subscriptions[].id]|ids) and ([.profiles[].id]|ids)
+    and all(.subscriptions[]; (.id|length)<=48 and (.name|type)=="string" and (.name|length)>0 and (.name|length)<=160
+      and (.urls|type)=="array" and (.urls|length)>0 and (.urls|length)<=30
+      and all(.urls[]; type=="string" and length<=4096))
+    and all(.profiles[]; (.name|type)=="string" and (.name|length)>0 and (.name|length)<=160
+      and (.subscriptions|ids) and (.nodes|ids) and (.rules|ids)
+      and (.final=="direct" or .final=="vpn-out")
+      and (.preference=="ru" or .preference=="non-ru" or .preference=="any")
+      and all(.subscriptions[]; . as $s | any($d.subscriptions[]; .id==$s)))
+  ' "$1" >/dev/null || error 'Invalid catalog: check IDs, references, URLs and profile fields'
+  jq -r '.subscriptions[].id,.profiles[]|if type=="object" then (.id,.subscriptions[],.nodes[],.rules[]) else . end' "$1" \
+    | while IFS= read -r id; do valid_id "$id" || error 'Invalid identifier'; done
+  jq -r '.subscriptions[].urls[]' "$1" | while IFS= read -r url; do
+    if printf '%s' "$url" | grep -Eq '[[:space:][:cntrl:]]|(^|/)\.\.(/|$)'; then error 'Invalid subscription URL'; fi
+    case "$url" in
+      https://*|http://*) printf '%s' "$url" | grep -Eq '^https?://[^/?#[:space:]]+' || error 'Invalid URL host' ;;
+      file:///etc/sing-box/manual-subscriptions/*|file:///etc/sing-box/bootstrap/*) ;;
+      *) error 'Only HTTP(S) subscriptions and local subscription files are supported' ;;
+    esac
+  done
+}
+
+snapshot() (
+  cp "$DB" "$TMP/catalog-snapshot.json"
+  DB="$TMP/catalog-snapshot.json"
+  echo '[]' > "$TMP/nodes.json"
+  jq -r '.subscriptions[].id' "$DB" | while IFS= read -r id; do
+    [ -s "$STORE/$id.nodes" ] || continue
+    cache_json "$STORE/$id.nodes" | jq --arg subscription "$id" \
+      '[.[] | {tag,subscription:$subscription,type,title:.tag}]' > "$TMP/source-nodes.json"
+    if [ -f "$STORE/$id.titles" ]; then
+      jq -Rn '[inputs | split("\t") | {key:.[0],value:(.[1:]|join("\t"))}]|from_entries' \
+        < "$STORE/$id.titles" > "$TMP/titles.json"
+      jq --slurpfile titles "$TMP/titles.json" 'map(.title=($titles[0][.tag] // .tag))' \
+        "$TMP/source-nodes.json" > "$TMP/next.json"
+      mv "$TMP/next.json" "$TMP/source-nodes.json"
+    fi
+    jq --slurpfile nodes "$TMP/source-nodes.json" '.+$nodes[0]' "$TMP/nodes.json" > "$TMP/next.json"
+    mv "$TMP/next.json" "$TMP/nodes.json"
+  done
+  echo '[]' > "$TMP/rules.json"
+  for file in "$PACKS/"*.rules; do
+    [ -f "$file" ] || continue
+    id=$(basename "$file" .rules)
+    hash=$(sha256sum "$file" | cut -d' ' -f1)
+    jq --arg id "$id" --arg revision "$hash" --rawfile content "$file" \
+      '.+[{id:$id,name:$id,content:$content,revision:$revision}]' "$TMP/rules.json" > "$TMP/next.json"
+    mv "$TMP/next.json" "$TMP/rules.json"
+  done
+  on=false; running && on=true
+  active=$(cat "$ACTIVE" 2>/dev/null || true)
+  managed=false; [ ! -s "$MANAGED" ] || managed=true
+  echo null > "$TMP/effective.json"
+  echo null > "$TMP/job.json"
+  [ ! -f "$BASE/profiles/update-job.json" ] || cp "$BASE/profiles/update-job.json" "$TMP/job.json"
+  if running && curl -fsS --max-time 2 http://127.0.0.1:9090/proxies > "$TMP/api.json"; then
+    jq 'def follow($tag;$n): if $n>12 then null else .proxies[$tag].now as $next
+      | if $next!=null and $next!="" then follow($next;$n+1) else $tag end end;
+      follow("vpn-out";0) as $tag | if $tag==null then null else
+      {tag:$tag,type:.proxies[$tag].type,delay_ms:(.proxies[$tag].history[-1].delay // null)} end' \
+      "$TMP/api.json" > "$TMP/effective.json" || echo null > "$TMP/effective.json"
+  fi
+  jq --slurpfile nodes "$TMP/nodes.json" '. as $node | if .==null then null else
+    .title=([$nodes[0][]|select(.tag==$node.tag)|.title][0] // .tag) end' "$TMP/effective.json" > "$TMP/effective-named.json"
+  mv "$TMP/effective-named.json" "$TMP/effective.json"
+  jq -n --arg revision "$(revision)" --slurpfile data "$DB" --arg active "$active" --argjson running "$on" \
+    --slurpfile nodes "$TMP/nodes.json" --slurpfile rules "$TMP/rules.json" --argjson managed "$managed" \
+    --slurpfile effective "$TMP/effective.json" \
+    --slurpfile job "$TMP/job.json" \
+    '{revision:$revision,data:$data[0],active:(if $active=="" then null else $active end),running:$running,managed:$managed,
+      effective:$effective[0],updateJob:$job[0],nodes:$nodes[0],rules:$rules[0]}'
+)
+
+refresh_sources() {
+  running || error 'VPN is off; downloads are disabled'
+  ids="${1:-all}"
+  [ "$ids" != all ] || ids=$(jq -r '.subscriptions[].id' "$DB")
+  failed=0
+  for id in $ids; do
+    running || { echo 'VPN switched off; remaining updates cancelled' >&2; return 1; }
+    refresh_source "$id" || failed=$((failed+1))
+  done
+  [ "$failed" = 0 ] || { echo "Failed subscriptions: $failed; other caches updated; previous caches retained" >&2; return 1; }
+}
+
+refresh_source() (
+  id="$1"
+  jq -e --arg id "$id" 'any(.subscriptions[]; .id==$id)' "$DB" >/dev/null || error 'Unknown subscription'
+  name=$(jq -r --arg id "$id" '.subscriptions[]|select(.id==$id)|.name' "$DB")
+  urls=$(jq -r --arg id "$id" '.subscriptions[]|select(.id==$id)|.urls[]' "$DB")
+  destination="$STORE"
+  STORE="$TMP/refresh-$id"
+  CACHE_DIR="$STORE"
+  mkdir -p "$STORE"
+  set -f
+  refresh_group "$id" "$name" $urls || exit 1
+  stable_cache "$id" || exit 1
+  for ext in tags titles preferred count name url updated nodes; do
+    [ ! -f "$STORE/$id.$ext" ] || cp "$STORE/$id.$ext" "$destination/$id.$ext.new" || exit 1
+  done
+  for ext in tags titles preferred count name url updated nodes; do
+    [ ! -f "$destination/$id.$ext.new" ] || mv "$destination/$id.$ext.new" "$destination/$id.$ext" || exit 1
+  done
+)
+
+test_node() (
+  wanted="$1"; valid_id "$wanted" || error 'Invalid node ID'
+  for file in "$STORE/"*.nodes; do
+    [ -f "$file" ] || continue
+    cache_json "$file" | jq --arg tag "$wanted" '.[]|select(.tag==$tag)' > "$TMP/probe-node.json"
+    [ ! -s "$TMP/probe-node.json" ] || break
+  done
+  [ -s "$TMP/probe-node.json" ] || error 'Node not found in subscription cache'
+  port=$((30000 + $$ % 20000))
+  jq -n --slurpfile node "$TMP/probe-node.json" --argjson port "$port" \
+    '{log:{level:"error"},dns:{servers:[{type:"udp",tag:"dns-direct",server:"77.88.8.8"}]},
+      inbounds:[{type:"mixed",listen:"127.0.0.1",listen_port:$port}],outbounds:$node,
+      route:{auto_detect_interface:true,default_domain_resolver:"dns-direct",final:$node[0].tag}}' > "$TMP/probe.json"
+  sing-box check -c "$TMP/probe.json"
+  sing-box run -c "$TMP/probe.json" > "$TMP/probe.log" 2>&1 &
+  probe_pid=$!
+  trap 'kill "$probe_pid" 2>/dev/null || true; wait "$probe_pid" 2>/dev/null || true' EXIT HUP INT TERM
+  sleep 1
+  kill -0 "$probe_pid" 2>/dev/null || error 'Probe instance could not start; working VPN was not changed'
+  elapsed=$(curl -4 -fsS --max-time 10 --connect-timeout 5 --noproxy '' --proxy "socks5h://127.0.0.1:$port" \
+    -o /dev/null -w '%{time_total}' "$CHECK_URL") || error 'Node HTTPS probe failed; working VPN was not changed'
+  jq -n --arg tag "$wanted" --arg seconds "$elapsed" '{node:$tag,https:true,delay_ms:($seconds|tonumber|.*1000)}'
+)
+
+build_profile() (
+  id="$1"
+  jq -e --arg id "$id" '.profiles[]|select(.id==$id)' "$DB" > "$TMP/profile.json" || error 'Unknown profile'
+  : > "$WORKDIR/included-groups"; : > "$WORKDIR/top-tags"; : > "$WORKDIR/all-nodes"
+  jq -r '.subscriptions[]' "$TMP/profile.json" | while IFS= read -r source_id; do
+    [ -s "$STORE/$source_id.nodes" ] || continue
+    echo "$source_id" >> "$WORKDIR/included-groups"
+    group_auto_tag "$source_id" >> "$WORKDIR/top-tags"
+    cat "$STORE/$source_id.nodes" >> "$WORKDIR/all-nodes"
+  done
+  jq -r '.nodes[]' "$TMP/profile.json" | while IFS= read -r tag; do
+    found=0
+    for file in "$STORE/"*.nodes; do
+      [ -f "$file" ] || continue
+      cache_json "$file" | jq --arg tag "$tag" '.[]|select(.tag==$tag)' > "$TMP/explicit-node"
+      [ -s "$TMP/explicit-node" ] || continue
+      if ! grep -Fxq "$tag" "$WORKDIR/top-tags"; then echo "$tag" >> "$WORKDIR/top-tags"; fi
+      if ! grep -Fq "\"$tag\"" "$WORKDIR/all-nodes"; then cat "$TMP/explicit-node" >> "$WORKDIR/all-nodes"; echo ',' >> "$WORKDIR/all-nodes"; fi
+      found=1; break
+    done
+    [ "$found" = 1 ] || error 'A selected node is no longer in cache; edit the profile'
+  done
+  [ -s "$WORKDIR/top-tags" ] || error 'No cached nodes for this profile; update its subscriptions first'
+  echo auto > "$WORKDIR/effective-node"; : > "$WORKDIR/effective-group"
+  RULE_PACK_ENABLED="$TMP/enabled"; mkdir -p "$RULE_PACK_ENABLED"
+  index=1
+  if [ -f "$PACKS/00-private-direct.rules" ]; then ln -s "$PACKS/00-private-direct.rules" "$RULE_PACK_ENABLED/000.rules"; fi
+  jq -r '.rules[]' "$TMP/profile.json" | while IFS= read -r rule; do
+    [ -f "$PACKS/$rule.rules" ] || error "Rule pack missing: $rule"
+    ln -s "$PACKS/$rule.rules" "$RULE_PACK_ENABLED/$(printf '%03d' "$index").rules"
+    index=$((index+1))
+  done
+  prepare_route
+  jq -r .final "$TMP/profile.json" > "$WORKDIR/route-final"
+  preference=$(jq -r .preference "$TMP/profile.json")
+  mode=WHITE
+  [ "$preference" != non-ru ] || mode=BLACK
+  WHITE_NODE_PREFERENCE="$preference"
+  write_auto_group() {
+    selected_source="$2"
+    tags="$STORE/$selected_source.tags"
+    preferred="$WORKDIR/$selected_source.preference-tags"
+    awk -v preference="$preference" 'FILENAME==ARGV[1] {ru[$1]=1;next}
+      preference=="any" || (preference=="ru" && FNR in ru) || (preference=="non-ru" && !(FNR in ru))' \
+      "$STORE/$selected_source.preferred" "$tags" > "$preferred"
+    if [ "$preference" = any ] || [ ! -s "$preferred" ]; then
+      write_urltest_group "$(group_auto_tag "$selected_source")" "$tags" 10m 50
+    else
+      write_urltest_group "$selected_source-preferred" "$preferred" 10m 50
+      write_urltest_group "$selected_source-fallback" "$tags" 10m 50
+      printf '%s\n' "$selected_source-preferred" "$selected_source-fallback" > "$WORKDIR/$selected_source.priority-tags"
+      write_urltest_group "$(group_auto_tag "$selected_source")" "$WORKDIR/$selected_source.priority-tags" 10m 60000
+    fi
+  }
+  write_config "$mode"
+  jq '[.outbounds[]|select(.type=="vless" or .type=="hysteria2")|.tag] as $nodes
+    | .outbounds |= (map(if .tag=="vpn-out" then .tag="profile-auto" else . end)
+      + [{type:"selector",tag:"vpn-out",outbounds:(["profile-auto"]+$nodes),default:"profile-auto",interrupt_exist_connections:false}])
+    | .route.rules |= ([{action:"route",outbound:"direct",ip_cidr:["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10",
+        "127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.168.0.0/16","224.0.0.0/4","255.255.255.255/32",
+        "::1/128","fc00::/7","fe80::/10","ff00::/8"]}]+.)' \
+    "$WORKDIR/config.json" > "$TMP/candidate.json"
+  sing-box check -c "$TMP/candidate.json"
+  if [ "${2:-}" = check ]; then echo 'Profile configuration valid; active connection unchanged'; exit 0; fi
+  rollback_config="$CONFIG.rollback.$$"
+  cp "$CONFIG" "$rollback_config" || error 'Cannot back up configuration; activation cancelled'
+  previous_active=$(cat "$ACTIVE" 2>/dev/null || true)
+  previous_managed=$(cat "$MANAGED" 2>/dev/null || true)
+  was_running=0; running && was_running=1
+  restore_profile() {
+    mv "$rollback_config" "$CONFIG"
+    if [ -n "$previous_active" ]; then echo "$previous_active" > "$ACTIVE"; else rm -f "$ACTIVE"; fi
+    if [ -n "$previous_managed" ]; then echo "$previous_managed" > "$MANAGED"; else rm -f "$MANAGED"; fi
+  }
+  if ! { cp "$TMP/candidate.json" "$CONFIG.new" && printf '%s\n' "$id" > "$ACTIVE.new" && echo 1 > "$MANAGED.new"; }; then
+    rm -f "$CONFIG.new" "$ACTIVE.new" "$MANAGED.new" "$rollback_config"
+    error 'Cannot stage profile files; working connection unchanged'
+  fi
+  if ! { mv "$CONFIG.new" "$CONFIG" && mv "$ACTIVE.new" "$ACTIVE" && mv "$MANAGED.new" "$MANAGED"; }; then
+    restore_profile
+    error 'Cannot publish profile state; previous configuration restored'
+  fi
+  started=0
+  if [ "$was_running" = 1 ]; then
+    /etc/init.d/sing-box restart && started=1
+  else
+    /usr/bin/vpn-toggle on && started=1
+  fi
+  sleep 1
+  if [ "$started" != 1 ] || ! running; then
+    if [ "$was_running" = 0 ]; then /usr/bin/vpn-toggle off || true; fi
+    restore_profile
+    [ "$was_running" = 0 ] || /etc/init.d/sing-box restart || true
+    error 'Profile activation failed; previous configuration restored'
+  fi
+  rm -f "$rollback_config"
+)
+
+migrate
+case "${1:-snapshot}" in
+  migrate) ;;
+  migrate-cache)
+    jq -r '.subscriptions[]|[.id,.name]|@tsv' "$DB" | while IFS="$(printf '\t')" read -r id name; do
+      case "$id" in source-black-*) mode=BLACK ;; source-white-*) mode=WHITE ;; *) continue ;; esac
+      jq --arg id "$id" '.subscriptions[]|select(.id==$id)|.urls' "$DB" > "$TMP/urls.json"
+      if ! import_legacy_cache "$id" "$name" "$mode" "$TMP/urls.json"; then
+        mkdir -p "$BASE/profiles/unverified"
+        for file in "$STORE/$id."*; do [ ! -f "$file" ] || mv "$file" "$BASE/profiles/unverified/"; done
+      fi
+    done
+    ;;
+  snapshot) snapshot ;;
+  save)
+    [ "${2:-}" = "$(revision)" ] || error 'Catalog changed; reload before saving'
+    cat > "$TMP/input.json"
+    [ "$(wc -c < "$TMP/input.json")" -le 262144 ] || error 'Catalog too large'
+    validate "$TMP/input.json"
+    jq -r '.profiles[].rules[]' "$TMP/input.json" | while IFS= read -r rule; do
+      [ -f "$PACKS/$rule.rules" ] || error "Unknown rule pack: $rule"
+    done
+    jq -r '.profiles[].nodes[]' "$TMP/input.json" | while IFS= read -r tag; do
+      found=0
+      for source_id in $(jq -r '.subscriptions[].id' "$TMP/input.json"); do
+        if [ -f "$STORE/$source_id.tags" ] && grep -Fxq "$tag" "$STORE/$source_id.tags"; then found=1; break; fi
+      done
+      [ "$found" = 1 ] || error 'A selected node is missing from the catalog; remove the reference first'
+    done
+    active=$(cat "$ACTIVE" 2>/dev/null || true)
+    if [ -n "$active" ] && running; then
+      jq -e --arg id "$active" 'any(.profiles[];.id==$id)' "$TMP/input.json" >/dev/null \
+        || error 'Turn VPN off before deleting the active profile'
+    fi
+    cp "$DB" "$DB.previous"; cp "$TMP/input.json" "$DB.new"; mv "$DB.new" "$DB"
+    if [ -n "$active" ] && ! jq -e --arg id "$active" 'any(.profiles[];.id==$id)' "$DB" >/dev/null; then rm -f "$ACTIVE"; fi
+    ;;
+  activate)
+    if [ "${2:-}" = off ]; then /usr/bin/vpn-toggle off; else build_profile "${2:-}"; fi
+    ;;
+  check) build_profile "${2:-}" check ;;
+  bootstrap)
+    if running; then error 'Bootstrap is only allowed while VPN is off'; fi
+    id="${2:-}"
+    jq -e --arg id "$id" '.profiles[]|select(.id==$id)' "$DB" > "$TMP/profile.json" || error 'Unknown profile'
+    VPN_BOOTSTRAP=1
+    jq -r '.subscriptions[]' "$TMP/profile.json" | while IFS= read -r source_id; do refresh_source "$source_id"; done
+    echo 'Initial profile cache loaded directly; VPN remains off. Select the profile when ready.'
+    ;;
+  update)
+    refresh_sources "${2:-all}"
+    ;;
+  queue-update)
+    running || error 'VPN is off; downloads are disabled'
+    id="${2:-all}"
+    [ "$id" = all ] || jq -e --arg id "$id" 'any(.subscriptions[];.id==$id)' "$DB" >/dev/null || error 'Unknown subscription'
+    [ ! -s "$BASE/profiles/update-request" ] || error 'An update is already queued'
+    flock -n /tmp/vpn-profiles-update.lock true || error 'An update is already running'
+    echo "$id" > "$BASE/profiles/update-request"
+    set_job "$(jq -n --arg source "$id" '{state:"queued",source:$source}')"
+    echo 'Обновление поставлено в очередь: запустится планировщиком в течение минуты. Кнопка обновления статуса покажет результат.'
+    ;;
+  update-queued)
+    [ -s "$BASE/profiles/update-request" ] || exit 0
+    id=$(cat "$BASE/profiles/update-request")
+    rm "$BASE/profiles/update-request"
+    set_job '{"state":"running"}'
+    if refresh_sources "$id"; then
+      set_job '{"state":"done"}'
+    else
+      set_job '{"state":"failed","message":"Часть подписок не обновилась; прежний кэш сохранен. См. /tmp/vpn-auto-update.log"}'
+      exit 1
+    fi
+    ;;
+  node)
+    [ -s "$MANAGED" ] || error 'Select a profile first'
+    tag="${2:-auto}"
+    [ "$tag" != auto ] || tag=profile-auto
+    curl -fsS --max-time 8 http://127.0.0.1:9090/proxies > "$TMP/proxies.json"
+    jq -e --arg tag "$tag" '.proxies["vpn-out"].all | index($tag)!=null' "$TMP/proxies.json" >/dev/null \
+      || error 'Node does not belong to the active profile/configuration'
+    jq -n --arg name "$tag" '{name:$name}' | curl -fsS --max-time 8 -X PUT -H 'Content-Type: application/json' \
+      --data-binary @- http://127.0.0.1:9090/proxies/vpn-out
+    ;;
+  test)
+    if [ -n "${2:-}" ]; then
+      test_node "$2"
+    else
+      /usr/bin/vpnctl node verify "$CHECK_URL"
+      /usr/bin/vpnctl geo || echo 'HTTPS доступен; геолокация не определена'
+    fi
+    ;;
+  rule-save)
+    id="${2:-}"; valid_id "$id" || error 'Invalid rule ID'
+    expected=new
+    [ ! -f "$PACKS/$id.rules" ] || expected=$(sha256sum "$PACKS/$id.rules" | cut -d' ' -f1)
+    [ "${3:-}" = "$expected" ] || error 'Rule changed; reload before saving'
+    cat > "$TMP/rule"; [ "$(wc -c < "$TMP/rule")" -le 65536 ] || error 'Rule pack too large'
+    [ ! -e "$PACKS/$id.rules" ] || cp "$PACKS/$id.rules" "$PACKS/$id.rules.previous"
+    cp "$TMP/rule" "$PACKS/$id.rules.new"; mv "$PACKS/$id.rules.new" "$PACKS/$id.rules"
+    ;;
+  rule-delete)
+    id="${2:-}"; valid_id "$id" || error 'Invalid rule ID'
+    [ -f "$PACKS/$id.rules" ] || error 'Rule not found'
+    [ "${3:-}" = "$(sha256sum "$PACKS/$id.rules" | cut -d' ' -f1)" ] || error 'Rule changed; reload before deleting'
+    jq -e --arg id "$id" 'all(.profiles[]; (.rules|index($id))==null)' "$DB" >/dev/null || error 'Rule is used by a profile'
+    [ "$id" != 00-private-direct ] || error 'Local network bypass cannot be deleted'
+    [ ! -e "$PACKS/$id.rules" ] || mv "$PACKS/$id.rules" "$PACKS/$id.rules.previous"
+    ;;
+  node-import)
+    [ "${3:-}" = "$(revision)" ] || error 'Catalog changed; reload before importing'
+    name="${2:-Manual node}"
+    [ "${#name}" -le 160 ] || error 'Name too long'
+    IFS= read -r uri || true
+    case "$uri" in vless://*|hy2://*|hysteria2://*) ;; *) error 'Expected one VLESS or Hysteria2 URI' ;; esac
+    [ "${#uri}" -le 8192 ] || error 'URI too long'
+    id="manual-$(printf '%s' "$uri" | sha256sum | cut -c1-24)"
+    jq -e --arg id "$id" 'all(.subscriptions[]; .id!=$id)' "$DB" >/dev/null || error 'This node is already imported'
+    printf '%s\n' "$uri" > "$TMP/import-uri"
+    parse_group "$id" "$TMP/import-uri"
+    [ "$parsed_count" = 1 ] || error 'Unsupported node parameters'
+    for ext in tags nodes titles preferred; do cp "$WORKDIR/$id.$ext" "$STORE/$id.$ext"; done
+    echo 1 > "$STORE/$id.count"
+    stable_cache "$id"
+    mkdir -p "$BASE/manual-subscriptions/profiles"
+    cp "$TMP/import-uri" "$BASE/manual-subscriptions/profiles/$id.txt"
+    jq --arg id "$id" --arg name "$name" --arg url "file://$BASE/manual-subscriptions/profiles/$id.txt" \
+      '.subscriptions += [{id:$id,name:$name,urls:[$url]}]' "$DB" > "$DB.new"
+    cp "$DB" "$DB.previous"; mv "$DB.new" "$DB"
+    ;;
+  *) error 'Usage: vpn-profiles snapshot|save REV|activate ID|off|update ID|all|node TAG|auto|test [TAG]|rule-save ID|rule-delete ID' ;;
+esac

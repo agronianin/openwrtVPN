@@ -898,6 +898,44 @@ if [ "$ACTION" = vpn_snapshot ]; then
   exit 0
 fi
 
+case "$ACTION" in vpn_profiles_*)
+  output_file=$(mktemp /tmp/vpn-profile-result.XXXXXX)
+  case "$ACTION" in
+    vpn_profiles_snapshot) : > "$output_file" ;;
+    vpn_profiles_node_import)
+      printf '%s\n' "$CONTENT" | /usr/bin/vpn-profiles node-import "$ARG" "$(url_decode "$(field revision)")" > "$output_file" 2>&1 ;;
+    vpn_profiles_save) printf '%s' "$CONTENT" | /usr/bin/vpn-profiles save "$(url_decode "$(field revision)")" > "$output_file" 2>&1 ;;
+    vpn_profiles_activate) /usr/bin/vpn-profiles activate "$ARG" > "$output_file" 2>&1 ;;
+    vpn_profiles_node) /usr/bin/vpn-profiles node "$ARG" > "$output_file" 2>&1 ;;
+    vpn_profiles_update) /usr/bin/vpn-profiles queue-update "$ARG" > "$output_file" 2>&1 ;;
+    vpn_profiles_test) /usr/bin/vpn-profiles test "$ARG" > "$output_file" 2>&1 ;;
+    vpn_profiles_rule_save)
+      printf '%s' "$CONTENT" | /usr/bin/vpn-profiles rule-save "$ARG" "$(url_decode "$(field revision)")" > "$output_file" 2>&1 ;;
+    vpn_profiles_rule_delete)
+      /usr/bin/vpn-profiles rule-delete "$ARG" "$(url_decode "$(field revision)")" > "$output_file" 2>&1 ;;
+    *) echo 'Unknown action' > "$output_file"; false ;;
+  esac
+  result_code=$?
+  if [ "$result_code" = 75 ] && [ ! -s "$output_file" ]; then
+    echo 'Другая операция уже выполняется. Текущее подключение не изменено; повторите через несколько секунд.' > "$output_file"
+  fi
+  snapshot_file=$(mktemp /tmp/vpn-profile-snapshot.XXXXXX)
+  snapshot_error=$(mktemp /tmp/vpn-profile-error.XXXXXX)
+  printf 'Content-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\n\r\n'
+  if [ "$result_code" = 0 ] && /usr/bin/vpn-profiles snapshot > "$snapshot_file" 2> "$snapshot_error"; then
+    jq -n --slurpfile snapshot "$snapshot_file" --rawfile output "$output_file" '{ok:true,snapshot:$snapshot[0],output:$output}'
+  else
+    if [ "$result_code" = 0 ]; then
+      printf '\nОперация выполнена, но обновление состояния не удалось. Не повторяйте сохранение вслепую; обновите страницу.\n' >> "$output_file"
+      cat "$snapshot_error" >> "$output_file"
+    fi
+    [ -s "$output_file" ] || echo 'Операция завершилась ошибкой без диагностического вывода' > "$output_file"
+    jq -n --rawfile error "$output_file" '{ok:false,error:$error}'
+  fi
+  rm -f "$output_file" "$snapshot_file" "$snapshot_error"
+  exit 0
+  ;; esac
+
 OUTPUT=""
 CMD=""
 RC=0
@@ -1198,6 +1236,7 @@ cat <<'EOF'
     summary { cursor: pointer; color: var(--blue); font-weight: 750; }
   </style>
   <link rel="stylesheet" href="/vpn.css">
+  <link rel="stylesheet" href="/profiles.css">
 </head>
 <body>
 <header>
@@ -1272,6 +1311,14 @@ fi
 
 if [ "$ACTIVE_TAB" = vpn ]; then
 echo '<section class="tab tab-vpn">'
+if [ -x /usr/bin/vpn-profiles ]; then
+  echo '<div id="vpn-app"></div><script type="application/json" id="vpn-profile-data">'
+  /usr/bin/vpn-profiles snapshot | jq -c . | sed 's/</\\u003c/g; s/>/\\u003e/g; s/\&/\\u0026/g'
+  echo '</script><script defer src="/profiles.js"></script>'
+  echo '<details class="advanced"><summary>Периоды автоматизации</summary>'
+  vpn_interval_editor
+  echo '</details>'
+else
 cat <<'EOF'
 <nav class="vpn-nav" aria-label="Разделы VPN">
 <a href="#vpn-connection">VPN</a><a href="#vpn-subscriptions">Подписки</a><a href="#vpn-nodes">Узлы</a><a href="#vpn-rules">Правила</a><a href="#vpn-settings">Ещё</a>
@@ -1378,6 +1425,7 @@ vpn_interval_editor
 echo '</section>'
 case "$ACTION" in vpn_*) result_block ;; esac
 echo '<div id="vpn-result" class="ajax-result"></div>'
+fi
 cat <<'EOF'
 </section>
 EOF
@@ -1401,6 +1449,7 @@ cat <<'EOF'
   document.addEventListener('submit', function (event) {
     var form = event.target;
     if (!form.matches('form')) return;
+    if (form.closest('#vpn-app')) return;
     var target = resultTarget(form);
     if (!target || !window.fetch || !window.FormData) return;
 

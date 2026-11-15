@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-if [ "${VPN_SUBSCRIPTIONS_LOCKED:-}" != 1 ] && [ "${1:-}" != status ]; then
+if [ "${VPN_LIBRARY_ONLY:-0}" != 1 ] && [ "${VPN_SUBSCRIPTIONS_LOCKED:-}" != 1 ] && [ "${1:-}" != status ]; then
   exec flock -n -E 75 /tmp/vpn-subscriptions.lock env VPN_SUBSCRIPTIONS_LOCKED=1 "$0" "$@"
 fi
 
@@ -50,7 +50,7 @@ load_settings() {
   BLACK_FAILOVER_TOLERANCE_MS=1500
   WHITE_FAILOVER_TOLERANCE_MS=60000
   UPDATE_INTERVAL_HOURS=6
-  [ -f "$SETTINGS_FILE" ] && . "$SETTINGS_FILE"
+  [ ! -f "$SETTINGS_FILE" ] || . "$SETTINGS_FILE"
 }
 
 upper() {
@@ -1248,6 +1248,8 @@ status() {
 }
 
 load_settings
+
+[ "${VPN_LIBRARY_ONLY:-0}" != 1 ] || return 0
 
 case "${1:-update}" in
   bootstrap)

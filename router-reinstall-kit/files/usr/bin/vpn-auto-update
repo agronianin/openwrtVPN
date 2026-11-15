@@ -7,6 +7,13 @@ UPDATE_INTERVAL_HOURS=6
 
 [ -f "$SETTINGS_FILE" ] && . "$SETTINGS_FILE"
 
+if [ -s /etc/sing-box/profiles/update-request ] && /etc/init.d/sing-box status >/dev/null 2>&1; then
+  requested=$(cat /etc/sing-box/profiles/update-request)
+  /usr/bin/vpn-profiles update-queued
+  [ "$requested" != all ] || date +%s > "$STATE_FILE"
+  exit 0
+fi
+
 case "$UPDATE_INTERVAL_HOURS" in
   *[!0-9]*) echo 'ERROR: invalid UPDATE_INTERVAL_HOURS' >&2; exit 2 ;;
   ''|0)
@@ -33,7 +40,11 @@ if [ "$age" -lt "$interval_seconds" ]; then
   exit 0
 fi
 
-if /usr/bin/vpn-subscriptions-update refresh; then
+updater=/usr/bin/vpn-subscriptions-update
+[ ! -f /etc/sing-box/profiles/catalog.json ] || updater=/usr/bin/vpn-profiles
+action=refresh
+[ "$updater" != /usr/bin/vpn-profiles ] || action=update
+if "$updater" "$action"; then
   mkdir -p "$(dirname "$STATE_FILE")"
   printf '%s\n' "$now" > "$STATE_FILE"
   logger -t vpn-auto-update "subscription cache refresh completed without applying config"

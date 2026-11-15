@@ -103,6 +103,10 @@ add_support_rules() {
 }
 
 vpn_on() {
+    if [ -s /etc/sing-box/profiles/managed ] && [ ! -s /etc/sing-box/profiles/active ]; then
+        log 'Select a VPN profile before enabling VPN'
+        return 1
+    fi
     if ! jq -e 'any(.outbounds[]?; .tag == "vpn-out")' /etc/sing-box/config.json >/dev/null 2>&1; then
         log 'No VPN nodes configured; run vpn-subscriptions-update bootstrap first'
         return 1

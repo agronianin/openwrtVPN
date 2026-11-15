@@ -42,10 +42,12 @@ else
 fi
 mkdir -p /usr/bin /etc/init.d /etc/config /opt/router-control/www/cgi-bin /etc/sing-box/vpn-config /etc/sing-box/subscriptions.d /etc/sing-box/rule-packs/available /etc/sing-box/rule-packs/enabled /etc/sing-box/subscriptions-cache /usr/share/sing-box
 copy_file() { cp "$FILES/$1" "/$1"; chmod "$2" "/$1"; }
-for name in vpnctl vpn-subscriptions-update vpn-toggle vpn-health-check vpn-auto-update vpn-mode sing-box-update; do copy_file "usr/bin/$name" 755; done
+for name in vpnctl vpn-subscriptions-update vpn-toggle vpn-health-check vpn-auto-update vpn-mode sing-box-update vpn-profiles; do
+  copy_file "usr/bin/$name" 755
+done
 for name in sing-box router-control-web; do copy_file "etc/init.d/$name" 755; done
 copy_file opt/router-control/www/cgi-bin/router-control 755
-for name in vpn.js vpn.css index.html; do copy_file "opt/router-control/www/$name" 644; done
+for name in vpn.js vpn.css profiles.js profiles.css index.html; do copy_file "opt/router-control/www/$name" 644; done
 copy_file etc/sing-box/rule-packs/apply-rules 755
 copy_file etc/sing-box/rule-packs/RULES-FORMAT.md 644
 [ -f /etc/config/openwrtvpn ] || cp "$ROOT/defaults/openwrtvpn" /etc/config/openwrtvpn

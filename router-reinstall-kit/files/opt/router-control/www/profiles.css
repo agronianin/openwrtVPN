@@ -1,0 +1,45 @@
+#vpn-app { color: #182026; font: 15px/1.5 system-ui, sans-serif; min-width: 0; width: 100%; }
+#vpn-app *, #vpn-app *::before, #vpn-app *::after { box-sizing: border-box; letter-spacing: 0; }
+#vpn-app .vp-nav { display: flex; flex-wrap: wrap; gap: 4px; border-bottom: 1px solid #c7d3dd; padding-bottom: 8px; }
+#vpn-app button { cursor: pointer; background: #fff; color: #145b91; border: 1px solid #bac6cf; border-radius: 4px; }
+#vpn-app button { font: inherit; min-height: 44px; padding: 8px 12px; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+#vpn-app .vp-nav button { flex: 1 1 auto; border-color: transparent; }
+#vpn-app .vp-nav [aria-current] { background: #e5f0f7; border-color: #145b91; color: #153b55; font-weight: 700; }
+#vpn-app button:disabled { opacity: .5; cursor: default; }
+#vpn-app button:hover:not(:disabled) { background: #e5f0f7; }
+#vpn-app :is(button, input, textarea, select):focus-visible { outline: 3px solid #1777b9; outline-offset: 2px; }
+#vpn-app .vp-save, #vpn-app .vp-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+#vpn-app .vp-save span { font-size: 14px; color: #52616d; }
+#vpn-app .vp-section { padding: 8px 0 24px; min-width: 0; }
+#vpn-app h2 { font-size: 20px; margin: 4px 0 16px; }
+#vpn-app label { display: block; font-weight: 600; margin: 10px 0; min-width: 0; overflow-wrap: anywhere; }
+#vpn-app input:not([type=checkbox]), #vpn-app select, #vpn-app textarea {
+  display: block; width: 100%; min-width: 0; max-width: 100%; margin: 5px 0 0; padding: 10px;
+  border: 1px solid #bac6cf; border-radius: 4px; background: #fff; color: #182026; font: inherit; min-height: 44px;
+}
+#vpn-app textarea { min-height: 150px; resize: vertical; overflow-wrap: anywhere; white-space: pre-wrap; }
+#vpn-app .vp-editor { border: 0; border-top: 1px solid #c7d3dd; padding: 16px 0; margin: 20px 0 0; min-width: 0; }
+#vpn-app legend { max-width: 100%; font-weight: 700; font-size: 16px; overflow-wrap: anywhere; padding: 0 8px 0 0; }
+#vpn-app .vp-ordered { min-width: 0; border: 0; padding: 4px 0; margin: 16px 0; }
+#vpn-app .vp-order-row { display: grid; grid-template-columns: minmax(0, 1fr) 44px 44px; gap: 4px; align-items: center; border-bottom: 1px solid #e1e6ea; }
+#vpn-app .vp-order-row label { display: flex; align-items: center; gap: 8px; margin: 0; min-height: 48px; font-weight: 400; }
+#vpn-app .vp-order-row input[type=checkbox] { appearance: auto; width: 20px; height: 20px; min-height: 20px; margin: 0; flex: 0 0 20px; }
+#vpn-app .vp-order-row button { width: 44px; height: 44px; padding: 0; font-size: 20px; }
+#vpn-app .vp-node { border-bottom: 1px solid #c7d3dd; padding: 16px 0; overflow-wrap: anywhere; }
+#vpn-app .vp-result { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0; }
+#vpn-app .vp-result:empty { display: none; }
+#vpn-app .vp-error { color: #a51d2b; }
+#vpn-app .vp-status { font-weight: 700; }
+#vpn-app p, #vpn-app strong { overflow-wrap: anywhere; }
+#vpn-app .vp-reapply { width: 44px; height: 44px; font-size: 22px; padding: 0; }
+#vpn-app .vp-warning { color: #8a4300; font-weight: 600; }
+#vpn-app .vp-count { color: #52616d; font-size: 13px; }
+#vpn-app .vp-compact { border-bottom: 1px solid #c7d3dd; margin-top: 8px; }
+#vpn-app .vp-compact > summary { cursor: pointer; min-height: 48px; padding: 12px 0; overflow-wrap: anywhere; }
+#vpn-app .vp-compact > summary:focus-visible { outline: 3px solid #1777b9; outline-offset: 2px; }
+#vpn-app code { display: block; overflow-wrap: anywhere; font-size: 13px; }
+@media (max-width: 480px) {
+  #vpn-app input:not([type=checkbox]), #vpn-app select, #vpn-app textarea { font-size: 16px; }
+  #vpn-app .vp-save { align-items: stretch; flex-direction: column; }
+  #vpn-app .vp-nav button { padding: 8px; }
+}
