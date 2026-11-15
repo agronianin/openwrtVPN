@@ -3,6 +3,7 @@
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 MAX_BODY=262144
+ASSET_VERSION=$(sha256sum /opt/router-control/www/profiles.js /opt/router-control/www/profiles.css 2>/dev/null | sha256sum | cut -c1-12)
 MODEM_ENABLED="$(uci -q get openwrtvpn.main.modem_enabled || echo 0)"
 
 html_escape() {
@@ -1236,7 +1237,9 @@ cat <<'EOF'
     summary { cursor: pointer; color: var(--blue); font-weight: 750; }
   </style>
   <link rel="stylesheet" href="/vpn.css">
-  <link rel="stylesheet" href="/profiles.css">
+EOF
+printf '<link rel="stylesheet" href="/profiles.css?v=%s">\n' "$ASSET_VERSION"
+cat <<'EOF'
 </head>
 <body>
 <header>
@@ -1314,7 +1317,7 @@ echo '<section class="tab tab-vpn">'
 if [ -x /usr/bin/vpn-profiles ]; then
   echo '<div id="vpn-app"></div><script type="application/json" id="vpn-profile-data">'
   /usr/bin/vpn-profiles snapshot | jq -c . | sed 's/</\\u003c/g; s/>/\\u003e/g; s/\&/\\u0026/g'
-  echo '</script><script defer src="/profiles.js"></script>'
+  printf '</script><script defer src="/profiles.js?v=%s"></script>\n' "$ASSET_VERSION"
   echo '<details class="advanced"><summary>Периоды автоматизации</summary>'
   vpn_interval_editor
   echo '</details>'

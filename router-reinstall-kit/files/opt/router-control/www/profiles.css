@@ -3,7 +3,7 @@
 #vpn-app .vp-nav { display: flex; flex-wrap: wrap; gap: 4px; border-bottom: 1px solid #c7d3dd; padding-bottom: 8px; }
 #vpn-app button { cursor: pointer; background: #fff; color: #145b91; border: 1px solid #bac6cf; border-radius: 4px; }
 #vpn-app button { font: inherit; min-height: 44px; padding: 8px 12px; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
-#vpn-app .vp-nav button { flex: 1 1 auto; border-color: transparent; }
+#vpn-app .vp-nav button { flex: 1 1 auto; width: auto; border-color: transparent; }
 #vpn-app .vp-nav [aria-current] { background: #e5f0f7; border-color: #145b91; color: #153b55; font-weight: 700; }
 #vpn-app button:disabled { opacity: .5; cursor: default; }
 #vpn-app button:hover:not(:disabled) { background: #e5f0f7; }
@@ -39,6 +39,7 @@
 #vpn-app .vp-compact > summary:focus-visible { outline: 3px solid #1777b9; outline-offset: 2px; }
 #vpn-app code { display: block; overflow-wrap: anywhere; font-size: 13px; }
 @media (max-width: 480px) {
+  #vpn-app .vp-nav { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
   #vpn-app input:not([type=checkbox]), #vpn-app select, #vpn-app textarea { font-size: 16px; }
   #vpn-app .vp-save { align-items: stretch; flex-direction: column; }
   #vpn-app .vp-nav button { padding: 8px; }
