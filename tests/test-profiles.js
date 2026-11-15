@@ -67,6 +67,18 @@ try {
   const imported = snapshot();
   assert.ok(imported.nodes.some(node => node.subscription.startsWith('manual-')));
   assert.equal(run(['node-import', 'Own node', imported.revision], uri).status, 1);
+  // Готовую подписку можно подложить в существующий источник без изменения URL, профиля и рабочего config.
+  const importedFile = path.join(work, 'subscription.txt');
+  fs.writeFileSync(importedFile, Buffer.from(uri).toString('base64'));
+  const catalogBefore = fs.readFileSync(path.join(root, 'profiles/catalog.json'), 'utf8');
+  const cacheImport = run(['import-cache', 'source-black-01', importedFile]);
+  assert.equal(cacheImport.status, 0, cacheImport.stderr);
+  const nodesFile = path.join(root, 'profiles/cache/source-black-01.nodes');
+  const nodesBefore = fs.readFileSync(nodesFile, 'utf8');
+  fs.writeFileSync(importedFile, 'invalid data');
+  assert.equal(run(['import-cache', 'source-black-01', importedFile]).status, 1);
+  assert.equal(fs.readFileSync(nodesFile, 'utf8'), nodesBefore);
+  assert.equal(fs.readFileSync(path.join(root, 'profiles/catalog.json'), 'utf8'), catalogBefore);
   assert.equal(fs.readFileSync(path.join(root, 'config.json'), 'utf8'), '{"old":"working-config"}');
   // Неудачный запуск из OFF должен вернуть обычную маршрутизацию, а ошибка записи — не менять метаданные.
   const bin = path.join(work, 'bin');

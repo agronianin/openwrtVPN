@@ -11,6 +11,12 @@
     return node;
   }
   var snapshot, data, baseline, busy = false, view = 'VPN', drafts = new Map(), expanded = new Set();
+  var probeJob = null, probeStarting = false, probeError = '', probeNote = '', drawProbe = null, targetId = 'google';
+  var defaultTargets = [
+    { id: 'google', name: 'Google', url: 'https://www.google.com/generate_204', status: 204 },
+    { id: 'youtube', name: 'YouTube', url: 'https://www.youtube.com/generate_204', status: 204 },
+    { id: 'cloudflare', name: 'Cloudflare', url: 'https://cp.cloudflare.com/generate_204', status: 204 }
+  ];
   try {
     snapshot = JSON.parse(source.textContent);
     data = JSON.parse(JSON.stringify(snapshot.data));
@@ -57,6 +63,65 @@
     parent.append(node); return node;
   }
   function fail(target, message) { target.textContent = message; target.classList.add('vp-error'); }
+  function probing() { return probeStarting || !!(probeJob && probeJob.state === 'running'); }
+  function updateProbe() { if (drawProbe) drawProbe(); }
+  async function probeRequest(action, extra) {
+    var params = new URLSearchParams({ action: action, ajax: '1', tab: 'vpn' });
+    Object.keys(extra || {}).forEach(function (key) { params.set(key, extra[key]); });
+    var controller = new AbortController(), timer;
+    try {
+      return await Promise.race([
+        (async function () {
+          var response = await fetch(window.location.pathname, {
+            method: 'POST', credentials: 'same-origin', headers: { Accept: 'application/json' }, body: params, signal: controller.signal
+          });
+          var payload, httpError = 'HTTP ' + response.status + (response.statusText ? ': ' + response.statusText : '');
+          try { payload = await response.json(); } catch (_) {
+            throw new Error(response.ok ? 'Сервер вернул некорректный JSON' : httpError);
+          }
+          if (!response.ok) throw new Error(httpError + (payload && payload.error ? ': ' + payload.error : ''));
+          if (!payload || !payload.ok) throw new Error(payload && payload.error || 'Операция отклонена сервером');
+          return payload;
+        }()),
+        new Promise(function (_, reject) {
+          timer = setTimeout(function () { controller.abort(); reject(new Error('Сервер не ответил за 20 секунд')); }, 20000);
+        })
+      ]);
+    } finally { clearTimeout(timer); }
+  }
+  function readProbe(payload, id) {
+    var job = payload.job;
+    if (!job || typeof job.id !== 'string' || !job.id || (id && job.id !== id) ||
+        !['running', 'done', 'failed'].includes(job.state) || !Array.isArray(job.results) ||
+        !Number.isInteger(job.total) || !Number.isInteger(job.done) || job.total < 1 || job.done < 0 || job.done > job.total || job.total > 60 ||
+        job.results.some(function (item) { return !item || typeof item.tag !== 'string' || !Number.isInteger(item.passed) ||
+          item.passed < 0 || item.passed > 2 || item.attempts !== 2 || typeof item.ok !== 'boolean'; })) {
+      throw new Error('Некорректный ответ задания проверки');
+    }
+    return job;
+  }
+  async function pollProbe() {
+    try {
+      probeJob = readProbe(await probeRequest('vpn_profiles_probe_status', { arg: probeJob.id }), probeJob.id);
+      probeError = '';
+    } catch (error) { probeError = error.message; }
+    updateProbe();
+    if (probing()) setTimeout(pollProbe, 1500);
+  }
+  async function startProbe(tags, speed, count) {
+    if (probing() || busy || !tags.length) return;
+    if (speed && !window.confirm('Тест скорости через Cloudflare: до 2 MiB на узел, до ' + tags.length * 2 + ' MiB всего. Продолжить?')) return;
+    probeStarting = true; probeError = ''; probeJob = null;
+    probeNote = count > 60 ? 'Найдено: ' + count + '. Проверяются первые 60 узлов.' : 'Узлов: ' + tags.length;
+    updateProbe();
+    try {
+      probeJob = readProbe(await probeRequest('vpn_profiles_probe_start', {
+        content: JSON.stringify({ tags: tags.slice(0, 60), target: targetId, speed: speed })
+      }));
+    } catch (error) { probeError = error.message; }
+    finally { probeStarting = false; updateProbe(); }
+    if (probing()) setTimeout(pollProbe, 1500);
+  }
   function nextId(prefix, items) {
     var number = 1;
     while (items.some(function (item) { return item.id === prefix + '-' + number; })) number++;
@@ -361,18 +426,137 @@
     field(area, 'Подписка', select([['', 'Все подписки']].concat(data.subscriptions.map(function (item) {
       return [item.id, item.name];
     })), '', function (value) { sourceId = value; page = 0; draw(); }));
+    var tests = el('div', undefined, 'vp-tests'); area.append(tests);
+    tests.append(el('h3', 'HTTPS-тесты'));
+    var targets = snapshot.testTargets || { revision: '', items: defaultTargets };
+    var targetItems = drafts.has('__targets') ? JSON.parse(drafts.get('__targets')) : JSON.parse(JSON.stringify(targets.items));
+    var targetSelect = field(tests, 'Ресурс', select([], '', function (value) { targetId = value; }));
+    function targetOptions() {
+      targetSelect.replaceChildren();
+      targets.items.forEach(function (item) {
+        var option = el('option', item.name); option.value = item.id; targetSelect.append(option);
+      });
+      if (!targets.items.some(function (item) { return item.id === targetId; })) targetId = targets.items[0] ? targets.items[0].id : '';
+      targetSelect.value = targetId;
+    }
+    targetOptions();
+    var targetDetails = el('details', undefined, 'vp-compact vp-targets');
+    targetDetails.append(el('summary', 'Ресурсы')); tests.append(targetDetails);
+    var targetList = el('div'), targetMessage = result(targetDetails), targetSaving = false;
+    targetDetails.append(targetList);
+    function targetChanged() { drafts.set('__targets', JSON.stringify(targetItems)); changed(); }
+    function drawTargets() {
+      targetList.replaceChildren();
+      targetItems.forEach(function (item) {
+        var row = el('div', undefined, 'vp-target-row'); targetList.append(row);
+        row.append(el('code', item.id));
+        field(row, 'Название ресурса', input(item.name, function (value) { item.name = value; targetChanged(); }));
+        var url = field(row, 'HTTPS URL', input(item.url, function (value) { item.url = value; targetChanged(); })); url.type = 'url';
+        var status = field(row, 'HTTP-код', input(item.status, function (value) { item.status = Number(value); targetChanged(); }));
+        status.type = 'number'; status.min = 200; status.max = 299;
+        row.append(button('×', function () {
+          targetItems.splice(targetItems.indexOf(item), 1); targetChanged(); drawTargets();
+        }, 'Удалить ресурс: ' + item.name));
+      });
+    }
+    drawTargets();
+    var targetActions = el('div', undefined, 'vp-actions'); targetDetails.append(targetActions);
+    targetActions.append(button('+', function () {
+      targetItems.push({ id: nextId('target', targetItems), name: '', url: '', status: 204 }); targetChanged(); drawTargets();
+    }, 'Добавить ресурс'));
+    var targetSave = button('Сохранить ресурсы', async function () {
+      if (targetSaving) return;
+      var invalid = !targetItems.length || targetItems.some(function (item) {
+        try {
+          var url = new URL(item.url);
+          return !item.name.trim() || url.protocol !== 'https:' || !!url.username || !!url.password ||
+            !Number.isInteger(item.status) || item.status < 200 || item.status > 299;
+        } catch (_) { return true; }
+      });
+      if (invalid) { fail(targetMessage, 'Укажите название, HTTPS URL без пароля и HTTP-код 200–299. Нужен хотя бы один ресурс.'); return; }
+      targetSaving = true; targetSave.disabled = true; targetList.inert = true; targetActions.inert = true;
+      targetMessage.classList.remove('vp-error'); targetMessage.textContent = 'Сохранение...';
+      var content = JSON.stringify(targetItems);
+      try {
+        var payload = await probeRequest('vpn_profiles_targets_save', { revision: targets.revision, content: content });
+        if (!payload.snapshot || !payload.snapshot.testTargets || !Array.isArray(payload.snapshot.testTargets.items)) {
+          throw new Error('В ответе сервера отсутствуют ресурсы');
+        }
+        snapshot.testTargets = payload.snapshot.testTargets; targets = snapshot.testTargets;
+        if (drafts.get('__targets') === content) drafts.delete('__targets');
+        targetOptions(); targetMessage.textContent = 'Ресурсы сохранены'; updateProbe();
+      } catch (error) { fail(targetMessage, error.message); }
+      finally { targetSaving = false; targetSave.disabled = false; targetList.inert = false; targetActions.inert = false; changed(); }
+    });
+    targetActions.append(targetSave);
+    var targetURLs = el('details', undefined, 'vp-compact');
+    targetURLs.append(el('summary', 'URL проверки')); tests.append(targetURLs);
+    var urls = el('div'); targetURLs.append(urls);
+    var testActions = el('div', undefined, 'vp-actions'); tests.append(testActions);
+    function filteredNodes() {
+      return snapshot.nodes.filter(function (node) {
+        return (!sourceId || node.subscription === sourceId) && [node.title, node.tag, node.type].join(' ').toLocaleLowerCase().includes(query);
+      });
+    }
+    function batch(speed) {
+      var matches = filteredNodes();
+      return startProbe(matches.slice(0, 60).map(function (node) { return node.tag; }), speed, matches.length);
+    }
+    var quick = button('Быстрый тест', function () { return batch(false); });
+    var speed = button('Тест скорости', function () { return batch(true); }); testActions.append(quick, speed);
+    var probeStatus = result(tests), progress = el('progress'), results = el('table', undefined, 'vp-probe-results');
+    progress.setAttribute('aria-label', 'Прогресс HTTPS-теста'); tests.append(progress, results);
+    drawProbe = function () {
+      var matches = filteredNodes(), active = probing();
+      quick.disabled = speed.disabled = active || !matches.length || !targetId;
+      targetSelect.disabled = active;
+      list.querySelectorAll('button').forEach(function (node) { node.disabled = active; });
+      urls.replaceChildren();
+      targets.items.forEach(function (item) { urls.append(el('p', item.name + ' · HTTP ' + item.status), el('code', item.url)); });
+      urls.append(el('p', 'Скорость · Cloudflare · 2 MiB'), el('code', 'https://speed.cloudflare.com/__down?bytes=2097152'));
+      var text = probeStarting ? 'Запуск...' : probeJob ?
+        ({ running: 'Проверка', done: 'Готово', failed: 'Ошибка задания' })[probeJob.state] + ': ' + probeJob.done + '/' + probeJob.total :
+        'Найдено: ' + matches.length + '. К тесту: ' + Math.min(60, matches.length) + ' (максимум 60).';
+      if (probeJob) text += '\n' + probeNote + (probeJob.target ? ' · ' + probeJob.target.name : '');
+      if (probeJob && probeJob.state === 'running' && probeJob.phase === 'speed') {
+        text += '\nЗамер скорости: ' + probeJob.results.filter(function (item) { return item.speed_bytes != null; }).length + '/' +
+          probeJob.results.filter(function (item) { return item.ok; }).length;
+      }
+      probeStatus.textContent = text + (probeError ? '\n' + probeError : '') + (probeJob && probeJob.error ? '\n' + probeJob.error : '');
+      probeStatus.classList.remove('vp-error');
+      if (probeError || probeJob && probeJob.state === 'failed') probeStatus.classList.add('vp-error');
+      progress.hidden = !active; progress.max = probeJob ? probeJob.total || 1 : 1; progress.value = probeJob ? probeJob.done : 0;
+      results.replaceChildren();
+      if (!probeJob || !probeJob.results.length) return;
+      var head = el('thead'), headings = el('tr');
+      ['Узел', 'HTTPS', 'HTTPS, мс', 'Мбит/с'].forEach(function (name) { var cell = el('th', name); cell.scope = 'col'; headings.append(cell); });
+      head.append(headings); results.append(head);
+      var body = el('tbody'); results.append(body);
+      probeJob.results.forEach(function (item) {
+        var row = el('tr'); body.append(row);
+        var values = [
+          (item.title || item.tag) + (item.type ? ' · ' + item.type : ''),
+          (item.ok ? 'Доступен' : item.passed ? 'Нестабильно' : 'Недоступен') +
+            ' · ' + item.passed + '/' + item.attempts + (item.http_code ? ' · HTTP ' + item.http_code : ''),
+          item.latency_ms == null ? '—' : String(item.latency_ms),
+          item.speed_mbps == null ? '—' : String(item.speed_mbps)
+        ];
+        values.forEach(function (value, index) {
+          var cell = el('td', value); cell.setAttribute('data-label', ['Узел', 'HTTPS', 'HTTPS, мс', 'Мбит/с'][index]); row.append(cell);
+          if (index === 1 && item.error) cell.append(el('p', item.error, 'vp-error'));
+          if (index === 3 && item.speed_error) cell.append(el('p', item.speed_error, 'vp-error'));
+        });
+      });
+    };
     var list = el('div'), pages = el('div', undefined, 'vp-actions'); area.append(list, pages);
     function draw() {
       list.replaceChildren();
-      var matches = snapshot.nodes.filter(function (node) {
-        return (!sourceId || node.subscription === sourceId) && [node.title, node.tag, node.type].join(' ').toLocaleLowerCase().includes(query);
-      });
+      var matches = filteredNodes();
       if (!matches.length) list.append(el('p', 'Узлы не найдены'));
       matches.slice(page * 30, (page + 1) * 30).forEach(function (node) {
         var row = el('div', undefined, 'vp-node');
         row.append(el('strong', node.title || node.tag), el('p', node.type + ' · ' + node.subscription), el('code', node.tag));
-        var output = result(row);
-        row.append(button('Проверить узел', function () { request('vpn_profiles_test', node.tag, output); })); list.append(row);
+        row.append(button('Проверить узел', function () { return startProbe([node.tag], false, 1); })); list.append(row);
       });
       pages.replaceChildren();
       if (matches.length > 30) {
@@ -380,11 +564,13 @@
         var next = button('Далее', function () { page++; draw(); }); next.disabled = (page + 1) * 30 >= matches.length;
         pages.append(previous, el('span', (page + 1) + ' / ' + Math.ceil(matches.length / 30)), next);
       }
+      updateProbe();
     }
     draw();
   }
   var save, saveState, notice, panel;
   function render() {
+    drawProbe = null;
     root.replaceChildren();
     var nav = el('nav', undefined, 'vp-nav'); nav.setAttribute('aria-label', 'VPN');
     [['VPN', 'VPN'], ['Profiles', 'Профили'], ['Subscriptions', 'Подписки'], ['Rules', 'Правила'], ['Nodes', 'Узлы']].forEach(function (item) {

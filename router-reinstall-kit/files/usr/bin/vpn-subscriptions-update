@@ -246,14 +246,14 @@ decode_subscription() {
     grep -E '^(vless|hysteria2|hy2)://' "$links" > "$links.nodes"
     return 0
   fi
-  base64 -d "$raw" > "$links.decoded" 2>/dev/null || return 1
+  base64 -d < "$raw" > "$links.decoded" 2>/dev/null || return 1
   tr -d '\r' < "$links.decoded" > "$links"
   grep -E '^(vless|hysteria2|hy2)://' "$links" > "$links.nodes"
 }
 
 query_get() {
   key="$1"
-  printf '%s' "$query" | tr '&' '\n' | sed -n "s/^${key}=//p" | sed -n '1p'
+  url_decode "$(printf '%s' "$query" | tr '&' '\n' | sed -n "s/^${key}=//p" | sed -n '1p')"
 }
 
 json_escape() {

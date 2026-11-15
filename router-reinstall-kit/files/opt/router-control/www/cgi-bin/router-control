@@ -902,6 +902,25 @@ fi
 case "$ACTION" in vpn_profiles_*)
   output_file=$(mktemp /tmp/vpn-profile-result.XXXXXX)
   case "$ACTION" in
+    vpn_profiles_probe_start|vpn_profiles_probe_status)
+      if [ "$ACTION" = vpn_profiles_probe_start ]; then
+        printf '%s' "$CONTENT" | /usr/bin/vpn-node-tests start > "$output_file" 2> "$output_file.error"
+      else
+        /usr/bin/vpn-node-tests status "$ARG" > "$output_file" 2> "$output_file.error"
+      fi
+      result_code=$?
+      printf 'Content-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\n\r\n'
+      if [ "$result_code" = 0 ] && jq -e '.id and .state and (.results|type=="array")' "$output_file" >/dev/null 2>&1; then
+        jq -n --slurpfile job "$output_file" '{ok:true,job:$job[0]}'
+      else
+        [ -s "$output_file.error" ] || echo 'Не удалось запустить или прочитать тест узлов' > "$output_file.error"
+        jq -n --rawfile error "$output_file.error" '{ok:false,error:$error}'
+      fi
+      rm -f "$output_file" "$output_file.error"
+      exit 0
+      ;;
+  esac
+  case "$ACTION" in
     vpn_profiles_snapshot) : > "$output_file" ;;
     vpn_profiles_node_import)
       printf '%s\n' "$CONTENT" | /usr/bin/vpn-profiles node-import "$ARG" "$(url_decode "$(field revision)")" > "$output_file" 2>&1 ;;
@@ -910,6 +929,8 @@ case "$ACTION" in vpn_profiles_*)
     vpn_profiles_node) /usr/bin/vpn-profiles node "$ARG" > "$output_file" 2>&1 ;;
     vpn_profiles_update) /usr/bin/vpn-profiles queue-update "$ARG" > "$output_file" 2>&1 ;;
     vpn_profiles_test) /usr/bin/vpn-profiles test "$ARG" > "$output_file" 2>&1 ;;
+    vpn_profiles_targets_save)
+      printf '%s' "$CONTENT" | /usr/bin/vpn-node-tests targets-save "$(url_decode "$(field revision)")" > "$output_file" 2>&1 ;;
     vpn_profiles_rule_save)
       printf '%s' "$CONTENT" | /usr/bin/vpn-profiles rule-save "$ARG" "$(url_decode "$(field revision)")" > "$output_file" 2>&1 ;;
     vpn_profiles_rule_delete)

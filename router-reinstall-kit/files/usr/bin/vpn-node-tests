@@ -1,0 +1,193 @@
+#!/bin/sh
+set -eu
+umask 077
+BASE="${VPN_DATA_ROOT:-/etc/sing-box}"
+ROOT="${VPN_TEST_ROOT:-/tmp/vpn-node-tests}"
+TARGETS="$BASE/profiles/test-targets.json"
+mkdir -p "$ROOT" "$BASE/profiles"
+fail() { echo "$*" >&2; exit 1; }
+valid_id() { printf '%s' "$1" | grep -Eq '^[a-zA-Z0-9_-]{1,80}$'; }
+defaults() {
+  printf '%s\n' '[{"id":"google","name":"Google","url":"https://www.google.com/generate_204","status":204},{"id":"youtube","name":"YouTube","url":"https://www.youtube.com/generate_204","status":204},{"id":"cloudflare","name":"Cloudflare","url":"https://cp.cloudflare.com/generate_204","status":204}]'
+}
+target_file() {
+  if [ -f "$TARGETS" ]; then
+    echo "$TARGETS"
+  else
+    defaults > "$ROOT/default-targets.json.new.$$"; mv "$ROOT/default-targets.json.new.$$" "$ROOT/default-targets.json"
+    echo "$ROOT/default-targets.json"
+  fi
+}
+targets() {
+  file=$(target_file)
+  jq -n --arg revision "$(sha256sum "$file" | cut -d' ' -f1)" --slurpfile items "$file" '{revision:$revision,items:$items[0]}'
+}
+publish() {
+  state="$1"
+  jq -s '.' "$JOB/"result-*.json > "$JOB/results.new"
+  jq --arg state "$state" --slurpfile results "$JOB/results.new" \
+    '.state=$state | .results=($results[0]|sort_by(.index)) | .done=(.results|length)' "$JOB/job.json" > "$JOB/job.new"
+  mv "$JOB/job.new" "$JOB/job.json"
+}
+probe_one() (
+  trap - EXIT HUP INT TERM
+  index="$1"; port=$((21080 + index)); passed=0; sum=0; code=0
+  : > "$JOB/error-$index"
+  for attempt in 1 2; do
+    rc=0
+    metrics=$(curl -q -4 -sS --proto '=https' --max-time 6 --connect-timeout 3 --max-filesize 262144 \
+      --noproxy '' --proxy "socks5h://127.0.0.1:$port" -o /dev/null -w '%{http_code} %{time_total}' "$url" \
+      2> "$JOB/error-$index") || rc=$?
+    code=${metrics%% *}; seconds=${metrics#* }
+    if [ "$rc" = 0 ] && [ "$code" = "$expected" ]; then
+      passed=$((passed+1)); sum=$(awk -v a="$sum" -v b="$seconds" 'BEGIN {print a+b}')
+    else
+      [ -s "$JOB/error-$index" ] || printf 'HTTP %s; expected %s\n' "$code" "$expected" > "$JOB/error-$index"
+      cp "$JOB/error-$index" "$JOB/last-error-$index"
+    fi
+  done
+  [ -f "$JOB/last-error-$index" ] || : > "$JOB/last-error-$index"
+  jq --argjson index "$index" --argjson passed "$passed" --arg code "$code" --arg sum "$sum" \
+    --rawfile error "$JOB/last-error-$index" \
+    '.[$index] | {index:$index,tag,title,type,passed:$passed,attempts:2,ok:($passed==2),http_code:($code|tonumber),
+      latency_ms:(if $passed>0 then (($sum|tonumber)*1000/$passed|round) else null end),error:$error,speed_mbps:null}' \
+    "$JOB/metadata.json" > "$JOB/result-$index.new"
+  mv "$JOB/result-$index.new" "$JOB/result-$index.json"
+)
+speed_one() {
+  index="$1"; port=$((21080 + index)); rc=0
+  metrics=$(curl -q -4 -sS --proto '=https' --max-time 6 --connect-timeout 3 --max-filesize 2097152 \
+    --noproxy '' --proxy "socks5h://127.0.0.1:$port" -o /dev/null -w '%{http_code} %{size_download} %{time_total}' \
+    'https://speed.cloudflare.com/__down?bytes=2097152' 2> "$JOB/speed-error") || rc=$?
+  set -- $metrics
+  code=${1:-0}; bytes=${2:-0}; elapsed=${3:-0}
+  if [ "$rc" = 0 ] && [ "$code" = 200 ] && [ "$bytes" = 2097152 ]; then
+    jq --arg seconds "$elapsed" '.speed_bytes=2097152 | .speed_mbps=(16.777216/($seconds|tonumber)*100|round/100)' \
+      "$JOB/result-$index.json" > "$JOB/result-$index.new"
+  else
+    [ -s "$JOB/speed-error" ] || printf 'HTTP %s; downloaded %s of 2097152 bytes\n' "$code" "$bytes" > "$JOB/speed-error"
+    jq --rawfile error "$JOB/speed-error" --arg bytes "$bytes" \
+      '.speed_error=$error | .speed_bytes=($bytes|tonumber)' "$JOB/result-$index.json" > "$JOB/result-$index.new"
+  fi
+  mv "$JOB/result-$index.new" "$JOB/result-$index.json"
+}
+worker() {
+  [ "${VPN_TEST_WORKER:-}" = 1 ] || fail 'Internal worker'
+  JOB="$ROOT/$1"; probe_pid=''; children=''
+  cleanup() {
+    trap - EXIT HUP INT TERM
+    [ -z "$children" ] || kill $children 2>/dev/null || true
+    [ -z "$probe_pid" ] || { kill "$probe_pid" 2>/dev/null || true; wait "$probe_pid" 2>/dev/null || true; }
+    if [ "$(jq -r .state "$JOB/job.json")" = running ]; then
+      tail -c 1000 "$JOB/probe.log" "$JOB/worker.log" > "$JOB/last-error" 2>/dev/null || true
+      jq --rawfile details "$JOB/last-error" \
+        '.state="failed" | .error=("Тест прерван; рабочее подключение не изменено. " + $details)' "$JOB/job.json" > "$JOB/job.new"
+      mv "$JOB/job.new" "$JOB/job.json"
+    fi
+    rm -f "$JOB/probe.json" "$JOB/nodes.json"
+  }
+  trap cleanup EXIT HUP INT TERM
+  sing-box check -c "$JOB/probe.json" > "$JOB/probe.log" 2>&1 || fail 'Invalid test configuration'
+  sing-box run -c "$JOB/probe.json" >> "$JOB/probe.log" 2>&1 &
+  probe_pid=$!
+  sleep 1
+  kill -0 "$probe_pid" 2>/dev/null || fail 'Test listener failed to start'
+  url=$(jq -r .target.url "$JOB/job.json"); expected=$(jq -r .target.status "$JOB/job.json")
+  count=$(jq -r .total "$JOB/job.json"); index=0
+  while [ "$index" -lt "$count" ]; do
+    children=''; n=0
+    while [ "$n" -lt 4 ] && [ "$index" -lt "$count" ]; do
+      probe_one "$index" & children="$children $!"
+      index=$((index+1)); n=$((n+1))
+    done
+    for child in $children; do wait "$child"; done
+    children=''; publish running
+  done
+  if [ "$(jq -r .speed "$JOB/job.json")" = true ]; then
+    jq '.phase="speed"' "$JOB/job.json" > "$JOB/job.new"; mv "$JOB/job.new" "$JOB/job.json"
+    index=0
+    while [ "$index" -lt "$count" ]; do
+      if jq -e .ok "$JOB/result-$index.json" >/dev/null; then speed_one "$index"; publish running; fi
+      index=$((index+1))
+    done
+  fi
+  publish done
+  jq --argjson finished "$(date +%s)" '.finished_at=$finished' "$JOB/job.json" > "$JOB/job.new"
+  mv "$JOB/job.new" "$JOB/job.json"
+}
+case "${1:-targets}" in
+  targets) targets ;;
+  targets-save)
+    exec 9> "$ROOT/targets.lock"; flock -n 9 || fail 'Resource settings are busy'
+    file=$(target_file)
+    [ "${2:-}" = "$(sha256sum "$file" | cut -d' ' -f1)" ] || fail 'Resources changed; reload before saving'
+    tmp=$(mktemp "$ROOT/targets.XXXXXX"); trap 'rm -f "$tmp"' EXIT HUP INT TERM
+    head -c 65537 > "$tmp"; [ "$(wc -c < "$tmp")" -le 65536 ] || fail 'Resource settings too large'
+    jq -e -s 'length==1 and (.[0]|type=="array" and length>0 and length<=20 and
+      (map(.id)|unique|length)==length and all(.[]; type=="object" and
+      (.id|type=="string" and length>0 and length<=40) and (.name|type=="string" and length>0 and length<=100) and
+      (.url|type=="string" and length<=2048 and (explode|all(.>=33 and .<=126))) and
+      (.id|explode|all(.>=33 and .<=126)) and (.status|type=="number" and .>=200 and .<=299 and floor==.)))' "$tmp" >/dev/null \
+      || fail 'Invalid resources: unique IDs, names, HTTPS URL and expected HTTP 200–299 required'
+    jq -r '.[].id' "$tmp" | while IFS= read -r id; do valid_id "$id" || fail 'Invalid resource ID'; done
+    jq -r '.[].url' "$tmp" | while IFS= read -r url; do
+      printf '%s' "$url" | grep -Eq '^https://[a-zA-Z0-9][a-zA-Z0-9.-]*(:[0-9]+)?(/[^[:space:]"\\]*)?$' \
+        || fail 'Use a public HTTPS URL without credentials, fragment or spaces'
+      case "$url" in *'#'*|*'@'*) fail 'Invalid resource URL' ;; esac
+    done
+    cp "$tmp" "$TARGETS.new"; mv "$TARGETS.new" "$TARGETS"; targets
+    ;;
+  start)
+    exec 9> "$ROOT/run.lock"; flock -n 9 || fail 'A node test is already running'
+    id="$(date +%s)-$$"; JOB="$ROOT/$id"; mkdir "$JOB"
+    trap 'rm -rf "$JOB"' EXIT HUP INT TERM
+    head -c 65537 > "$JOB/request.json"
+    [ "$(wc -c < "$JOB/request.json")" -le 65536 ] || fail 'Test request too large'
+    jq -e -s 'length==1 and (.[0]|type=="object" and (.tags|type=="array" and length>0 and length<=60 and
+      (unique|length)==length and all(.[];type=="string")) and (.target|type=="string") and (.speed|type=="boolean"))' \
+      "$JOB/request.json" >/dev/null || fail 'Select 1–60 unique nodes'
+    target=$(jq -r .target "$JOB/request.json")
+    jq --arg id "$target" '.[]|select(.id==$id)' "$(target_file)" > "$JOB/target.json"
+    [ -s "$JOB/target.json" ] || fail 'Unknown test resource'
+    : > "$JOB/all.nodes"; : > "$JOB/all.titles"
+    for file in "$BASE/profiles/cache/"*.nodes; do
+      [ -s "$file" ] || continue
+      cat "$file" >> "$JOB/all.nodes"
+      [ ! -f "${file%.nodes}.titles" ] || cat "${file%.nodes}.titles" >> "$JOB/all.titles"
+    done
+    { printf '[\n'; sed '$s/,[[:space:]]*$//' "$JOB/all.nodes"; printf '\n]\n'; } > "$JOB/all.json"
+    jq --slurpfile request "$JOB/request.json" '. as $all | [$request[0].tags[] as $tag | $all[]|select(.tag==$tag)]' \
+      "$JOB/all.json" > "$JOB/nodes.json"
+    [ "$(jq length "$JOB/nodes.json")" = "$(jq '.tags|length' "$JOB/request.json")" ] || fail 'Node cache changed; refresh the node list'
+    jq -e 'all(.[]; .type!="direct" and .type!="block" and .type!="selector" and .type!="urltest")' "$JOB/nodes.json" >/dev/null \
+      || fail 'Only concrete proxy nodes can be tested'
+    jq -Rn '[inputs|split("\t")|{key:.[0],value:(.[1:]|join("\t"))}]|from_entries' < "$JOB/all.titles" > "$JOB/titles.json"
+    jq --slurpfile titles "$JOB/titles.json" '[.[]|{tag,type,title:($titles[0][.tag]//.tag)}]' "$JOB/nodes.json" > "$JOB/metadata.json"
+    jq '{log:{level:"error"},dns:{servers:[{type:"udp",tag:"dns-direct",server:"77.88.8.8",routing_mark:32768}]},
+      inbounds:[to_entries[]|{type:"mixed",tag:("probe-"+(.key|tostring)),listen:"127.0.0.1",listen_port:(21080+.key)}],
+      outbounds:map(.routing_mark=32768),route:{auto_detect_interface:true,default_domain_resolver:"dns-direct",final:.[0].tag,
+      rules:[to_entries[]|{inbound:["probe-"+(.key|tostring)],action:"route",outbound:.value.tag}]}}' "$JOB/nodes.json" > "$JOB/probe.json"
+    jq -n --arg id "$id" --slurpfile request "$JOB/request.json" --slurpfile target "$JOB/target.json" \
+      --argjson started "$(date +%s)" \
+      '{id:$id,state:"running",phase:"https",started_at:$started,target:$target[0],speed:$request[0].speed,total:($request[0].tags|length),done:0,results:[]}' > "$JOB/job.json"
+    rm -f "$JOB/all.nodes" "$JOB/all.json" "$JOB/all.titles" "$JOB/titles.json"
+    # The child inherits the lock; all descriptors returned to CGI are closed before background work.
+    (trap '' HUP; VPN_TEST_WORKER=1 "$0" _worker "$id") </dev/null >"$JOB/worker.log" 2>&1 &
+    trap - EXIT HUP INT TERM
+    cat "$JOB/job.json"
+    ;;
+  status)
+    valid_id "${2:-}" || fail 'Invalid test ID'
+    [ -f "$ROOT/$2/job.json" ] || fail 'Test results expired; start another test'
+    if [ "$(jq -r .state "$ROOT/$2/job.json")" = running ]; then
+      exec 9> "$ROOT/run.lock"
+      if flock -n 9; then
+        jq '.state="failed" | .error="Проверка остановилась; повторите тест"' "$ROOT/$2/job.json"
+        exit 0
+      fi
+    fi
+    cat "$ROOT/$2/job.json"
+    ;;
+  _worker) valid_id "${2:-}" || fail 'Invalid test ID'; worker "$2" ;;
+  *) fail 'Usage: vpn-node-tests targets|targets-save REV|start|status ID' ;;
+esac

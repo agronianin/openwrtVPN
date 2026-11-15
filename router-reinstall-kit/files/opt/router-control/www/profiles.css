@@ -38,7 +38,21 @@
 #vpn-app .vp-compact > summary { cursor: pointer; min-height: 48px; padding: 12px 0; overflow-wrap: anywhere; }
 #vpn-app .vp-compact > summary:focus-visible { outline: 3px solid #1777b9; outline-offset: 2px; }
 #vpn-app code { display: block; overflow-wrap: anywhere; font-size: 13px; }
+#vpn-app .vp-tests { border-block: 1px solid #c7d3dd; padding: 12px 0; }
+#vpn-app .vp-tests h3 { font-size: 16px; margin: 0; }
+#vpn-app .vp-tests progress { width: 100%; accent-color: #147a52; }
+#vpn-app .vp-target-row { border-bottom: 1px solid #e1e6ea; padding: 8px 0; }
+#vpn-app .vp-target-row label { font-size: 13px; margin: 4px 0; }
+#vpn-app .vp-probe-results { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 13px; }
+#vpn-app .vp-probe-results :is(th, td) { text-align: left; padding: 8px; border-bottom: 1px solid #c7d3dd; overflow-wrap: anywhere; }
+#vpn-app .vp-probe-results th:first-child { width: 36%; }
 @media (max-width: 480px) {
+  #vpn-app .vp-probe-results :is(table, tbody, tr, td) { display: block; }
+  #vpn-app .vp-probe-results thead { display: none; }
+  #vpn-app .vp-probe-results tr { border-bottom: 1px solid #c7d3dd; padding: 8px 0; }
+  #vpn-app .vp-probe-results td { display: grid; grid-template-columns: 80px minmax(0, 1fr); gap: 8px; border: 0; padding: 3px 0; }
+  #vpn-app .vp-probe-results td::before { content: attr(data-label); color: #52616d; }
+  #vpn-app .vp-probe-results td p { grid-column: 2; margin: 0; }
   #vpn-app .vp-nav { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
   #vpn-app input:not([type=checkbox]), #vpn-app select, #vpn-app textarea { font-size: 16px; }
   #vpn-app .vp-save { align-items: stretch; flex-direction: column; }

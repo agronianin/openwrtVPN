@@ -7,11 +7,18 @@ UPDATE_INTERVAL_HOURS=6
 
 [ -f "$SETTINGS_FILE" ] && . "$SETTINGS_FILE"
 
+save_attempt() {
+  mkdir -p "$(dirname "$STATE_FILE")"
+  printf '%s\n' "$1" > "$STATE_FILE.new.$$"
+  mv "$STATE_FILE.new.$$" "$STATE_FILE"
+}
+
 if [ -s /etc/sing-box/profiles/update-request ] && /etc/init.d/sing-box status >/dev/null 2>&1; then
   requested=$(cat /etc/sing-box/profiles/update-request)
-  /usr/bin/vpn-profiles update-queued
-  [ "$requested" != all ] || date +%s > "$STATE_FILE"
-  exit 0
+  rc=0
+  /usr/bin/vpn-profiles update-queued || rc=$?
+  if [ "$requested" = all ] && [ "$rc" != 75 ]; then save_attempt "$(date +%s)"; fi
+  exit "$rc"
 fi
 
 case "$UPDATE_INTERVAL_HOURS" in
@@ -44,9 +51,11 @@ updater=/usr/bin/vpn-subscriptions-update
 [ ! -f /etc/sing-box/profiles/catalog.json ] || updater=/usr/bin/vpn-profiles
 action=refresh
 [ "$updater" != /usr/bin/vpn-profiles ] || action=update
-if "$updater" "$action"; then
-  mkdir -p "$(dirname "$STATE_FILE")"
-  printf '%s\n' "$now" > "$STATE_FILE"
+rc=0
+"$updater" "$action" || rc=$?
+# A partial failure must not turn the configured hourly schedule into a once-per-minute retry loop.
+[ "$rc" = 75 ] || save_attempt "$(date +%s)"
+if [ "$rc" = 0 ]; then
   logger -t vpn-auto-update "subscription cache refresh completed without applying config"
 else
   logger -t vpn-auto-update "subscription cache refresh failed"

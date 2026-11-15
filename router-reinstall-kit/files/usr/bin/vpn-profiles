@@ -20,7 +20,7 @@ readonly=0
 [ "${1:-snapshot}" != snapshot ] || [ ! -f "$DB" ] || readonly=1
 if [ "${VPN_PROFILES_LOCKED:-0}" != 1 ] && [ "$readonly" != 1 ]; then
   lock=/tmp/vpn-subscriptions.lock
-  case "${1:-}" in update|update-queued) lock=/tmp/vpn-profiles-update.lock ;; esac
+  case "${1:-}" in update|update-queued|import-cache) lock=/tmp/vpn-profiles-update.lock ;; esac
   exec flock -n -E 75 "$lock" env VPN_PROFILES_LOCKED=1 "$0" "$@"
 fi
 
@@ -183,6 +183,8 @@ snapshot() (
   managed=false; [ ! -s "$MANAGED" ] || managed=true
   echo null > "$TMP/effective.json"
   echo null > "$TMP/job.json"
+  echo '{"revision":"","items":[]}' > "$TMP/test-targets.json"
+  if [ -x /usr/bin/vpn-node-tests ]; then /usr/bin/vpn-node-tests targets > "$TMP/test-targets.json"; fi
   [ ! -f "$BASE/profiles/update-job.json" ] || cp "$BASE/profiles/update-job.json" "$TMP/job.json"
   if running && curl -fsS --max-time 2 http://127.0.0.1:9090/proxies > "$TMP/api.json"; then
     jq 'def follow($tag;$n): if $n>12 then null else .proxies[$tag].now as $next
@@ -198,8 +200,9 @@ snapshot() (
     --slurpfile nodes "$TMP/nodes.json" --slurpfile rules "$TMP/rules.json" --argjson managed "$managed" \
     --slurpfile effective "$TMP/effective.json" \
     --slurpfile job "$TMP/job.json" \
+    --slurpfile targets "$TMP/test-targets.json" \
     '{revision:$revision,data:$data[0],active:(if $active=="" then null else $active end),running:$running,managed:$managed,
-      effective:$effective[0],updateJob:$job[0],nodes:$nodes[0],rules:$rules[0]}'
+      effective:$effective[0],updateJob:$job[0],testTargets:$targets[0],nodes:$nodes[0],rules:$rules[0]}'
 )
 
 refresh_sources() {
@@ -214,6 +217,15 @@ refresh_sources() {
   [ "$failed" = 0 ] || { echo "Failed subscriptions: $failed; other caches updated; previous caches retained" >&2; return 1; }
 }
 
+publish_cache() {
+  for ext in tags titles preferred count name url updated nodes; do
+    [ ! -f "$STORE/$id.$ext" ] || cp "$STORE/$id.$ext" "$destination/$id.$ext.new" || return 1
+  done
+  for ext in tags titles preferred count name url updated nodes; do
+    [ ! -f "$destination/$id.$ext.new" ] || mv "$destination/$id.$ext.new" "$destination/$id.$ext" || return 1
+  done
+}
+
 refresh_source() (
   id="$1"
   jq -e --arg id "$id" 'any(.subscriptions[]; .id==$id)' "$DB" >/dev/null || error 'Unknown subscription'
@@ -226,12 +238,7 @@ refresh_source() (
   set -f
   refresh_group "$id" "$name" $urls || exit 1
   stable_cache "$id" || exit 1
-  for ext in tags titles preferred count name url updated nodes; do
-    [ ! -f "$STORE/$id.$ext" ] || cp "$STORE/$id.$ext" "$destination/$id.$ext.new" || exit 1
-  done
-  for ext in tags titles preferred count name url updated nodes; do
-    [ ! -f "$destination/$id.$ext.new" ] || mv "$destination/$id.$ext.new" "$destination/$id.$ext" || exit 1
-  done
+  publish_cache
 )
 
 test_node() (
@@ -242,7 +249,7 @@ test_node() (
     [ ! -s "$TMP/probe-node.json" ] || break
   done
   [ -s "$TMP/probe-node.json" ] || error 'Node not found in subscription cache'
-  port=$((30000 + $$ % 20000))
+  port=$((18000 + $$ % 10000))
   jq -n --slurpfile node "$TMP/probe-node.json" --argjson port "$port" \
     '{log:{level:"error"},dns:{servers:[{type:"udp",tag:"dns-direct",server:"77.88.8.8"}]},
       inbounds:[{type:"mixed",listen:"127.0.0.1",listen_port:$port}],outbounds:$node,
@@ -408,6 +415,24 @@ case "${1:-snapshot}" in
   update)
     refresh_sources "${2:-all}"
     ;;
+  import-cache)
+    id="${2:-}"; valid_id "$id" || error 'Invalid subscription ID'
+    jq -e --arg id "$id" 'any(.subscriptions[];.id==$id)' "$DB" >/dev/null || error 'Unknown subscription'
+    file="${3:-}"; [ -f "$file" ] || error 'Subscription file not found'
+    [ "$(wc -c < "$file")" -le 16777216 ] || error 'Subscription file exceeds 16 MiB'
+    decode_subscription "$file" "$TMP/import" || error 'Unsupported subscription format'
+    parse_group "$id" "$TMP/import.nodes"
+    [ "$parsed_count" -gt 0 ] || error 'No supported nodes; previous cache retained'
+    destination="$STORE"; STORE="$TMP/cache"; mkdir -p "$STORE"
+    for ext in tags nodes titles preferred; do cp "$WORKDIR/$id.$ext" "$STORE/$id.$ext"; done
+    echo "$parsed_count" > "$STORE/$id.count"
+    jq -r --arg id "$id" '.subscriptions[]|select(.id==$id)|.name' "$DB" > "$STORE/$id.name"
+    jq -r --arg id "$id" '.subscriptions[]|select(.id==$id)|.urls[0]' "$DB" > "$STORE/$id.url"
+    date '+%Y-%m-%d %H:%M:%S %z' > "$STORE/$id.updated"
+    stable_cache "$id"
+    publish_cache
+    echo "Imported $parsed_count nodes into $id; active connection unchanged"
+    ;;
   queue-update)
     running || error 'VPN is off; downloads are disabled'
     id="${2:-all}"
@@ -486,5 +511,5 @@ case "${1:-snapshot}" in
       '.subscriptions += [{id:$id,name:$name,urls:[$url]}]' "$DB" > "$DB.new"
     cp "$DB" "$DB.previous"; mv "$DB.new" "$DB"
     ;;
-  *) error 'Usage: vpn-profiles snapshot|save REV|activate ID|off|update ID|all|node TAG|auto|test [TAG]|rule-save ID|rule-delete ID' ;;
+  *) error 'Usage: vpn-profiles snapshot|save REV|activate ID|off|update ID|all|import-cache ID FILE|node TAG|auto|test [TAG]|rule-save ID|rule-delete ID' ;;
 esac

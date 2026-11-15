@@ -29,9 +29,13 @@ class Element {
   }
 }
 const settle = () => new Promise(resolve => setImmediate(resolve));
-let root, context, requests, confirmAnswer, replies, unload;
+let root, context, requests, confirmAnswer, replies, unload, timers;
 const initial = {
   revision: 'revision-1', active: 'work', running: true,
+  testTargets: { revision: 'targets-1', items: [
+    { id: 'google', name: 'Google', url: 'https://www.google.com/generate_204', status: 204 },
+    { id: 'youtube', name: 'YouTube', url: 'https://www.youtube.com/generate_204', status: 204 }
+  ] },
   data: {
     version: 1,
     subscriptions: [{ id: 'first', name: 'First', urls: ['https://a.example', 'https://b.example'] },
@@ -47,18 +51,24 @@ const initial = {
     { id: '20-direct', name: 'Direct', content: 'direct content', revision: 'sha-direct' }]
 };
 function boot(snapshot = initial) {
-  root = new Element('main'); requests = []; replies = []; confirmAnswer = true;
+  root = new Element('main'); requests = []; replies = []; confirmAnswer = true; timers = new Map();
   const seed = new Element('script'); seed.textContent = JSON.stringify(snapshot);
   context = {
     document: { getElementById: id => id === 'vpn-app' ? root : seed, createElement: tag => new Element(tag) },
     window: { location: { pathname: '/cgi-bin/router-control' }, confirm: () => confirmAnswer,
       addEventListener: (name, callback) => { if (name === 'beforeunload') unload = callback; } },
-    URLSearchParams,
+    URLSearchParams, URL, AbortController,
+    setTimeout: (callback, delay) => { const id = {}; timers.set(id, { callback, delay }); return id; },
+    clearTimeout: id => timers.delete(id),
     fetch: async (url, options) => {
       requests.push({ url, options, fields: Object.fromEntries(options.body) });
       const reply = replies.shift() || { ok: true, snapshot: initial };
       if (reply instanceof Error) throw reply;
-      return { ok: reply.http === undefined, status: reply.http, statusText: 'Failure', json: async () => reply };
+      if (reply.hang) return new Promise(() => {});
+      return { ok: reply.http === undefined, status: reply.http, statusText: 'Failure', json: async () => {
+        if (reply.jsonError) throw new Error('Invalid JSON');
+        return reply;
+      } };
     }
   };
   vm.runInNewContext(source, context);
@@ -126,9 +136,10 @@ async function testConnectionAndSearch() {
   assert.equal(requests.at(-1).fields.action, 'vpn_profiles_activate'); assert.equal(requests.at(-1).fields.arg, 'off');
   await click('Узлы'); await edit(nodeSearch(), 'Node B');
   assert.equal(buttons().filter(node => node.textContent === 'Проверить узел').length, 1);
-  replies.push({ ok: true, snapshot: initial, output: '<script>unsafe</script>' }); await click('Проверить узел');
-  assert.equal(requests.at(-1).fields.action, 'vpn_profiles_test'); assert.equal(requests.at(-1).fields.arg, 'b');
-  assert.ok(root.textContent.includes('<script>unsafe</script>')); assert.equal(root.querySelectorAll('script').length, 0);
+  replies.push({ ok: true, job: { ...probeJob('done', 1), total: 1 } }); await click('Проверить узел');
+  assert.equal(requests.at(-1).fields.action, 'vpn_profiles_probe_start');
+  assert.deepEqual(postedData(), { tags: ['b'], target: 'google', speed: false });
+  assert.equal(root.querySelectorAll('script').length, 0);
   await click('Узлы'); await edit(root.querySelectorAll('select')[0], 'second', 'change');
   assert.equal(buttons().filter(node => node.textContent === 'Проверить узел').length, 1);
 }
@@ -280,10 +291,106 @@ async function testReadableOutput() {
   assert.ok(root.textContent.includes('Connection refused'));
 }
 
+// Ответы заданий и виртуальное время позволяют проверить polling без реальной сети и ожидания.
+function probeJob(state = 'running', done = 0, results = []) {
+  return { id: 'job-1', state, total: 60, done, target: initial.testTargets.items[0], speed: false, results };
+}
+// Один шаг запускает только нужный таймер, чтобы таймаут запроса не подменял polling.
+async function tick(delay = 1500) {
+  const entry = [...timers].find(([, timer]) => timer.delay === delay);
+  assert.ok(entry, 'Missing timer: ' + delay); timers.delete(entry[0]); await entry[1].callback(); await settle();
+}
+
+// Массовый тест берет первые 60 совпадений поиска И подписки со всех страниц, а не первые 30 видимых строк.
+async function testFilteredProbeAndProgress() {
+  const large = JSON.parse(JSON.stringify(initial));
+  large.nodes = Array.from({ length: 140 }, (_, index) => ({
+    tag: 'tag-' + index, title: 'Match ' + index, subscription: index % 2 ? 'second' : 'first', type: 'vless'
+  }));
+  boot(large); await click('Узлы');
+  await edit(root.querySelectorAll('textarea')[0], 'vless://draft@host:443');
+  await edit(nodeSearch(), 'Match'); await edit(root.querySelectorAll('select')[0], 'second', 'change');
+  await click('Далее');
+  const nav = root.querySelectorAll('nav')[0], search = nodeSearch(), uri = root.querySelectorAll('textarea')[0];
+  const targetSelect = root.querySelectorAll('select')[1]; await edit(targetSelect, 'youtube', 'change');
+  replies.push({ ok: true, job: probeJob() }); await click('Быстрый тест');
+  assert.equal(requests.at(-1).fields.action, 'vpn_profiles_probe_start');
+  assert.deepEqual(postedData(), { tags: Array.from({ length: 60 }, (_, i) => 'tag-' + (i * 2 + 1)), target: 'youtube', speed: false });
+  assert.ok(root.textContent.includes('Найдено: 70. Проверяются первые 60'));
+  assert.equal(named('Быстрый тест').disabled, true); assert.equal(named('Тест скорости').disabled, true);
+  assert.ok(buttons().filter(node => node.textContent === 'Проверить узел').every(node => node.disabled));
+  await named('Быстрый тест').fire('click'); assert.equal(requests.length, 1);
+  const result = { tag: 'tag-1', title: '<img src=x>', type: 'vless', passed: 1, attempts: 2, ok: false,
+    http_code: 503, latency_ms: 0, error: 'TLS failed', speed_mbps: null, speed_error: 'No download' };
+  replies.push({ ok: true, job: probeJob('running', 1, [result]) }); await tick();
+  assert.equal(requests.at(-1).fields.arg, 'job-1'); assert.equal(requests.at(-1).fields.action, 'vpn_profiles_probe_status');
+  assert.ok(root.textContent.includes('1/60')); assert.equal(root.querySelectorAll('progress')[0].value, 1);
+  assert.ok(root.textContent.includes('TLS failed')); assert.ok(root.textContent.includes('No download'));
+  assert.equal(root.querySelectorAll('img').length, 0);
+  assert.equal(root.querySelectorAll('nav')[0], nav); assert.equal(nodeSearch(), search);
+  assert.equal(uri.value, 'vless://draft@host:443'); assert.equal(targetSelect.value, 'youtube');
+  replies.push({ ok: true, job: probeJob('done', 60, [result]) }); await tick();
+  assert.ok(root.textContent.includes('Готово: 60/60')); assert.equal(named('Быстрый тест').disabled, false);
+  assert.equal(timers.size, 0);
+  assert.ok(requests.every(request => !['vpn_profiles_activate', 'vpn_profiles_node', 'vpn_profiles_snapshot'].includes(request.fields.action)));
+}
+
+// HTTP, JSON, сеть и неверное задание не блокируют старт; ошибка polling повторяется через 1500 мс и сохраняет результаты.
+async function testProbeErrorsAndSpeed() {
+  for (const reply of [
+    { http: 502, error: 'Unavailable' }, { jsonError: true }, new Error('Offline'), { ok: true },
+    { ok: true, job: probeJob('running', 0, [null]) }
+  ]) {
+    boot(); await click('Узлы'); replies.push(reply); await click('Быстрый тест');
+    assert.equal(named('Быстрый тест').disabled, false); assert.equal(timers.size, 0);
+    assert.ok(root.textContent.includes(reply.http ? 'HTTP 502' : reply.jsonError ? 'JSON' : reply.message || 'Некорректный ответ'));
+  }
+  boot(); await click('Узлы'); replies.push({ hang: true });
+  const pending = named('Быстрый тест').fire('click'); await settle(); await tick(20000); await pending;
+  assert.ok(root.textContent.includes('20 секунд')); assert.equal(named('Быстрый тест').disabled, false);
+  boot(); await click('Узлы'); confirmAnswer = false; await click('Тест скорости'); assert.equal(requests.length, 0);
+  confirmAnswer = true; replies.push({ ok: true, job: probeJob() }); await click('Тест скорости');
+  assert.equal(postedData().speed, true);
+  for (const reply of [{ http: 503 }, { jsonError: true }, new Error('Disconnected'), { ok: true, job: { id: 'other' } }]) {
+    replies.push(reply); await tick(); assert.equal(named('Тест скорости').disabled, true);
+    assert.ok(root.textContent.includes('0/60')); assert.equal([...timers.values()][0].delay, 1500);
+  }
+  await click('Правила'); await edit(editor('05-proxy').querySelectorAll('textarea')[0], 'keep draft');
+  const textarea = editor('05-proxy').querySelectorAll('textarea')[0];
+  replies.push({ ok: true, job: { ...probeJob('failed', 1), error: 'Worker stopped' } }); await tick();
+  assert.equal(editor('05-proxy').querySelectorAll('textarea')[0], textarea); assert.equal(textarea.value, 'keep draft');
+  await click('Узлы'); assert.ok(root.textContent.includes('Worker stopped')); assert.equal(named('Тест скорости').disabled, false);
+  assert.equal(timers.size, 0);
+}
+
+// CRUD ресурсов передает CAS-ревизию, валидирует HTTPS, сохраняет ошибки и не уничтожает черновики каталога/импорта.
+async function testTargetEditing() {
+  boot(); await click('Профили'); await edit(editor('work').querySelectorAll('input')[0], 'Unsaved profile');
+  await click('Узлы'); const uri = root.querySelectorAll('textarea')[0]; await edit(uri, 'vless://draft@host:443');
+  const details = root.querySelectorAll('details').find(node => node.children[0].textContent === 'Ресурсы'); details.open = true;
+  await edit(details.querySelectorAll('input')[0], 'Renamed Google'); await click('Добавить ресурс');
+  let inputs = details.querySelectorAll('input'); await edit(inputs[6], 'Custom');
+  await edit(inputs[7], 'http://unsafe.example'); await click('Сохранить ресурсы'); assert.equal(requests.length, 0);
+  await edit(inputs[7], 'https://custom.example/check'); await edit(inputs[8], '200');
+  replies.push({ http: 409, error: 'Target revision conflict' }); await click('Сохранить ресурсы');
+  assert.ok(details.textContent.includes('HTTP 409')); assert.equal(inputs[7].value, 'https://custom.example/check');
+  assert.equal(requests.at(-1).fields.revision, 'targets-1'); assert.equal(requests.at(-1).fields.action, 'vpn_profiles_targets_save');
+  const content = postedData(); assert.equal(content[2].status, 200); assert.equal(content[0].name, 'Renamed Google');
+  const updated = { ...initial, testTargets: { revision: 'targets-2', items: content } };
+  replies.push({ ok: true, snapshot: updated }); const nav = root.querySelectorAll('nav')[0]; await click('Сохранить ресурсы');
+  assert.equal(root.querySelectorAll('nav')[0], nav); assert.equal(uri.value, 'vless://draft@host:443');
+  assert.ok(root.querySelectorAll('select')[1].textContent.includes('Custom'));
+  await click('Удалить ресурс: YouTube');
+  replies.push({ ok: true, snapshot: { ...updated, testTargets: { revision: 'targets-3', items: content.filter(item => item.id !== 'youtube') } } });
+  await click('Сохранить ресурсы'); assert.equal(requests.at(-1).fields.revision, 'targets-2'); assert.equal(postedData().length, 2);
+  await click('Профили'); assert.equal(editor('work').querySelectorAll('input')[0].value, 'Unsaved profile');
+}
+
 (async function () {
   const tests = [testAtomicSaveAndOrdering, testFailuresAndDiscard, testConnectionAndSearch, testCatalogCrud, testRuleActions,
-    testLargeCatalog, testEffectiveAndRuleGuard, testImportAndRefresh, testUpdateJob, testReadableOutput];
+    testLargeCatalog, testEffectiveAndRuleGuard, testImportAndRefresh, testUpdateJob, testReadableOutput,
+    testFilteredProbeAndProgress, testProbeErrorsAndSpeed, testTargetEditing];
   for (const test of tests) await test();
   assert.ok(!source.includes('innerHTML'));
-  console.log('PASS: profiles UI ordering, atomic CAS save, CRUD, node filters, safe text, errors and dirty-state protection');
+  console.log('PASS: 13 profiles UI scenarios: legacy, filtered/background probes, polling/errors/timeouts, target CRUD and draft preservation');
 })().catch(error => { console.error(error); process.exitCode = 1; });
