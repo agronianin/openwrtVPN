@@ -51,7 +51,10 @@ else if(args[0]==='set'||args[0]==='add_list') { const pos=args[1].indexOf('=');
     assert.equal(state['openwrtvpn.main.modem_enabled'],modem);
     assert.equal(fs.existsSync(path.join(sandbox,'usr/bin/modem-t77w968')),modem==='1');
     assert.ok(fs.existsSync(path.join(sandbox,'opt/router-control/www/vpn.js')));
-    assert.ok(fs.statSync(path.join(sandbox,'usr/bin/vpn-node-tests')).mode & 0o111);
+    // Новый контроллер должен устанавливаться исполняемым с обоими вариантами модемного модуля.
+    for (const tool of ['vpn-node-tests', 'vpn-connection']) {
+      assert.ok(fs.statSync(path.join(sandbox,'usr/bin',tool)).mode & 0o111);
+    }
     assert.equal(fs.readFileSync(path.join(sandbox,'etc/sing-box/config.json'),'utf8'),fs.readFileSync(path.join(project,'defaults/config.json'),'utf8'));
     assert.ok(!fs.existsSync(path.join(sandbox,'usr/bin/modem-qmi-connect')));
     assert.ok(!fs.readFileSync(path.join(sandbox,'etc/sing-box/subscriptions.d/black.txt'),'utf8').includes('withblancvpn'));

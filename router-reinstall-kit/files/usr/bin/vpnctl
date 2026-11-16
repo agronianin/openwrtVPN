@@ -1204,7 +1204,7 @@ EOF
 
 if [ -s /etc/sing-box/profiles/managed ]; then
   case "${1:-}:${2:-}" in
-    node:auto) exec /usr/bin/vpn-profiles activate "$(cat /etc/sing-box/profiles/active)" ;;
+    node:auto|node:find) exec /usr/bin/vpn-connection start find ;;
     mode:*|subscription:set|subscription:auto|subscription:next|subscription:prev)
       echo 'Use vpn-profiles to select a profile; legacy mode changes are disabled for managed profiles' >&2; exit 2 ;;
     update:*) exec /usr/bin/vpn-profiles update all ;;

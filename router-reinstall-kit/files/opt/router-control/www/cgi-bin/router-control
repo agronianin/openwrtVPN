@@ -914,6 +914,23 @@ fi
 case "$ACTION" in vpn_profiles_*)
   output_file=$(mktemp /tmp/vpn-profile-result.XXXXXX)
   case "$ACTION" in
+    vpn_profiles_connection_start|vpn_profiles_connection_status|vpn_profiles_connection_save)
+      case "$ACTION" in
+        vpn_profiles_connection_start) /usr/bin/vpn-connection start "$ARG" > "$output_file" 2> "$output_file.error" ;;
+        vpn_profiles_connection_status) /usr/bin/vpn-connection status > "$output_file" 2> "$output_file.error" ;;
+        vpn_profiles_connection_save)
+          printf '%s' "$CONTENT" | /usr/bin/vpn-connection configure "$(url_decode "$(field revision)")" > "$output_file" 2> "$output_file.error" ;;
+      esac
+      result_code=$?
+      printf 'Content-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\n\r\n'
+      if [ "$result_code" = 0 ] && jq -e '.settings and .revision' "$output_file" >/dev/null 2>&1; then
+        jq -n --slurpfile connection "$output_file" '{ok:true,connection:$connection[0]}'
+      else
+        [ -s "$output_file.error" ] || echo 'Операция соединения завершилась ошибкой' > "$output_file.error"
+        jq -n --rawfile error "$output_file.error" '{ok:false,error:$error}'
+      fi
+      rm -f "$output_file" "$output_file.error"; exit 0
+      ;;
     vpn_profiles_probe_start|vpn_profiles_probe_status)
       if [ "$ACTION" = vpn_profiles_probe_start ]; then
         printf '%s' "$CONTENT" | /usr/bin/vpn-node-tests start > "$output_file" 2> "$output_file.error"
@@ -1177,14 +1194,14 @@ vpn_interval_editor() {
 <input type="hidden" name="action" value="vpn_settings_save">
 <input type="hidden" name="tab" value="vpn">
 <label>Обновление подписок, часов <input type="number" name="update_hours" min="0" max="720" required value="$(esc "${hours:-1}")"></label>
-<label>Проверка соединения, минут <input type="number" name="health_minutes" min="0" max="1440" required value="$(esc "${minutes:-5}")"></label>
+<label $([ ! -s /etc/sing-box/profiles/managed ] || printf hidden)>Проверка соединения, минут <input type="number" name="health_minutes" min="0" max="1440" required value="$(esc "${minutes:-5}")"></label>
 <label>Загружать подписки
 <select name="subscription_fetch_mode">
 <option value="vpn"$([ "$transport" != vpn ] || printf ' selected')>Только через VPN</option>
 <option value="direct"$([ "$transport" != direct ] || printf ' selected')>Только напрямую</option>
 <option value="vpn-first"$([ "$transport" != vpn-first ] || printf ' selected')>VPN, затем напрямую</option>
 </select></label>
-<p>0 отключает соответствующую задачу. Обновление сохраняет подключение. Три неудачные проверки подряд запускают автоматический выбор из актуальных узлов.</p>
+<p>0 отключает таймер обновления подписок. Обновление сохраняет текущее подключение.</p>
 <button type="submit">Сохранить настройки</button>
 <div class="inline-result"></div>
 </form>

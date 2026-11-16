@@ -42,7 +42,7 @@ else
 fi
 mkdir -p /usr/bin /etc/init.d /etc/config /opt/router-control/www/cgi-bin /etc/sing-box/vpn-config /etc/sing-box/subscriptions.d /etc/sing-box/rule-packs/available /etc/sing-box/rule-packs/enabled /etc/sing-box/subscriptions-cache /usr/share/sing-box
 copy_file() { cp "$FILES/$1" "/$1"; chmod "$2" "/$1"; }
-for name in vpnctl vpn-subscriptions-update vpn-toggle vpn-health-check vpn-auto-update vpn-mode sing-box-update vpn-profiles vpn-node-tests; do
+for name in vpnctl vpn-subscriptions-update vpn-toggle vpn-health-check vpn-auto-update vpn-mode sing-box-update vpn-profiles vpn-node-tests vpn-connection; do
   copy_file "usr/bin/$name" 755
 done
 for name in sing-box router-control-web; do copy_file "etc/init.d/$name" 755; done

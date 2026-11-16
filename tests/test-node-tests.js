@@ -42,7 +42,8 @@ const file=process.env.TEST_WORK+'/attempt-'+proxy.slice(-5); const n=fs.existsS
 fs.writeFileSync(file,String(n+1));
 if(proxy.endsWith('21081') && n===0) console.log('403 0.02'); else console.log('204 0.15');
 `);
-  fs.writeFileSync(path.join(root, 'config.json'), 'working config');
+  const liveConfig = JSON.stringify({working: true});
+  fs.writeFileSync(path.join(root, 'config.json'), liveConfig);
   fs.writeFileSync(path.join(root, 'profiles/cache/source.nodes'),
     '{"type":"vless","tag":"one","server":"vpn.example","server_port":443},\n' +
     '{"type":"hysteria2","tag":"two","server":"vpn2.example","server_port":443},\n');
@@ -88,7 +89,7 @@ if(proxy.endsWith('21081') && n===0) console.log('403 0.02'); else console.log('
   assert.equal(failed.state, 'done', JSON.stringify(failed));
   assert.equal(failed.results[0].passed, 0); assert.equal(failed.results[0].ok, false);
   assert.equal(failed.results[0].latency_ms, null); assert.match(failed.results[0].error, /Certificate/);
-  assert.equal(fs.readFileSync(path.join(root, 'config.json'), 'utf8'), 'working config');
+  assert.equal(fs.readFileSync(path.join(root, 'config.json'), 'utf8'), liveConfig);
   console.log('PASS: forced per-node proxy, repeat HTTPS checks, bounded speed, custom targets and unchanged active config');
 }
 test().catch(error => { console.error(error); process.exitCode = 1; }).finally(() => fs.rmSync(work, {recursive: true, force: true}));

@@ -33,6 +33,11 @@ let root, context, requests, confirmAnswer, replies, unload, timers;
 const initial = {
   revision: 'revision-1', active: 'work', running: true,
   selection: {mode: 'auto', tag: 'profile-auto'}, effective: {tag: 'b', title: 'Node B', type: 'Hysteria2'},
+  connection: {
+    revision: 'connection-1',
+    settings: { enabled: false, interval_minutes: 5, failures: 3, target: 'google', refresh_on_failure: false, allow_reload: true },
+    lastCheck: null, job: null
+  },
   testTargets: { revision: 'targets-1', items: [
     { id: 'google', name: 'Google', url: 'https://www.google.com/generate_204', status: 204 },
     { id: 'youtube', name: 'YouTube', url: 'https://www.youtube.com/generate_204', status: 204 }
@@ -119,9 +124,10 @@ async function testFailuresAndDiscard() {
     assert.equal(editor('work').querySelectorAll('input')[0].value, 'Unsaved');
     assert.equal(named('Сохранить изменения').disabled, false);
     let prevented = false; unload({ preventDefault: () => { prevented = true; } }); assert.ok(prevented);
-    await click('VPN'); confirmAnswer = false; await click('Автовыбор узла'); assert.equal(requests.length, 1);
-    confirmAnswer = true; await click('Автовыбор узла');
-    assert.equal(requests.at(-1).fields.arg, 'auto');
+    await click('Статус'); confirmAnswer = false; await edit(root.querySelectorAll('select')[1], 'b', 'change');
+    assert.equal(requests.length, 1);
+    confirmAnswer = true; await edit(root.querySelectorAll('select')[1], 'b', 'change');
+    assert.equal(requests.at(-1).fields.arg, 'b');
     assert.ok(!root.textContent.includes('Есть несохраненные изменения'));
   }
 }
@@ -172,7 +178,7 @@ async function testRuleActions() {
   boot(); await click('Правила'); await click('Удалить правило', editor('05-proxy'));
   assert.ok(root.textContent.includes('Правило используется')); assert.equal(requests.length, 0);
   await edit(editor('05-proxy').querySelectorAll('textarea')[0], 'updated content');
-  await click('VPN'); await click('Правила'); assert.equal(editor('05-proxy').querySelectorAll('textarea')[0].value, 'updated content');
+  await click('Статус'); await click('Правила'); assert.equal(editor('05-proxy').querySelectorAll('textarea')[0].value, 'updated content');
   replies.push({ ok: false, error: 'Invalid rule' }); await click('Сохранить правило', editor('05-proxy'));
   assert.equal(requests.at(-1).fields.action, 'vpn_profiles_rule_save');
   assert.equal(requests.at(-1).fields.arg, '05-proxy'); assert.equal(requests.at(-1).fields.content, 'updated content');
@@ -246,7 +252,7 @@ async function testImportAndRefresh() {
   assert.ok(root.textContent.includes('HTTP 409')); assert.ok(root.textContent.includes('Catalog changed; refresh and retry'));
   assert.equal(uri.value, 'vless://example@test.example:443');
   await click('Обновить состояние'); assert.equal(requests.length, 1);
-  await click('VPN'); await click('Узлы'); assert.equal(root.querySelectorAll('textarea')[0].value, uri.value);
+  await click('Статус'); await click('Узлы'); assert.equal(root.querySelectorAll('textarea')[0].value, uri.value);
   await click('Добавить узел'); assert.equal(requests.length, 2);
   assert.equal(root.querySelectorAll('textarea')[0].value, '');
   assert.equal(root.querySelectorAll('input').find(node => node.type !== 'search').value, '');
@@ -277,57 +283,217 @@ async function testUpdateJob() {
   assert.ok(requests.every(request => request.fields.action !== 'vpn_profiles_activate'));
 }
 
-// JSON проверки читается по-русски, а отрицательный результат и диагностические подробности не теряются.
-async function testReadableOutput() {
-  boot();
-  replies.push({ ok: true, snapshot: initial, output: '{"https":true,"delay_ms":123}' });
-  await click('Проверить подключение');
-  assert.ok(root.textContent.includes('HTTPS-проверка прошла.')); assert.ok(root.textContent.includes('Задержка: 123 мс'));
-  replies.push({ ok: true, snapshot: initial, output: { https: false, delay_ms: 0, error: 'TLS certificate expired' } });
-  await click('Проверить подключение');
-  assert.ok(root.textContent.includes('HTTPS-проверка не прошла.')); assert.ok(root.textContent.includes('TLS certificate expired'));
-  replies.push({ http: 502, ok: false, error: 'Probe failed', output: '{"https":false,"detail":"Connection refused"}' });
-  await click('Проверить подключение');
-  assert.ok(root.textContent.includes('HTTP 502')); assert.ok(root.textContent.includes('Probe failed'));
-  assert.ok(root.textContent.includes('Connection refused'));
+// Полный typed-контракт отделён от снимка каталога: ответы не содержат snapshot.
+function connectionReply(state = 'running', extra = {}) {
+  return { ok: true, connection: { ...initial.connection, ...extra,
+    job: { id: 'connection-job', kind: 'find', state, phase: 'testing', message: 'Проверка кандидатов', done: 1, total: 4, ...extra.job }
+  } };
+}
+// Последняя проверка сохраняет нулевую задержку и причины; чужой профиль/узел и выключенный VPN помечаются устаревшими.
+async function testLastCheck() {
+  const check = { time: 1794770000, profile: 'work', node: 'b', ok: false, passed: 1, attempts: 2,
+    latency_ms: 0, http_code: 503, reason: '<img src=x> TLS certificate expired' };
+  for (const overrides of [{}, { active: 'other' }, { effective: { tag: 'a' } }, { running: false }]) {
+    boot({ ...initial, connection: { ...initial.connection, lastCheck: check }, ...overrides });
+    assert.ok(root.textContent.includes('Последняя проверка:')); assert.ok(root.textContent.includes('Нестабильно · 1/2 · 0 мс · HTTP 503'));
+    assert.ok(root.textContent.includes(check.reason)); assert.equal(root.querySelectorAll('img').length, 0);
+    assert.equal(root.textContent.includes('Устарело:'), Object.keys(overrides).length > 0);
+    await click('Узлы'); await click('Статус'); assert.ok(root.textContent.includes(check.reason));
+  }
+  boot({ ...initial, connection: { ...initial.connection, lastCheck: { ...check, ok: true, passed: 2, latency_ms: null, reason: '' } } });
+  assert.ok(root.textContent.includes('HTTPS доступен · 2/2')); assert.ok(!root.textContent.includes('null мс'));
+  replies.push({ ok: true, snapshot: { ...initial, effective: { tag: 'extra', title: 'Extra' },
+    connection: { ...initial.connection, lastCheck: check } } });
+  await edit(root.querySelectorAll('select')[1], 'extra', 'change');
+  assert.ok(root.textContent.includes(check.reason)); assert.ok(root.textContent.includes('Устарело:'));
 }
 
-// Автовыбор показывает реальное включение режима, ожидание/ошибку и не выдает его за завершенный поиск узлов.
+// Автовыбор — конечное задание: polling показывает прогресс, блокирует конфликтующие команды и один раз читает итоговый снимок.
 async function testSelectionFeedback() {
   boot();
-  const apply = named('Применить профиль');
-  assert.ok(apply.title.includes('разрыв')); assert.ok(apply.title.includes('ручная фиксация'));
-  assert.ok(named('Автовыбор узла').title.includes('Не запускает отдельный поиск'));
-  assert.ok(named('Проверить подключение').title.includes('геолокации'));
+  assert.equal(root.querySelectorAll('nav')[0].children[0].textContent, 'Статус');
+  assert.ok(named('Применить профиль').title.includes('разрыв'));
+  assert.ok(named('Автовыбор узла').title.includes('Разовый поиск'));
+  assert.ok(named('Автовыбор узла').title.includes('текущий узел сохраняется'));
+  assert.ok(named('Проверить подключение').title.includes('Два HTTPS-запроса'));
   assert.ok(named('Обновить состояние').title.includes('Не применяет профиль'));
-  assert.ok(buttons().every(node => !['↻', '↺'].includes(node.textContent)));
-  assert.ok(root.textContent.includes('Выбор узла: автоматически'));
-  let complete;
+  assert.ok(!root.textContent.includes('Выбор узла:'));
+  replies.push(connectionReply()); await click('Автовыбор узла');
+  assert.equal(requests[0].fields.action, 'vpn_profiles_connection_start'); assert.equal(requests[0].fields.arg, 'find');
+  assert.ok(root.textContent.includes('Проверка кандидатов')); assert.ok(!root.textContent.includes(' · testing'));
+  assert.equal(root.attributes['aria-busy'], 'true');
+  for (const name of ['Автовыбор узла', 'Проверить подключение', 'Применить профиль', 'Обновить состояние', 'Сохранить автовосстановление']) {
+    assert.equal(named(name).disabled, true);
+  }
+  assert.equal(root.querySelectorAll('select')[1].disabled, true);
+  await named('Автовыбор узла').fire('click'); assert.equal(requests.length, 1);
+  const nav = root.querySelectorAll('nav')[0];
+  replies.push(connectionReply('running', { job: { done: 3, message: '<b>testing</b>' } })); await tick();
+  assert.equal(requests.at(-1).fields.action, 'vpn_profiles_connection_status'); assert.equal(root.querySelectorAll('nav')[0], nav);
+  assert.equal(root.querySelectorAll('progress')[0].value, 3); assert.equal(root.querySelectorAll('b').length, 0);
+  const selected = { tag: 'extra', title: 'Extra', latency_ms: 12 };
+  replies.push(connectionReply('done', { job: { done: 4, selected } }),
+    { ok: true, snapshot: { ...initial, effective: { tag: 'extra', title: 'Extra', delay_ms: 12 } } });
+  await tick(); assert.ok(root.textContent.includes('Завершено · проверено 4/4')); assert.ok(root.textContent.includes('Выбран: Extra · 12 мс'));
+  assert.ok(root.textContent.includes('Текущий узел: Extra')); assert.equal(timers.size, 0);
+  assert.equal(requests.filter(request => request.fields.action === 'vpn_profiles_snapshot').length, 1);
+  assert.equal(named('Автовыбор узла').disabled, false); assert.equal(root.attributes['aria-busy'], undefined);
+  assert.ok(requests.every(request => request.fields.action !== 'vpn_profiles_node'));
+}
+
+// Нет кандидата и ошибки задания не подменяются успехом; черновики каталога, правил и импорта переживают завершение без снимка.
+async function testConnectionDraftsAndNoCandidate() {
+  boot(); await click('Профили'); await edit(editor('work').querySelectorAll('input')[0], 'Unsaved profile');
+  await click('Правила'); await edit(editor('05-proxy').querySelectorAll('textarea')[0], 'Unsaved rule');
+  await click('Узлы'); await edit(root.querySelectorAll('textarea')[0], 'vless://draft@host:443');
+  await click('Статус'); confirmAnswer = false;
+  replies.push(connectionReply()); await click('Автовыбор узла');
+  await click('Правила'); const textarea = editor('05-proxy').querySelectorAll('textarea')[0];
+  replies.push(connectionReply('failed', { job: { error: 'No candidate; current node retained', message: 'Узел не найден' } })); await tick();
+  assert.equal(editor('05-proxy').querySelectorAll('textarea')[0], textarea); assert.equal(textarea.value, 'Unsaved rule');
+  await click('Статус'); assert.ok(root.textContent.includes('No candidate')); assert.ok(root.textContent.includes('Текущий узел: Node B'));
+  assert.equal(named('Автовыбор узла').disabled, false); assert.equal(timers.size, 0);
+  assert.equal(requests.length, 2);
+  replies.push(connectionReply('done', { job: { id: 'empty-search', message: 'Кандидат не найден; текущий узел сохранён' } }));
+  await click('Автовыбор узла'); assert.ok(root.textContent.includes('Кандидат не найден'));
+  assert.ok(root.textContent.includes('Текущий узел: Node B')); assert.ok(!root.textContent.includes('Выбран:'));
+  replies.push(connectionReply('done', { job: { id: 'next-job', selected: { tag: 'extra', title: 'Extra', latency_ms: 0 } } }));
+  await click('Автовыбор узла'); assert.ok(root.textContent.includes('Текущий узел: Extra'));
+  await click('Профили'); assert.equal(editor('work').querySelectorAll('input')[0].value, 'Unsaved profile');
+  await click('Узлы'); assert.equal(root.querySelectorAll('textarea')[0].value, 'vless://draft@host:443');
+  assert.ok(requests.every(request => request.fields.action !== 'vpn_profiles_snapshot'));
+}
+
+// HTTP/JSON/сеть/таймаут не оставляют старт заблокированным; polling повторяется и сохраняет последнюю проверку.
+async function testConnectionErrorsAndCheck() {
+  for (const reply of [{ http: 502, error: 'Unavailable' }, { jsonError: true }, new Error('Offline'), { ok: true },
+    connectionReply('invalid'), connectionReply('running', { lastCheck: {} })]) {
+    boot(); replies.push(reply); await click('Проверить подключение');
+    assert.equal(named('Проверить подключение').disabled, false); assert.equal(timers.size, 0);
+    assert.ok(root.textContent.includes(reply.http ? 'HTTP 502' : reply.jsonError ? 'JSON' : reply.message || 'Некорректный ответ'));
+  }
+  boot(); replies.push({ hang: true }); const pending = named('Проверить подключение').fire('click'); await settle();
+  assert.ok(root.textContent.includes('Запуск операции')); await tick(20000); await pending;
+  assert.ok(root.textContent.includes('20 секунд')); assert.equal(named('Проверить подключение').disabled, false);
+  const check = { time: 1794770000, profile: 'work', node: 'b', ok: true, passed: 2, attempts: 2,
+    latency_ms: 10, http_code: 204, reason: '' };
+  boot(); replies.push(connectionReply('running', { lastCheck: check, job: { kind: 'check' } })); await click('Проверить подключение');
+  assert.equal(requests[0].fields.arg, 'check');
+  for (const reply of [{ http: 503 }, { jsonError: true }, new Error('Disconnected'), connectionReply('running', { job: { id: 'other' } })]) {
+    replies.push(reply); await tick(); assert.equal(named('Проверить подключение').disabled, true);
+    assert.ok(root.textContent.includes('HTTPS доступен · 2/2')); assert.equal([...timers.values()][0].delay, 1500);
+  }
+  replies.push(connectionReply('done', { lastCheck: check, job: { kind: 'check', done: 4 } }), { http: 503 }); await tick();
+  assert.ok(root.textContent.includes('Не удалось обновить текущий узел')); assert.equal(timers.size, 0);
+  assert.equal(named('Проверить подключение').disabled, false);
+  // Открытие панели с уже идущим заданием возобновляет polling, а OFF не разрешает запуск проверок.
+  boot({ ...initial, connection: connectionReply().connection });
+  replies.push(connectionReply('done'), { ok: true, snapshot: initial }); await tick(); assert.equal(timers.size, 0);
+  boot({ ...initial, running: false }); assert.equal(named('Автовыбор узла').disabled, true);
+  assert.equal(named('Проверить подключение').disabled, true);
+}
+
+// Настройки сохраняются отдельно с CAS, диапазонами и всеми флагами; конфликт и чужие черновики сохраняются.
+async function testRecoverySettings() {
+  boot(); await click('Профили'); await edit(editor('work').querySelectorAll('input')[0], 'Unsaved profile');
+  await click('Правила'); await edit(editor('05-proxy').querySelectorAll('textarea')[0], 'Unsaved rule');
+  await click('Узлы'); await edit(root.querySelectorAll('textarea')[0], 'vless://draft@host:443');
+  await click('Статус');
+  const details = root.querySelectorAll('details').find(node => node.children[0].textContent === 'Автовосстановление');
+  const inputs = details.querySelectorAll('input'), enabled = inputs[0], interval = inputs[1], failures = inputs[2];
+  assert.equal(enabled.type, 'checkbox'); assert.equal(enabled.checked, false); assert.equal(inputs[4].checked, true);
+  enabled.checked = true; await enabled.fire('change');
+  for (const value of ['0', '1441', '1.5']) {
+    await edit(interval, value); await click('Сохранить автовосстановление'); assert.equal(requests.length, 0);
+  }
+  await edit(interval, '1');
+  for (const value of ['1', '11', '2.5']) {
+    await edit(failures, value); await click('Сохранить автовосстановление'); assert.equal(requests.length, 0);
+  }
+  await edit(failures, '10'); await edit(details.querySelectorAll('select')[0], 'youtube', 'change');
+  inputs[3].checked = true; await inputs[3].fire('change');
+  const settings = { enabled: true, interval_minutes: 1, failures: 10, target: 'youtube', refresh_on_failure: true, allow_reload: true };
+  replies.push({ http: 409, error: 'Connection revision conflict' }); await click('Сохранить автовосстановление');
+  assert.ok(details.textContent.includes('HTTP 409')); assert.equal(enabled.checked, true);
+  assert.equal(requests.at(-1).fields.revision, 'connection-1'); assert.deepEqual(postedData(), settings);
+  replies.push({ ok: true, connection: { ...initial.connection, revision: 'connection-2', settings } });
+  const nav = root.querySelectorAll('nav')[0]; await click('Сохранить автовосстановление');
+  assert.equal(root.querySelectorAll('nav')[0], nav); assert.ok(root.textContent.includes('Автовосстановление включено'));
+  assert.equal(requests.at(-1).fields.action, 'vpn_profiles_connection_save');
+  inputs[4].checked = false; await inputs[4].fire('change');
+  replies.push({ ok: true, connection: { ...initial.connection, revision: 'connection-3', settings: { ...settings, allow_reload: false } } });
+  await click('Сохранить автовосстановление'); assert.equal(requests.at(-1).fields.revision, 'connection-2');
+  assert.equal(postedData().allow_reload, false);
+  await click('Профили'); assert.equal(editor('work').querySelectorAll('input')[0].value, 'Unsaved profile');
+  await click('Правила'); assert.equal(editor('05-proxy').querySelectorAll('textarea')[0].value, 'Unsaved rule');
+  await click('Узлы'); assert.equal(root.querySelectorAll('textarea')[0].value, 'vless://draft@host:443');
+  await click('Статус'); assert.equal(root.querySelectorAll('input')[0].checked, true);
+}
+
+// Финальный снимок не сбрасывает правки, введённые после его отправки, и до ответа не разрешает новое задание.
+async function testConnectionSnapshotRace() {
+  boot(); replies.push(connectionReply()); await click('Автовыбор узла');
+  const originalFetch = context.fetch; let complete;
   context.fetch = (url, options) => {
-    requests.push({url, options, fields: Object.fromEntries(options.body)});
+    if (options.body.get('action') !== 'vpn_profiles_snapshot') return originalFetch(url, options);
+    requests.push({ url, options, fields: Object.fromEntries(options.body) });
     return new Promise(resolve => { complete = resolve; });
   };
-  const pending = named('Автовыбор узла').fire('click'); await settle();
-  assert.ok(root.textContent.includes('Включаю автовыбор узла...'));
-  assert.equal(root.attributes['aria-busy'], 'true'); assert.ok(named('Автовыбор узла').disabled);
-  complete({ok: true, json: async () => ({ok: true, snapshot: initial, output: ''})}); await pending;
-  assert.ok(root.textContent.includes('Автовыбор включён.'));
-  assert.ok(root.textContent.includes('Сейчас выбран: Node B.'));
-  assert.ok(root.textContent.includes('этой командой не проверяется'));
-  assert.equal(root.attributes['aria-busy'], undefined); assert.equal(named('Автовыбор узла').disabled, false);
-  // Явная ошибка и превышение времени ожидания разблокируют интерфейс и не показывают успех.
-  boot(); replies.push({ok: false, error: 'Selector unavailable'}); await click('Автовыбор узла');
-  assert.ok(root.textContent.includes('Selector unavailable')); assert.ok(!root.textContent.includes('Автовыбор включён.'));
-  boot(); replies.push({hang: true});
-  const timed = named('Автовыбор узла').fire('click'); await settle(); await tick(45000); await timed;
-  assert.ok(root.textContent.includes('45 секунд')); assert.equal(named('Автовыбор узла').disabled, false);
-  assert.equal(root.attributes['aria-busy'], undefined);
-  // Фиксация и неизвестное состояние различаются; отсутствие ответа API не маскируется под автоматический режим.
-  boot({...initial, selection: {mode: 'manual', tag: 'b'}});
-  assert.ok(root.textContent.includes('Выбор узла: вручную'));
-  boot({...initial, selection: null}); assert.ok(root.textContent.includes('Выбор узла: не определён'));
-  replies.push({ok: true, snapshot: {...initial, selection: null}, output: ''}); await click('Автовыбор узла');
-  assert.ok(root.textContent.includes('режим выбора не подтверждён'));
+  replies.push(connectionReply('done')); const pending = tick(); await settle();
+  await click('Профили'); await edit(editor('work').querySelectorAll('input')[0], 'Late draft');
+  await click('Статус'); assert.equal(named('Автовыбор узла').disabled, true);
+  await click('Правила'); await edit(editor('05-proxy').querySelectorAll('textarea')[0], 'Late rule');
+  const textarea = editor('05-proxy').querySelectorAll('textarea')[0];
+  complete({ ok: true, json: async () => ({ ok: true, snapshot: initial }) }); await pending;
+  assert.equal(editor('05-proxy').querySelectorAll('textarea')[0], textarea); assert.equal(textarea.value, 'Late rule');
+  await click('Профили'); assert.equal(editor('work').querySelectorAll('input')[0].value, 'Late draft');
+  assert.equal(timers.size, 0);
+}
+
+// Необязательная проверка настоящим Chrome: iframe задаёт точную мобильную ширину без новых npm-зависимостей.
+function testMobileLayout() {
+  if (!process.env.PROFILES_UI_CHROME) return;
+  const { execFileSync } = require('node:child_process');
+  const css = fs.readFileSync(path.join(__dirname, '../router-reinstall-kit/files/opt/router-control/www/profiles.css'), 'utf8');
+  const profile = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'profiles-ui-chrome-'));
+  const fixture = JSON.parse(JSON.stringify(initial));
+  fixture.connection.lastCheck = { time: 1794770000, profile: 'old-profile', node: 'old-node', ok: false, passed: 0, attempts: 2,
+    latency_ms: null, http_code: 503, reason: 'LongErrorWithoutSpaces'.repeat(8) };
+  const seed = JSON.stringify(fixture).replace(/</g, '\\u003c');
+  const document = '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<style>body{margin:8px}' + css + '</style><main id="vpn-app"></main>' +
+    '<script id="vpn-profile-data" type="application/json">' + seed + '</script><script>' + source + '</script>';
+  try {
+    for (const width of [320, 390, 1200]) {
+      const shell = '<!doctype html><body style="margin:0"><script>' +
+        'const frame=document.createElement("iframe");frame.style="border:0;width:' + width + 'px;height:1800px";' +
+        'frame.onload=()=>{try{const d=frame.contentDocument,w=frame.contentWindow,app=d.getElementById("vpn-app");' +
+        'if(!app)throw Error("Missing app");if(w.innerWidth!==' + width + ')throw Error("Wrong viewport");' +
+        'for(const view of ["Статус","Профили","Подписки","Правила","Узлы"]){' +
+        '[...app.querySelectorAll("nav button")].find(b=>b.textContent===view).click();' +
+        'app.querySelectorAll("details").forEach(n=>n.open=true);' +
+        'if(d.documentElement.scrollWidth>w.innerWidth)throw Error("Page overflow: "+view);' +
+        'for(const n of app.querySelectorAll("button,input,select,textarea,summary,progress")){' +
+        'if(!n.getClientRects().length)continue;const r=n.getBoundingClientRect();' +
+        'if(r.left<0||r.right>w.innerWidth+1)throw Error("Control overflow: "+view+" "+n.tagName);}' +
+        '}[...app.querySelectorAll("nav button")].find(b=>b.textContent==="Статус").click();' +
+        'app.querySelector("details").open=true;' +
+        'const columns=w.getComputedStyle(app.querySelector(".vp-recovery-grid")).gridTemplateColumns.split(" ").length;' +
+        'if(columns!==' + (width < 481 ? 1 : 3) + ')throw Error("Recovery columns");' +
+        'document.body.setAttribute("data-layout","pass");' +
+        '}catch(e){document.body.setAttribute("data-layout","FAIL: "+e.message);}};' +
+        'frame.srcdoc=' + JSON.stringify(document).replace(/</g, '\\u003c') + ';document.body.append(frame);</script>';
+      const args = ['--headless', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--user-data-dir=' + profile,
+        '--window-size=' + Math.max(width, 500) + ',1800', '--virtual-time-budget=1500', '--dump-dom'];
+      if (process.env.PROFILES_UI_SCREENSHOTS) {
+        args.push('--screenshot=' + path.join(process.env.PROFILES_UI_SCREENSHOTS, 'profiles-' + width + '.png'));
+      }
+      args.push('data:text/html;charset=utf-8,' + encodeURIComponent(shell));
+      const output = execFileSync(process.env.PROFILES_UI_CHROME, args, { encoding: 'utf8', timeout: 20000, stdio: ['ignore', 'pipe', 'pipe'] });
+      assert.ok(output.includes('data-layout="pass"'), 'Layout ' + width + ': ' + (output.match(/data-layout="([^"]*)"/) || [])[1]);
+    }
+  } finally { fs.rmSync(profile, { recursive: true, force: true }); }
+  console.log('PASS: Chrome layouts at 320, 390 and 1200 px, all five views and recovery controls');
 }
 
 // Ответы заданий и виртуальное время позволяют проверить polling без реальной сети и ожидания.
@@ -427,9 +593,11 @@ async function testTargetEditing() {
 
 (async function () {
   const tests = [testAtomicSaveAndOrdering, testFailuresAndDiscard, testConnectionAndSearch, testCatalogCrud, testRuleActions,
-    testLargeCatalog, testEffectiveAndRuleGuard, testImportAndRefresh, testUpdateJob, testReadableOutput,
-    testFilteredProbeAndProgress, testProbeErrorsAndSpeed, testTargetEditing, testSelectionFeedback];
+    testLargeCatalog, testEffectiveAndRuleGuard, testImportAndRefresh, testUpdateJob, testLastCheck,
+    testFilteredProbeAndProgress, testProbeErrorsAndSpeed, testTargetEditing, testSelectionFeedback,
+    testConnectionDraftsAndNoCandidate, testConnectionErrorsAndCheck, testRecoverySettings, testConnectionSnapshotRace];
   for (const test of tests) await test();
   assert.ok(!source.includes('innerHTML'));
-  console.log('PASS: 14 profiles UI scenarios, including selection feedback, tooltips, busy state and bounded timeout');
+  console.log('PASS: 18 profiles UI scenarios, including finite search, polling, recovery settings, stale checks and retained drafts');
+  testMobileLayout();
 })().catch(error => { console.error(error); process.exitCode = 1; });

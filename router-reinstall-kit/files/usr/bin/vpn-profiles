@@ -16,6 +16,7 @@ set_job() {
   mv "$BASE/profiles/update-job.json.new.$$" "$BASE/profiles/update-job.json"
 }
 running() { /etc/init.d/sing-box status >/dev/null 2>&1; }
+if [ "${1:-}:${2:-}" = node:auto ] && [ -x /usr/bin/vpn-connection ]; then exec /usr/bin/vpn-connection start find; fi
 readonly=0
 [ "${1:-snapshot}" != snapshot ] || [ ! -f "$DB" ] || readonly=1
 if [ "${VPN_PROFILES_LOCKED:-0}" != 1 ] && [ "$readonly" != 1 ]; then
@@ -169,6 +170,19 @@ snapshot() (
     jq --slurpfile nodes "$TMP/source-nodes.json" '.+$nodes[0]' "$TMP/nodes.json" > "$TMP/next.json"
     mv "$TMP/next.json" "$TMP/nodes.json"
   done
+  echo '{}' > "$TMP/loaded-titles.json"
+  if [ -s "$BASE/profiles/loaded-titles.json" ]; then
+    jq --arg hash "$(sha256sum "$CONFIG" | cut -d' ' -f1)" 'if .config==$hash then .items else {} end' \
+      "$BASE/profiles/loaded-titles.json" > "$TMP/loaded-titles.json"
+  fi
+  jq --slurpfile data "$DB" --slurpfile cached "$TMP/nodes.json" \
+    --slurpfile titles "$TMP/loaded-titles.json" \
+    '[.outbounds[]?|select(.type=="vless" or .type=="hysteria2")|. as $node|
+      {tag,type,title:([$cached[0][]|select(.tag==$node.tag)|.title][0]//$titles[0][.tag]//.tag),
+       subscription:([$data[0].subscriptions[]|. as $source|select($node.tag|startswith($source.id+"-"))|.id][0]//"loaded")}]' \
+    "$CONFIG" > "$TMP/loaded.json"
+  jq --slurpfile loaded "$TMP/loaded.json" '.+$loaded[0]|unique_by(.tag)' "$TMP/nodes.json" > "$TMP/nodes.new"
+  mv "$TMP/nodes.new" "$TMP/nodes.json"
   echo '[]' > "$TMP/rules.json"
   for file in "$PACKS/"*.rules; do
     [ -f "$file" ] || continue
@@ -184,6 +198,8 @@ snapshot() (
   echo null > "$TMP/effective.json"
   echo null > "$TMP/selection.json"
   echo null > "$TMP/job.json"
+  echo null > "$TMP/connection.json"
+  [ ! -x /usr/bin/vpn-connection ] || /usr/bin/vpn-connection status > "$TMP/connection.json"
   echo '{"revision":"","items":[]}' > "$TMP/test-targets.json"
   if [ -x /usr/bin/vpn-node-tests ]; then /usr/bin/vpn-node-tests targets > "$TMP/test-targets.json"; fi
   [ ! -f "$BASE/profiles/update-job.json" ] || cp "$BASE/profiles/update-job.json" "$TMP/job.json"
@@ -206,8 +222,9 @@ snapshot() (
     --slurpfile selection "$TMP/selection.json" \
     --slurpfile job "$TMP/job.json" \
     --slurpfile targets "$TMP/test-targets.json" \
+    --slurpfile connection "$TMP/connection.json" \
     '{revision:$revision,data:$data[0],active:(if $active=="" then null else $active end),running:$running,managed:$managed,
-      effective:$effective[0],selection:$selection[0],updateJob:$job[0],testTargets:$targets[0],nodes:$nodes[0],rules:$rules[0]}'
+      effective:$effective[0],selection:$selection[0],connection:$connection[0],updateJob:$job[0],testTargets:$targets[0],nodes:$nodes[0],rules:$rules[0]}'
 )
 
 refresh_sources() {
@@ -326,8 +343,8 @@ build_profile() (
   }
   write_config "$mode"
   jq '[.outbounds[]|select(.type=="vless" or .type=="hysteria2")|.tag] as $nodes
-    | .outbounds |= (map(if .tag=="vpn-out" then .tag="profile-auto" else . end)
-      + [{type:"selector",tag:"vpn-out",outbounds:(["profile-auto"]+$nodes),default:"profile-auto",interrupt_exist_connections:false}])
+    | .outbounds |= (map(select(.type!="urltest" and .tag!="vpn-out"))
+      + [{type:"selector",tag:"vpn-out",outbounds:$nodes,default:$nodes[0],interrupt_exist_connections:false}])
     | .route.rules |= ([{action:"route",outbound:"direct",ip_cidr:["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10",
         "127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.168.0.0/16","224.0.0.0/4","255.255.255.255/32",
         "::1/128","fc00::/7","fe80::/10","ff00::/8"]}]+.)' \
@@ -473,6 +490,16 @@ case "${1:-snapshot}" in
       || error 'Selection was sent, but its state could not be confirmed; refresh status before retrying'
     jq -e -s --arg tag "$tag" 'length==1 and (.[0].proxies["vpn-out"].now==$tag)' "$TMP/selection-confirm.json" >/dev/null \
       || error 'sing-box did not confirm the requested selection; refresh status'
+    if jq -e 'any(.outbounds[]?;.tag=="vpn-out" and .type=="selector")' "$CONFIG" >/dev/null; then
+      old_hash=$(sha256sum "$CONFIG" | cut -d' ' -f1)
+      jq --arg tag "$tag" '(.outbounds[]|select(.tag=="vpn-out")).default=$tag' "$CONFIG" > "$CONFIG.new"
+      mv "$CONFIG.new" "$CONFIG"
+      if [ -s "$BASE/profiles/loaded-titles.json" ]; then
+        jq --arg old "$old_hash" --arg new "$(sha256sum "$CONFIG" | cut -d' ' -f1)" \
+          'if .config==$old then .config=$new else . end' "$BASE/profiles/loaded-titles.json" > "$BASE/profiles/loaded-titles.json.new"
+        mv "$BASE/profiles/loaded-titles.json.new" "$BASE/profiles/loaded-titles.json"
+      fi
+    fi
     if [ "$tag" = profile-auto ]; then
       echo 'Automatic selection enabled for loaded nodes; subscriptions were not updated and VPN was not restarted'
     else

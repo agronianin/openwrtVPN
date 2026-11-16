@@ -103,6 +103,7 @@ add_support_rules() {
 }
 
 vpn_on() {
+    [ ! -x /usr/bin/vpn-connection ] || rm -f /tmp/vpn-connection/off
     if [ -s /etc/sing-box/profiles/managed ] && [ ! -s /etc/sing-box/profiles/active ]; then
         log 'Select a VPN profile before enabling VPN'
         return 1
@@ -132,6 +133,7 @@ vpn_on() {
 }
 
 vpn_off() {
+    if [ -x /usr/bin/vpn-connection ]; then mkdir -p /tmp/vpn-connection; touch /tmp/vpn-connection/off; fi
     log "disabling VPN"
     set_baseline_dns
     /etc/init.d/sing-box disable >/dev/null 2>&1 || true

@@ -155,8 +155,13 @@ case "${1:-targets}" in
       cat "$file" >> "$JOB/all.nodes"
       [ ! -f "${file%.nodes}.titles" ] || cat "${file%.nodes}.titles" >> "$JOB/all.titles"
     done
+    if [ -s "$BASE/config.json" ]; then
+      jq '.outbounds//[]|map(select(.type=="vless" or .type=="hysteria2"))' "$BASE/config.json" > "$JOB/loaded.json" \
+        || fail 'Working configuration cannot be read'
+    else echo '[]' > "$JOB/loaded.json"; fi
     { printf '[\n'; sed '$s/,[[:space:]]*$//' "$JOB/all.nodes"; printf '\n]\n'; } > "$JOB/all.json"
-    jq --slurpfile request "$JOB/request.json" '. as $all | [$request[0].tags[] as $tag | $all[]|select(.tag==$tag)]' \
+    jq --slurpfile request "$JOB/request.json" --slurpfile loaded "$JOB/loaded.json" \
+      '(.+$loaded[0]|unique_by(.tag)) as $all | [$request[0].tags[] as $tag | $all[]|select(.tag==$tag)]' \
       "$JOB/all.json" > "$JOB/nodes.json"
     [ "$(jq length "$JOB/nodes.json")" = "$(jq '.tags|length' "$JOB/request.json")" ] || fail 'Node cache changed; refresh the node list'
     jq -e 'all(.[]; .type!="direct" and .type!="block" and .type!="selector" and .type!="urltest")' "$JOB/nodes.json" >/dev/null \
@@ -170,9 +175,10 @@ case "${1:-targets}" in
     jq -n --arg id "$id" --slurpfile request "$JOB/request.json" --slurpfile target "$JOB/target.json" \
       --argjson started "$(date +%s)" \
       '{id:$id,state:"running",phase:"https",started_at:$started,target:$target[0],speed:$request[0].speed,total:($request[0].tags|length),done:0,results:[]}' > "$JOB/job.json"
-    rm -f "$JOB/all.nodes" "$JOB/all.json" "$JOB/all.titles" "$JOB/titles.json"
+    rm -f "$JOB/all.nodes" "$JOB/all.json" "$JOB/all.titles" "$JOB/titles.json" "$JOB/loaded.json"
     # The child inherits the lock; all descriptors returned to CGI are closed before background work.
-    (trap '' HUP; VPN_TEST_WORKER=1 "$0" _worker "$id") </dev/null >"$JOB/worker.log" 2>&1 &
+    (trap '' HUP; export VPN_TEST_WORKER=1; exec "$0" _worker "$id") </dev/null >"$JOB/worker.log" 2>&1 &
+    echo "$!" > "$JOB/pid"
     trap - EXIT HUP INT TERM
     cat "$JOB/job.json"
     ;;
@@ -182,12 +188,20 @@ case "${1:-targets}" in
     if [ "$(jq -r .state "$ROOT/$2/job.json")" = running ]; then
       exec 9> "$ROOT/run.lock"
       if flock -n 9; then
-        jq '.state="failed" | .error="Проверка остановилась; повторите тест"' "$ROOT/$2/job.json"
+        jq 'if .state=="running" then .state="failed" | .error="Проверка остановилась; повторите тест" else . end' "$ROOT/$2/job.json"
         exit 0
       fi
     fi
     cat "$ROOT/$2/job.json"
     ;;
   _worker) valid_id "${2:-}" || fail 'Invalid test ID'; worker "$2" ;;
+  cancel)
+    valid_id "${2:-}" || fail 'Invalid test ID'
+    file="$ROOT/$2/pid"; [ -s "$file" ] || exit 0
+    pid=$(cat "$file"); case "$pid" in ''|*[!0-9]*) fail 'Invalid worker PID' ;; esac
+    if [ -r "/proc/$pid/cmdline" ] && tr '\000' '\n' < "/proc/$pid/cmdline" | grep -Fxq "$2"; then
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
+    ;;
   *) fail 'Usage: vpn-node-tests targets|targets-save REV|start|status ID' ;;
 esac

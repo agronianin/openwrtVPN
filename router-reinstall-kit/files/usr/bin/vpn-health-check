@@ -1,6 +1,14 @@
 #!/bin/sh
 set -eu
 
+if [ -s /etc/sing-box/profiles/managed ] && [ -x /usr/bin/vpn-connection ]; then
+  case "${1:-}" in
+    auto) exec /usr/bin/vpn-connection auto ;;
+    repair) exec /usr/bin/vpn-connection start find ;;
+    *) exec /usr/bin/vpn-connection start check ;;
+  esac
+fi
+
 SETTINGS_FILE=/etc/sing-box/vpn-config/vpn-settings.conf
 HEALTH_STATE=/tmp/vpn-health-auto.state
 CHECK_URL=https://www.google.com/generate_204
