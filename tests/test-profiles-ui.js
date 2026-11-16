@@ -88,10 +88,16 @@ function named(text, parent = root) {
 }
 async function click(text, parent) { const node = named(text, parent); assert.ok(!node.disabled, text); await node.fire('click'); }
 async function edit(node, value, type = 'input') { node.value = value; await node.fire(type); }
-function editor(id) {
-  const details = root.querySelectorAll('details').find(node => node.attributes['data-editor-id'] === id);
+function openDetails(details) {
   if (details && !details.open) { details.open = true; details.fire('toggle'); }
-  return root.querySelectorAll('fieldset').find(node => node.children.some(child => child.tagName === 'code' && child.textContent === id));
+  return details;
+}
+function editor(id) {
+  const details = openDetails(root.querySelectorAll('details').find(node => node.attributes['data-editor-id'] === id));
+  return details && details.querySelectorAll('fieldset')[0];
+}
+function disclosure(title, parent = root) {
+  return parent.querySelectorAll('details').find(node => node.children[0].textContent === title);
 }
 function group(title) { return root.querySelectorAll('fieldset').find(node => node.children[0].textContent === title); }
 function postedData() { return JSON.parse(requests.at(-1).fields.content); }
@@ -100,7 +106,15 @@ function nodeSearch() { return root.querySelectorAll('input').find(node => node.
 // Приоритеты не сортируются сами, идентификаторы стабильны, сохранение одного профиля отправляет его правки с исходной ревизией.
 async function testAtomicSaveAndOrdering() {
   boot(); await click('Профили');
-  editor('work');
+  const profile = editor('work');
+  const groups = disclosure('Группы и узлы', profile);
+  const rules = disclosure('Правила', profile);
+  assert.equal(groups.open, false);
+  assert.equal(rules.open, false);
+  openDetails(rules);
+  assert.equal(group('Группы узлов по приоритету'), undefined);
+  assert.ok(group('Правила по приоритету'));
+  openDetails(groups);
   assert.deepEqual(group('Группы узлов по приоритету').querySelectorAll('span').map(node => node.textContent), ['1. Second', '2. First']);
   await edit(editor('work').querySelectorAll('input')[0], 'Renamed');
   await click('Выше: First'); await click('Ниже: Direct');
@@ -141,8 +155,13 @@ async function testConnectionAndSearch() {
   assert.deepEqual(manual.children.map(node => node.value), ['', 'a', 'b', 'extra']);
   assert.equal(root.querySelectorAll('img').length, 0);
   await edit(manual, 'extra', 'change'); assert.equal(requests.at(-1).fields.arg, 'extra');
-  await edit(root.querySelectorAll('select')[0], 'off', 'change');
+  replies.push({ ok: true, snapshot: { ...initial, running: false, selection: null, effective: null } });
+  await click('Выключить VPN');
   assert.equal(requests.at(-1).fields.action, 'vpn_profiles_activate'); assert.equal(requests.at(-1).fields.arg, 'off');
+  assert.equal(root.querySelectorAll('select')[0].value, 'work');
+  await click('Включить VPN');
+  assert.equal(requests.at(-1).fields.action, 'vpn_profiles_on');
+  assert.ok(named('Выключить VPN'));
   await click('Узлы'); await edit(nodeSearch(), 'Node B');
   assert.equal(buttons().filter(node => node.textContent === 'Проверить узел').length, 1);
   replies.push({ ok: true, job: { ...probeJob('done', 1), total: 1 } }); await click('Проверить узел');
@@ -162,6 +181,7 @@ async function testCatalogCrud() {
   await edit(subscription.querySelectorAll('textarea')[0], 'https://z.example\nhttps://a.example');
   await click('Профили'); await click('Добавить профиль');
   const profile = editor('profile-1');
+  openDetails(disclosure('Группы и узлы', profile));
   const checks = profile.querySelectorAll('input').filter(node => node.type === 'checkbox');
   checks[0].checked = true; await checks[0].fire('change');
   await click('Сохранить профиль', profile);
@@ -187,6 +207,9 @@ async function testNodeNameAndLocalGroup() {
   boot(local); await click('Группы узлов');
   assert.ok(root.textContent.includes('First · Ручная группа'));
   assert.equal(editor('first').querySelectorAll('textarea').length, 0);
+  const heading = root.querySelectorAll('details').find(node => node.attributes['data-editor-id'] === 'first').children[0];
+  assert.equal(heading.textContent, 'First · Ручная группа');
+  assert.equal(heading.title, 'ID: first');
   const priority = group('Приоритет узлов внутри группы').querySelectorAll('input').find(node => node.type === 'checkbox');
   priority.checked = true; await priority.fire('change');
   await click('Сохранить группу', editor('first'));
@@ -230,7 +253,7 @@ async function testLargeCatalog() {
   large.data.profiles[0].nodes = ['node-599', 'node-598'];
   boot(large); assert.equal(buttons().some(node => node.textContent === 'Сохранить изменения'), false);
   await click('Профили'); assert.equal(root.querySelectorAll('input').length, 0);
-  editor('work');
+  openDetails(disclosure('Группы и узлы', editor('work')));
   const chooser = group('Дополнительные узлы по приоритету');
   let checks = chooser.querySelectorAll('input').filter(node => node.type === 'checkbox');
   assert.equal(checks.length, 32); assert.equal(checks.filter(node => node.checked).length, 2);

@@ -764,6 +764,34 @@ result_summary() {
   esac
 }
 
+modem_set_power() {
+  local desired="$1" power
+  power="$(ifstatus modem_mm 2>/dev/null | jq -r .autostart)"
+  case "$power:$desired" in
+    true:true|false:false) return 0 ;;
+    false:true) ifup modem_mm ;;
+    true:false) ifdown modem_mm ;;
+    *) echo 'Интерфейс мобильного интернета modem_mm недоступен.'; return 1 ;;
+  esac
+}
+
+render_modem_power() {
+  local power action label
+  power="$(printf '%s' "$1" | jq -r .autostart)"
+  case "$power" in
+    true) action=modem_off; label='Выключить модем' ;;
+    false) action=modem_on; label='Включить модем' ;;
+    *) echo '<p>Интерфейс мобильного интернета modem_mm недоступен.</p>'; return 0 ;;
+  esac
+  cat <<EOF
+  <form method="post" class="power-form" data-page-submit>
+    <input type="hidden" name="tab" value="modem">
+    <input type="hidden" name="action" value="$action">
+    <button type="submit" role="switch" aria-checked="$power" aria-label="Мобильный интернет">$label</button>
+  </form>
+EOF
+}
+
 render_modem_cards() {
   mstat="$(/usr/bin/modem-t77w968 status 2>&1)"
   mid="$(modem_id)"
@@ -805,6 +833,7 @@ render_modem_cards() {
     $( [ "$usb_config" = "1" ] && [ "$driver" = "qmi_wwan" ] && badge ok "QMI" || badge warn "проверь USB режим" )
     $( [ "$reg" = "registered" ] && badge ok "сеть зарегистрирована" || badge warn "сеть не подтверждена" )
   </div>
+  $( [ "$ACTIVE_TAB" != modem ] || render_modem_power "$ifjson" )
   <div class="status-grid">
 EOF
   item "USB режим" "config=$usb_config, driver=$driver" "Рабочий режим для этого роутера: config=1 и qmi_wwan."
@@ -955,6 +984,7 @@ case "$ACTION" in vpn_profiles_*)
       printf '%s\n' "$CONTENT" | /usr/bin/vpn-profiles node-import "$ARG" "$(url_decode "$(field revision)")" > "$output_file" 2>&1 ;;
     vpn_profiles_save) printf '%s' "$CONTENT" | /usr/bin/vpn-profiles save "$(url_decode "$(field revision)")" > "$output_file" 2>&1 ;;
     vpn_profiles_activate) /usr/bin/vpn-profiles activate "$ARG" > "$output_file" 2>&1 ;;
+    vpn_profiles_on) /usr/bin/vpnctl on > "$output_file" 2>&1 ;;
     vpn_profiles_node) /usr/bin/vpn-profiles node "$ARG" > "$output_file" 2>&1 ;;
     vpn_profiles_update) /usr/bin/vpn-profiles queue-update "$ARG" > "$output_file" 2>&1 ;;
     vpn_profiles_test) /usr/bin/vpn-profiles test "$ARG" > "$output_file" 2>&1 ;;
@@ -992,6 +1022,8 @@ CMD=""
 RC=0
 if [ -n "$ACTION" ]; then
   case "$ACTION" in
+    modem_on) CMD="ifup modem_mm"; OUTPUT="$(modem_set_power true 2>&1)" ;;
+    modem_off) CMD="ifdown modem_mm"; OUTPUT="$(modem_set_power false 2>&1)" ;;
     modem_status) CMD="/usr/bin/modem-t77w968 status
 mid=\$(mmcli -L | sed -n 's/.*\\/Modem\\/\\([0-9][0-9]*\\).*/\\1/p' | head -n 1)
 mmcli -m \"\$mid\"
@@ -1510,7 +1542,7 @@ cat <<'EOF'
   document.addEventListener('submit', function (event) {
     var form = event.target;
     if (!form.matches('form')) return;
-    if (form.closest('#vpn-app')) return;
+    if (form.closest('#vpn-app') || form.hasAttribute('data-page-submit')) return;
     var target = resultTarget(form);
     if (!target || !window.fetch || !window.FormData) return;
 
