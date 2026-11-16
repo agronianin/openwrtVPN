@@ -68,7 +68,9 @@ function boot(snapshot = initial) {
     clearTimeout: id => timers.delete(id),
     fetch: async (url, options) => {
       requests.push({ url, options, fields: Object.fromEntries(options.body) });
-      const reply = replies.shift() || { ok: true, snapshot: initial };
+      const fields = requests.at(-1).fields;
+      const saved = fields.action === 'vpn_profiles_save' ? { ...snapshot, data: JSON.parse(fields.content) } : initial;
+      const reply = replies.shift() || { ok: true, snapshot: saved };
       if (reply instanceof Error) throw reply;
       if (reply.hang) return new Promise(() => {});
       return { ok: reply.http === undefined, status: reply.http, statusText: 'Failure', json: async () => {
@@ -95,14 +97,14 @@ function group(title) { return root.querySelectorAll('fieldset').find(node => no
 function postedData() { return JSON.parse(requests.at(-1).fields.content); }
 function nodeSearch() { return root.querySelectorAll('input').find(node => node.type === 'search'); }
 
-// Приоритеты не сортируются сами, идентификаторы стабильны, сохранение отправляет весь документ с исходной ревизией.
+// Приоритеты не сортируются сами, идентификаторы стабильны, сохранение одного профиля отправляет его правки с исходной ревизией.
 async function testAtomicSaveAndOrdering() {
   boot(); await click('Профили');
   editor('work');
-  assert.deepEqual(group('Подписки по приоритету').querySelectorAll('span').map(node => node.textContent), ['1. Second', '2. First']);
+  assert.deepEqual(group('Группы узлов по приоритету').querySelectorAll('span').map(node => node.textContent), ['1. Second', '2. First']);
   await edit(editor('work').querySelectorAll('input')[0], 'Renamed');
   await click('Выше: First'); await click('Ниже: Direct');
-  await click('Сохранить изменения');
+  await click('Сохранить профиль');
   assert.equal(requests[0].url, '/cgi-bin/router-control');
   assert.equal(requests[0].options.method, 'POST');
   assert.equal(requests[0].fields.revision, 'revision-1');
@@ -119,10 +121,10 @@ async function testAtomicSaveAndOrdering() {
 async function testFailuresAndDiscard() {
   for (const reply of [{ ok: false, error: 'Revision conflict' }, { http: 503 }, new Error('Network unavailable')]) {
     boot(); await click('Профили'); await edit(editor('work').querySelectorAll('input')[0], 'Unsaved');
-    replies.push(reply); await click('Сохранить изменения');
+    replies.push(reply); await click('Сохранить профиль');
     assert.ok(root.textContent.includes(reply.error || (reply.http ? 'HTTP 503' : reply.message)));
     assert.equal(editor('work').querySelectorAll('input')[0].value, 'Unsaved');
-    assert.equal(named('Сохранить изменения').disabled, false);
+    assert.equal(named('Сохранить профиль').disabled, false);
     let prevented = false; unload({ preventDefault: () => { prevented = true; } }); assert.ok(prevented);
     await click('Статус'); confirmAnswer = false; await edit(root.querySelectorAll('select')[1], 'b', 'change');
     assert.equal(requests.length, 1);
@@ -153,7 +155,7 @@ async function testConnectionAndSearch() {
 
 // CRUD подписок и профилей сохраняет порядок зеркал и блокирует удаление используемого источника.
 async function testCatalogCrud() {
-  boot(); await click('Подписки'); await click('Удалить подписку', editor('first'));
+  boot(); await click('Группы узлов'); await click('Удалить подписку', editor('first'));
   assert.ok(root.textContent.includes('Подписка используется')); await click('Добавить подписку');
   const subscription = editor('source-1');
   await edit(subscription.querySelectorAll('input')[0], 'New source');
@@ -162,15 +164,38 @@ async function testCatalogCrud() {
   const profile = editor('profile-1');
   const checks = profile.querySelectorAll('input').filter(node => node.type === 'checkbox');
   checks[0].checked = true; await checks[0].fire('change');
-  await click('Сохранить изменения');
-  assert.deepEqual(postedData().subscriptions[2].urls, ['https://z.example', 'https://a.example']);
+  await click('Сохранить профиль', profile);
+  assert.deepEqual(postedData().subscriptions, initial.data.subscriptions);
   assert.equal(postedData().profiles[1].id, 'profile-1');
   assert.deepEqual(postedData().profiles[1].subscriptions, ['first']);
+  await click('Группы узлов');
+  assert.equal(editor('source-1').querySelectorAll('input')[0].value, 'New source');
+  await click('Сохранить подписку', editor('source-1'));
+  assert.deepEqual(postedData().subscriptions[2].urls, ['https://z.example', 'https://a.example']);
+  await click('Профили'); await click('Удалить профиль', editor('profile-1'));
   await click('Профили'); await click('Добавить профиль'); await click('Удалить профиль', editor('profile-1'));
   assert.equal(editor('profile-1'), undefined);
-  await click('Подписки'); await click('Добавить подписку'); await click('Удалить подписку', editor('source-1'));
-  assert.equal(editor('source-1'), undefined);
+  await click('Группы узлов'); await click('Добавить подписку'); await click('Удалить подписку', editor('source-2'));
+  assert.equal(editor('source-2'), undefined);
   await click('Обновить все'); assert.equal(requests.at(-1).fields.arg, 'all');
+}
+
+// Имя узла сохраняется по тегу, а локальный источник обозначается как ручная группа.
+async function testNodeNameAndLocalGroup() {
+  const local = JSON.parse(JSON.stringify(initial));
+  local.data.subscriptions[0].urls = ['file:///etc/sing-box/manual-subscriptions/test.txt'];
+  boot(local); await click('Группы узлов');
+  assert.ok(root.textContent.includes('First · Ручная группа'));
+  assert.equal(editor('first').querySelectorAll('textarea').length, 0);
+  const priority = group('Приоритет узлов внутри группы').querySelectorAll('input').find(node => node.type === 'checkbox');
+  priority.checked = true; await priority.fire('change');
+  await click('Сохранить группу', editor('first'));
+  assert.deepEqual(postedData().subscriptions[0].priority, ['a']);
+  await click('Узлы');
+  await edit(editor('b').querySelectorAll('input')[0], 'New node label');
+  await click('Сохранить узел', editor('b'));
+  assert.deepEqual(postedData().nodeNames, { b: 'New node label' });
+  assert.deepEqual(postedData().profiles, initial.data.profiles);
 }
 
 // Правила сохраняются отдельным действием, переживают переходы между разделами и не удаляются при наличии ссылок.
@@ -181,7 +206,7 @@ async function testRuleActions() {
   await click('Статус'); await click('Правила'); assert.equal(editor('05-proxy').querySelectorAll('textarea')[0].value, 'updated content');
   replies.push({ ok: false, error: 'Invalid rule' }); await click('Сохранить правило', editor('05-proxy'));
   assert.equal(requests.at(-1).fields.action, 'vpn_profiles_rule_save');
-  assert.equal(requests.at(-1).fields.arg, '05-proxy'); assert.equal(requests.at(-1).fields.content, 'updated content');
+  assert.equal(requests.at(-1).fields.arg, '05-proxy'); assert.equal(requests.at(-1).fields.content, '# profile-name: Proxy\nupdated content');
   assert.equal(requests.at(-1).fields.revision, 'sha-proxy');
   assert.equal(editor('05-proxy').querySelectorAll('textarea')[0].value, 'updated content');
   const fresh = root.querySelectorAll('fieldset').find(node => node.children[0].textContent === 'Новое правило');
@@ -234,7 +259,7 @@ async function testEffectiveAndRuleGuard() {
   confirmAnswer = false; await click('Сохранить правило', editor('05-proxy')); assert.equal(requests.length, 1);
   await edit(editor('05-proxy').querySelectorAll('textarea')[0], 'changed again');
   await edit(editor('20-direct').querySelectorAll('textarea')[0], 'another draft');
-  await click('Сохранить правило', editor('05-proxy')); assert.equal(requests.length, 1);
+  await click('Сохранить правило', editor('05-proxy')); assert.equal(requests.length, 2);
   assert.equal(editor('20-direct').querySelectorAll('textarea')[0].value, 'another draft');
 }
 
@@ -268,11 +293,11 @@ async function testUpdateJob() {
   for (const [state, text] of Object.entries(states)) {
     const snapshot = JSON.parse(JSON.stringify(initial));
     snapshot.updateJob = { state, message: '<test>job message</test>' };
-    boot(snapshot); await click('Подписки');
+    boot(snapshot); await click('Группы узлов');
     assert.ok(root.textContent.includes(text)); assert.ok(root.textContent.includes('<test>job message</test>'));
     assert.equal(root.querySelectorAll('test').length, 0);
   }
-  boot(); await click('Подписки');
+  boot(); await click('Группы узлов');
   const queued = JSON.parse(JSON.stringify(initial)); queued.updateJob = { state: 'queued' };
   replies.push({ ok: true, snapshot: queued, output: 'Обновление поставлено в очередь' });
   await click('Обновить все');
@@ -592,12 +617,12 @@ async function testTargetEditing() {
 }
 
 (async function () {
-  const tests = [testAtomicSaveAndOrdering, testFailuresAndDiscard, testConnectionAndSearch, testCatalogCrud, testRuleActions,
+  const tests = [testAtomicSaveAndOrdering, testFailuresAndDiscard, testConnectionAndSearch, testCatalogCrud, testNodeNameAndLocalGroup, testRuleActions,
     testLargeCatalog, testEffectiveAndRuleGuard, testImportAndRefresh, testUpdateJob, testLastCheck,
     testFilteredProbeAndProgress, testProbeErrorsAndSpeed, testTargetEditing, testSelectionFeedback,
     testConnectionDraftsAndNoCandidate, testConnectionErrorsAndCheck, testRecoverySettings, testConnectionSnapshotRace];
   for (const test of tests) await test();
   assert.ok(!source.includes('innerHTML'));
-  console.log('PASS: 18 profiles UI scenarios, including finite search, polling, recovery settings, stale checks and retained drafts');
+  console.log('PASS: profiles UI scenarios, including entity saves, local groups, aliases, polling and retained drafts');
   testMobileLayout();
 })().catch(error => { console.error(error); process.exitCode = 1; });

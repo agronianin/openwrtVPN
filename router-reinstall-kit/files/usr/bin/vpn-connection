@@ -128,16 +128,19 @@ collect_pool() {
   fi
   jq -Rn '[inputs]' < "$J/ru-tags" > "$J/ru.json"
   jq --slurpfile cache "$J/cached.json" --slurpfile profile "$J/profile.json" --slurpfile titles "$J/titles.json" \
-    --slurpfile ru "$J/ru.json" '
+    --slurpfile ru "$J/ru.json" --slurpfile catalog "$DB" '
+    ($catalog[0].subscriptions|map({key:.id,value:(.priority//[])})|from_entries) as $priorities |
     ([.outbounds[]|select(.type=="vless" or .type=="hysteria2")]+$cache[0])
     | unique_by(.tag) | map(. as $node | $profile[0] as $p |
-      ([$p.subscriptions|to_entries[]|. as $entry|select($node.tag|startswith($entry.value+"-"))|.key][0]) as $rank |
+      ($p.subscriptions|map(select(. as $id|$node.tag|startswith($id+"-")))|max_by(length)) as $source |
+      ($p.subscriptions|index($source)) as $rank |
       select($rank!=null or ($p.nodes|index($node.tag))!=null) |
-      {node:$node,title:($titles[0][.tag]//.tag),rank:($rank//($p.subscriptions|length)),
+      {node:$node,title:($catalog[0].nodeNames[.tag]//$titles[0][.tag]//.tag),rank:($rank//($p.subscriptions|length)),
+       priority:(if $source!=null then ($priorities[$source]|index($node.tag))//500 else ($p.nodes|index($node.tag)) end),
        country_rank:(if $p.preference=="any" then 0 elif ($titles[0]|has($node.tag)|not) then 1
          elif ($ru[0]|index($node.tag))!=null or ($titles[0][$node.tag]|contains("🇷🇺") or contains("Russia") or contains("Россия")) then
          (if $p.preference=="ru" then 0 else 1 end) else (if $p.preference=="non-ru" then 0 else 1 end) end)})
-    | sort_by(.rank,.country_rank,.node.tag)' "$J/data/config.json" > "$J/pool.json" || fail 'Не удалось собрать кандидатов профиля'
+    | sort_by(.rank,.priority,.country_rank,.node.tag)' "$J/data/config.json" > "$J/pool.json" || fail 'Не удалось собрать кандидатов профиля'
   if [ "$(jq -r .allow_reload "$J/settings.json")" = false ]; then
     jq --slurpfile config "$J/data/config.json" 'map(. as $entry|select(any($config[0].outbounds[];.tag==$entry.node.tag)))' \
       "$J/pool.json" > "$J/pool.new"; mv "$J/pool.new" "$J/pool.json"
@@ -149,7 +152,7 @@ collect_pool() {
 }
 search_pool() {
   collect_pool
-  jq '[group_by([.rank,.country_rank])[]|map(.node.tag)]' "$J/pool.json" > "$J/tiers.json"
+  jq '[group_by([.rank,.priority,.country_rank])[]|map(.node.tag)]' "$J/pool.json" > "$J/tiers.json"
   tier=0; tiers=$(jq length "$J/tiers.json"); : > "$J/results.jsonl"
   while [ "$tier" -lt "$tiers" ]; do
     count=$(jq --argjson n "$tier" '.[$n]|length' "$J/tiers.json"); offset=0

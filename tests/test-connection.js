@@ -190,6 +190,17 @@ async function test() {
   catalog.profiles[0].preference='ru';f.write('profiles/catalog.json',catalog);result=await start(f,'find');
   assert.equal(result.job.selected.tag,'src-slow');
   const tested=fs.readFileSync(path.join(f.root,'tested'),'utf8');assert.ok(!tested.includes('src-fast'));
+  // Ручной порядок внутри группы важнее страны и задержки, при отказе проверяется следующий узел.
+  f=setup('node-priority'); catalog=JSON.parse(fs.readFileSync(path.join(f.root,'profiles/catalog.json')));
+  catalog.profiles[0].preference='ru';
+  catalog.subscriptions[0].priority=['src-old','src-fast'];
+  catalog.nodeNames={'src-fast':'Personal name'};
+  f.write('profiles/catalog.json',catalog);
+  f.write('results.json', {'src-old':{passed:0,latency:500},'src-fast':{passed:2,latency:50},'src-slow':{passed:2,latency:200}});
+  result=await start(f,'find');
+  assert.equal(result.job.selected.tag,'src-fast');
+  assert.equal(result.job.selected.title,'Personal name');
+  assert.deepEqual(fs.readFileSync(path.join(f.root,'tested'),'utf8').trim().split('\n').map(line=>JSON.parse(line)),[['src-old'],['src-fast']]);
   // Параллельное изменение профиля или выключение VPN отменяет применение уже найденного кандидата.
   for(const flag of ['TEST_CONTEXT_CHANGE','TEST_OFF_DURING_SEARCH']) {
     f=setup(flag);f.env[flag]='1';const initial=fs.readFileSync(path.join(f.root,'config.json'),'utf8');

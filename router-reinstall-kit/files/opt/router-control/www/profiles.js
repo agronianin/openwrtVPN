@@ -33,7 +33,6 @@
   }
   function dirty() { return JSON.stringify(data) !== baseline || drafts.size > 0; }
   function changed() {
-    save.disabled = busy || connectionWorking() || JSON.stringify(data) === baseline;
     saveState.textContent = dirty() ? 'Есть несохраненные изменения' : 'Сохранено';
   }
   function button(text, action, title) {
@@ -288,8 +287,23 @@
       if (!response.ok) throw new Error(httpError + (payload.error ? ': ' + payload.error : ''));
       if (!payload.ok) throw new Error(payload.error || 'Операция отклонена сервером');
       if (!payload.snapshot || !payload.snapshot.data) throw new Error('В ответе сервера отсутствуют данные VPN');
+      var previous = JSON.parse(baseline), working = data;
       snapshot = payload.snapshot;
-      data = JSON.parse(JSON.stringify(snapshot.data)); baseline = JSON.stringify(data); drafts.clear();
+      data = JSON.parse(JSON.stringify(snapshot.data)); baseline = JSON.stringify(data);
+      if (saving) {
+        ['profiles', 'subscriptions'].forEach(function (collection) {
+          working[collection].forEach(function (item) {
+            if (saving.collection === collection && saving.id === item.id) return;
+            var old = previous[collection].find(function (entry) { return entry.id === item.id; });
+            if (JSON.stringify(old) !== JSON.stringify(item)) {
+              var index = data[collection].findIndex(function (entry) { return entry.id === item.id; });
+              if (index < 0) data[collection].push(item);
+              else data[collection][index] = item;
+            }
+          });
+        });
+        (savedDrafts || []).forEach(function (key) { drafts.delete(key); });
+      } else drafts.clear();
       render();
       var output = String(payload.output);
       if (action === 'vpn_profiles_node') output = selectionOutput(arg);
@@ -310,8 +324,30 @@
       updateConnection(); scheduleConnection();
     }
   }
+  function saveEntity(collection, item, target, remove) {
+    var catalog = JSON.parse(baseline);
+    var index = catalog[collection].findIndex(function (entry) { return entry.id === item.id; });
+    if (remove) {
+      if (index < 0) { data[collection] = data[collection].filter(function (entry) { return entry !== item; }); render(); return; }
+      catalog[collection].splice(index, 1);
+    } else {
+      if (!item.name.trim()) { fail(target, 'Укажите название.'); return; }
+      if (collection === 'subscriptions' && !item.urls.length) { fail(target, 'Добавьте адрес зеркала.'); return; }
+      if (index < 0) catalog[collection].push(item); else catalog[collection][index] = item;
+    }
+    return request('vpn_profiles_save', undefined, target, { revision: snapshot.revision, content: JSON.stringify(catalog) },
+      { collection: collection, id: item.id });
+  }
+  function groupName(id) {
+    var group = data.subscriptions.find(function (item) { return item.id === id; });
+    return group ? group.name : (id === 'loaded' ? 'Загружены из прежней конфигурации' : id);
+  }
+  function nodeLabel(node) { return (node.title || node.tag) + ' · ' + groupName(node.subscription); }
+  function localGroup(group) {
+    return group.urls.length > 0 && group.urls.every(function (url) { return url.startsWith('file:///etc/sing-box/manual-subscriptions/'); });
+  }
   // Preserve the stored order; catalog order only determines where unchecked items appear.
-  function ordered(parent, title, selected, items, searchable) {
+  function ordered(parent, title, selected, items, searchable, onEdit) {
     var group = el('fieldset', undefined, 'vp-ordered'); group.append(el('legend', title)); parent.append(group);
     var query = '', lookup = new Map(items);
     if (searchable) {
@@ -334,6 +370,7 @@
         var check = el('input'); check.type = 'checkbox'; check.checked = index !== -1;
         check.addEventListener('change', function () {
           if (check.checked) selected.push(id); else selected.splice(selected.indexOf(id), 1);
+          if (onEdit) onEdit();
           changed(); draw();
         });
         var label = el('label'); label.append(check, el('span', (index < 0 ? '' : (index + 1) + '. ') + (item ? item[1] : id + ' (недоступен)')));
@@ -342,6 +379,7 @@
           var move = button(offset < 0 ? '\u2191' : '\u2193', function () {
             var other = index + offset;
             selected[index] = selected[other]; selected[other] = id;
+            if (onEdit) onEdit();
             changed(); draw();
           }, (offset < 0 ? 'Выше: ' : 'Ниже: ') + (item ? item[1] : id));
           move.disabled = index < 0 || index + offset < 0 || index + offset >= selected.length;
@@ -420,7 +458,7 @@
     var stop = button('Выключить VPN', function () { request('vpn_profiles_activate', 'off', target); },
       'Останавливает VPN и возвращает обычный интернет. Идущий подбор будет отменён без последующего переключения.');
     area.append(stop);
-    var options = [['', 'Выберите узел']].concat(allowedNodes(current).map(function (node) { return [node.tag, node.title || node.tag]; }));
+    var options = [['', 'Выберите узел']].concat(allowedNodes(current).map(function (node) { return [node.tag, nodeLabel(node)]; }));
     var manual = connectionControl(field(area, 'Узел вручную', select(options, '', async function (tag) {
       if (tag) await request('vpn_profiles_node', tag, target);
       manual.value = '';
@@ -535,12 +573,18 @@
     data.profiles.forEach(function (profile) {
       compactEditor(area, profile.name, profile.id, 'profile', function (group) {
       field(group, 'Название профиля', input(profile.name, function (value) { profile.name = value; }));
-      ordered(group, 'Подписки по приоритету', profile.subscriptions, data.subscriptions.map(function (item) { return [item.id, item.name]; }));
+      var savedGroups = new Set(snapshot.data.subscriptions.map(function (item) { return item.id; }));
+      ordered(group, 'Группы узлов по приоритету', profile.subscriptions, data.subscriptions.filter(function (item) {
+        return savedGroups.has(item.id);
+      }).map(function (item) { return [item.id, item.name]; }));
+      group.append(el('p', 'Выбранная группа включает все её узлы. Дополнительные узлы можно выбрать отдельно, по названию и группе.'));
       ordered(
         group,
         'Дополнительные узлы по приоритету',
         profile.nodes,
-        snapshot.nodes.map(function (item) { return [item.tag, item.title || item.tag]; }),
+        snapshot.nodes.filter(function (item) {
+          return item.subscription !== 'loaded' || profile.nodes.includes(item.tag);
+        }).map(function (item) { return [item.tag, nodeLabel(item)]; }),
         true
       );
       ordered(group, 'Правила по приоритету', profile.rules, snapshot.rules.map(function (item) { return [item.id, item.name || item.id]; }));
@@ -550,14 +594,17 @@
       field(group, 'Предпочтение страны', select([['ru', 'Россия'], ['non-ru', 'Не Россия'], ['any', 'Любая']], profile.preference, function (value) {
         profile.preference = value; changed();
       }));
-      group.append(button('Удалить профиль', function () {
-        if (window.confirm('Удалить профиль «' + profile.name + '»?')) { data.profiles.splice(data.profiles.indexOf(profile), 1); render(); }
-      }));
+      var output = result(group);
+      group.append(command('Сохранить профиль', function () { return saveEntity('profiles', profile, output); }),
+        command('Удалить профиль', function () {
+          if (window.confirm('Удалить профиль «' + profile.name + '»?')) return saveEntity('profiles', profile, output, true);
+        }));
       });
     });
   }
   function subscriptions() {
-    var area = section('Подписки'), target = result(area);
+    var area = section('Группы узлов'), target = result(area);
+    area.append(el('p', 'Группа получает узлы из подписки или содержит узлы, добавленные вручную. Зеркала одной подписки проверяются по порядку.'));
     if (snapshot.updateJob) {
       var job = snapshot.updateJob;
       var states = {
@@ -575,12 +622,21 @@
       data.subscriptions.push({ id: id, name: 'Новая подписка', urls: [] }); render();
     }), command('Обновить все', function () { request('vpn_profiles_update', 'all', target); }));
     data.subscriptions.forEach(function (subscription) {
-      compactEditor(area, subscription.name, subscription.id, 'source', function (group) {
-      field(group, 'Название подписки', input(subscription.name, function (value) { subscription.name = value; }));
-      field(group, 'Зеркала по приоритету', input(subscription.urls.join('\n'), function (value) {
+      var local = localGroup(subscription);
+      var heading = subscription.name + (local ? ' · Ручная группа' : ' · Подписка');
+      compactEditor(area, heading, subscription.id, 'source', function (group) {
+      field(group, 'Название группы', input(subscription.name, function (value) { subscription.name = value; }));
+      if (!local) field(group, 'Зеркала по приоритету', input(subscription.urls.join('\n'), function (value) {
         subscription.urls = value.split(/\r?\n/).map(function (url) { return url.trim(); }).filter(Boolean);
       }, true));
+      var priority = subscription.priority || [];
+      ordered(group, 'Приоритет узлов внутри группы', priority, snapshot.nodes.filter(function (node) {
+        return node.subscription === subscription.id;
+      }).map(function (node) { return [node.tag, node.title || node.tag]; }), true, function () { subscription.priority = priority; });
       var output = result(group);
+      group.append(command(local ? 'Сохранить группу' : 'Сохранить подписку', function () {
+        return saveEntity('subscriptions', subscription, output);
+      }));
       group.append(command('Обновить', function () { request('vpn_profiles_update', subscription.id, output); }));
       group.append(button('Удалить подписку', function () {
         var nodeTags = snapshot.nodes.filter(function (node) { return node.subscription === subscription.id; }).map(function (node) { return node.tag; });
@@ -590,7 +646,7 @@
           fail(output, 'Подписка используется в профилях. Сначала уберите ее из профилей.'); return;
         }
         if (window.confirm('Удалить подписку «' + subscription.name + '»?')) {
-          data.subscriptions.splice(data.subscriptions.indexOf(subscription), 1); render();
+          return saveEntity('subscriptions', subscription, output, true);
         }
       }));
       });
@@ -609,6 +665,10 @@
         id = value; drafts.set('__new_id', value); if (!value) drafts.delete('__new_id');
       }));
       var key = fresh ? '__new_content' : rule.id;
+      var nameKey = 'rule-name:' + (fresh ? 'new' : rule.id);
+      var name = field(group, 'Название правила', input(drafts.get(nameKey) ?? rule.name ?? '', function (value) {
+        if (value === (rule.name || '')) drafts.delete(nameKey); else drafts.set(nameKey, value);
+      }));
       var content = field(group, 'Содержимое правила', input(drafts.has(key) ? drafts.get(key) : rule.content, function (value) {
         if (value === rule.content) drafts.delete(key); else drafts.set(key, value);
       }, true));
@@ -616,20 +676,23 @@
       group.append(command('Сохранить правило', function () {
         if (!/^[a-z0-9][a-z0-9_-]*$/.test(id)) { fail(output, 'ID: строчные латинские буквы, цифры, дефис и подчеркивание.'); return; }
         if (fresh && snapshot.rules.some(function (item) { return item.id === id; })) { fail(output, 'Такой ID уже существует.'); return; }
-        request(
+        var title = name.value.trim() || id;
+        if (title.length > 160 || /[\x00-\x1f\x7f]/.test(title)) { fail(output, 'Название должно быть одной строкой до 160 символов.'); return; }
+        var body = title === id ? content.value : '# profile-name: ' + title + '\n' + content.value;
+        return request(
           'vpn_profiles_rule_save',
           id,
           output,
-          { revision: fresh ? 'new' : rule.revision, content: content.value },
-          false,
-          fresh ? ['__new_id', '__new_content'] : [key]
+          { revision: fresh ? 'new' : rule.revision, content: body },
+          true,
+          fresh ? ['__new_id', '__new_content', nameKey] : [key, nameKey]
         );
       }));
       if (!fresh) group.append(command('Удалить правило', function () {
         var referenced = data.profiles.concat(snapshot.data.profiles).some(function (profile) { return profile.rules.includes(id); });
         if (referenced) { fail(output, 'Правило используется в профилях. Сначала уберите его из профилей и сохраните.'); return; }
         if (window.confirm('Удалить правило «' + id + '»?')) {
-          request('vpn_profiles_rule_delete', id, output, { revision: rule.revision });
+          request('vpn_profiles_rule_delete', id, output, { revision: rule.revision }, true, [key, nameKey]);
         }
       }));
     }
@@ -639,6 +702,7 @@
   function nodes() {
     var area = section('Узлы'), query = '', sourceId = '', page = 0;
     var importer = editor(area, 'Добавить узел', '');
+    importer.append(el('p', 'Для узла будет создана ручная группа. Её можно добавить в профиль целиком.'));
     var nodeName = field(importer, 'Название узла', input(drafts.get('__node_name') || '', function (value) {
       if (value) drafts.set('__node_name', value); else drafts.delete('__node_name');
     }));
@@ -657,13 +721,13 @@
         nodeName.value.trim(),
         importResult,
         { content: uri.value.trim(), revision: snapshot.revision },
-        false,
+        true,
         ['__node_name', '__node_uri']
       );
     }));
     var search = field(area, 'Поиск узлов', input('', function (value) { query = value.toLocaleLowerCase(); page = 0; draw(); }));
     search.type = 'search';
-    field(area, 'Подписка', select([['', 'Все подписки']].concat(data.subscriptions.map(function (item) {
+    field(area, 'Группа', select([['', 'Все группы']].concat(data.subscriptions.map(function (item) {
       return [item.id, item.name];
     })), '', function (value) { sourceId = value; page = 0; draw(); }));
     var tests = el('div', undefined, 'vp-tests'); area.append(tests);
@@ -795,8 +859,23 @@
       if (!matches.length) list.append(el('p', 'Узлы не найдены'));
       matches.slice(page * 30, (page + 1) * 30).forEach(function (node) {
         var row = el('div', undefined, 'vp-node');
-        row.append(el('strong', node.title || node.tag), el('p', node.type + ' · ' + node.subscription), el('code', node.tag));
+        row.append(el('strong', node.title || node.tag), el('p', node.type + ' · ' + groupName(node.subscription)));
         row.append(button('Проверить узел', function () { return startProbe([node.tag], false, 1); })); list.append(row);
+        compactEditor(row, 'Переименовать узел', node.tag, 'node', function (group) {
+          var key = 'node-name:' + node.tag;
+          var name = field(group, 'Название узла', input(drafts.get(key) ?? node.title ?? node.tag, function (value) {
+            if (value === (node.title || node.tag)) drafts.delete(key); else drafts.set(key, value);
+          }));
+          var output = result(group);
+          group.append(command('Сохранить узел', function () {
+            var title = name.value.trim();
+            if (!title || title.length > 160) { fail(output, 'Укажите название до 160 символов.'); return; }
+            var catalog = JSON.parse(baseline);
+            catalog.nodeNames = Object.assign(Object.create(null), catalog.nodeNames);
+            catalog.nodeNames[node.tag] = title;
+            return request('vpn_profiles_save', undefined, output, { revision: snapshot.revision, content: JSON.stringify(catalog) }, true, [key]);
+          }));
+        });
       });
       pages.replaceChildren();
       if (matches.length > 30) {
@@ -808,7 +887,7 @@
     }
     draw();
   }
-  var save, saveState, notice, panel;
+  var saveState, notice, panel;
   function render() {
     drawProbe = null; drawConnection = null; connectionControls = [];
     root.replaceChildren();
@@ -816,7 +895,7 @@
     [
       ['VPN', 'Статус', 'Текущее подключение, последняя проверка, разовый поиск узла и автовосстановление.'],
       ['Profiles', 'Профили', 'Состав профилей: подписки, узлы, правила и приоритеты. Сохранение не применяет профиль автоматически.'],
-      ['Subscriptions', 'Подписки', 'Редактирование источников и обновление кэша узлов без разрыва текущего подключения.'],
+      ['Subscriptions', 'Группы узлов', 'Редактирование источников и обновление кэша узлов без разрыва текущего подключения.'],
       ['Rules', 'Правила', 'Редактирование наборов маршрутизации. Для применения сохранённых изменений нужно применить профиль.'],
       ['Nodes', 'Узлы', 'Поиск, независимые HTTPS-тесты и замер скорости. Тесты не переключают текущий узел.']
     ].forEach(function (item) {
@@ -828,14 +907,7 @@
     refresh.setAttribute('aria-label', 'Обновить состояние'); nav.append(refresh);
     root.append(nav);
     var toolbar = el('div', undefined, 'vp-save');
-    save = button('Сохранить изменения', function () {
-      var invalid = data.profiles.concat(data.subscriptions).some(function (item) { return !item.name.trim(); });
-      if (invalid) { fail(notice, 'Укажите название каждого профиля и подписки.'); return; }
-      if (data.subscriptions.some(function (item) { return !item.urls.length; })) { fail(notice, 'Добавьте адрес зеркала каждой подписки.'); return; }
-      if (drafts.size && !window.confirm('Другие несохранённые черновики будут потеряны. Сохранить профили и подписки?')) return;
-      request('vpn_profiles_save', undefined, notice, { revision: snapshot.revision, content: JSON.stringify(data) }, true);
-    });
-    saveState = el('span'); toolbar.append(save, saveState);
+    saveState = el('span'); toolbar.append(saveState);
     if (view !== 'VPN') root.append(toolbar);
     notice = result(root); panel = el('div'); root.append(panel);
     ({ VPN: vpn, Profiles: profiles, Subscriptions: subscriptions, Rules: rules, Nodes: nodes })[view]();
