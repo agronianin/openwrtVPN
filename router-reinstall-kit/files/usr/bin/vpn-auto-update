@@ -48,9 +48,11 @@ if [ "$age" -lt "$interval_seconds" ]; then
 fi
 
 updater=/usr/bin/vpn-subscriptions-update
-[ ! -f /etc/sing-box/profiles/catalog.json ] || updater=/usr/bin/vpn-profiles
 action=refresh
-[ "$updater" != /usr/bin/vpn-profiles ] || action=update
+if [ -s /etc/sing-box/profiles/managed ] && [ -f /etc/sing-box/profiles/catalog.json ]; then
+  updater=/usr/bin/vpn-profiles
+  action=update
+fi
 rc=0
 "$updater" "$action" || rc=$?
 # A partial failure must not turn the configured hourly schedule into a once-per-minute retry loop.

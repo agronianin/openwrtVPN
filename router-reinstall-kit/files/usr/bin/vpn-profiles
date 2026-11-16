@@ -21,7 +21,9 @@ readonly=0
 [ "${1:-snapshot}" != snapshot ] || [ ! -f "$DB" ] || readonly=1
 if [ "${VPN_PROFILES_LOCKED:-0}" != 1 ] && [ "$readonly" != 1 ]; then
   lock=/tmp/vpn-subscriptions.lock
-  case "${1:-}" in update|update-queued|import-cache) lock=/tmp/vpn-profiles-update.lock ;; esac
+  if [ -f "$DB" ]; then
+    case "${1:-}" in update|update-queued|import-cache) lock=/tmp/vpn-profiles-update.lock ;; esac
+  fi
   exec flock -n -E 75 "$lock" env VPN_PROFILES_LOCKED=1 "$0" "$@"
 fi
 
@@ -60,67 +62,22 @@ stable_cache() (
   for ext in nodes tags titles; do mv "$TMP/new.$ext" "$STORE/$source_id.$ext"; done
 )
 
-import_legacy_cache() (
-  id="$1"; name="$2"; mode="$3"; urls_file="$4"
-  chosen=''
-  for metadata in "$BASE/subscriptions-cache/$(lower "$mode")-"*.url; do
-    [ -f "$metadata" ] || continue
-    url=$(cat "$metadata")
-    if jq -e --arg url "$url" 'index($url)!=null' "$urls_file" >/dev/null; then chosen="${metadata%.url}"; break; fi
-  done
-  if [ -z "$chosen" ]; then
-    for metadata in "$BASE/subscriptions-cache/$(lower "$mode")-"*.name; do
-      [ -f "$metadata" ] || continue
-      [ "$(cat "$metadata")" != "$name" ] || { chosen="${metadata%.name}"; break; }
-    done
-  fi
-  [ -n "$chosen" ] && [ -s "$chosen.nodes" ] || return 1
-  for ext in nodes tags titles preferred count; do
-    [ ! -f "$chosen.$ext" ] || cp "$chosen.$ext" "$STORE/$id.$ext"
-  done
-  [ -e "$STORE/$id.preferred" ] || : > "$STORE/$id.preferred"
-  [ -e "$STORE/$id.titles" ] || : > "$STORE/$id.titles"
-  stable_cache "$id" || exit 1
-)
-
-migrate() (
+init_catalog() (
   [ ! -f "$DB" ] || exit 0
-  echo '[]' > "$TMP/sources.json"
-  echo '[]' > "$TMP/profiles.json"
   for mode in BLACK WHITE; do
-    SUB_DIR="$BASE/subscriptions.d"
-    index=0
-    subscription_group_lines "$mode" > "$TMP/legacy-lines"
-    : > "$TMP/ids"
-    while IFS= read -r entry; do
-      index=$((index+1))
-      old=$(printf '%s-%02d' "$(lower "$mode")" "$index")
-      id="source-$old"
-      set -- $entry; name="$1"; shift
-      printf '%s\n' "$id" >> "$TMP/ids"
-      printf '%s\n' "$@" | jq -R . | jq -s . > "$TMP/urls.json"
-      jq --arg id "$id" --arg name "$name" --slurpfile urls "$TMP/urls.json" \
-        '. + [{id:$id,name:$name,urls:$urls[0]}]' "$TMP/sources.json" > "$TMP/next.json"
-      mv "$TMP/next.json" "$TMP/sources.json"
-      import_legacy_cache "$id" "$name" "$mode" "$TMP/urls.json" || true
-    done < "$TMP/legacy-lines"
-    cat "$TMP/ids" | jq -R . | jq -s . > "$TMP/ids.json"
-    if [ "$mode" = BLACK ]; then final=direct; preference=non-ru; else final=vpn-out; preference=ru; fi
-    printf '%s\n' 00-private-direct 05-force-proxy 06-force-direct 10-subscription-proxy 20-jet-direct 30-black-main \
-      | while IFS= read -r rule; do [ ! -f "$PACKS/$rule.rules" ] || echo "$rule"; done > "$TMP/rules"
-    if [ "$mode" = WHITE ]; then
-      printf '%s\n' 00-private-direct 05-force-proxy 06-force-direct 10-subscription-proxy 20-jet-proxy 25-white-direct 30-white-main \
-        | while IFS= read -r rule; do [ ! -f "$PACKS/$rule.rules" ] || echo "$rule"; done > "$TMP/rules"
+    set -- 00-private-direct 05-force-proxy 06-force-direct 10-subscription-proxy
+    if [ "$mode" = BLACK ]; then
+      final=direct; preference=non-ru
+      set -- "$@" 20-jet-direct 30-black-main
+    else
+      final=vpn-out; preference=ru
+      set -- "$@" 20-jet-proxy 25-white-direct 30-white-main
     fi
-    jq -Rn '[inputs]' < "$TMP/rules" > "$TMP/rules.json"
-    jq --arg id "$(lower "$mode")" --arg name "$mode" --arg final "$final" --arg preference "$preference" \
-      --slurpfile subs "$TMP/ids.json" --slurpfile rules "$TMP/rules.json" \
-      '. + [{id:$id,name:$name,subscriptions:$subs[0],nodes:[],rules:$rules[0],final:$final,preference:$preference}]' \
-      "$TMP/profiles.json" > "$TMP/next.json"
-    mv "$TMP/next.json" "$TMP/profiles.json"
-  done
-  jq -n --slurpfile subscriptions "$TMP/sources.json" --slurpfile profiles "$TMP/profiles.json" \
-    '{version:1,subscriptions:$subscriptions[0],profiles:$profiles[0]}' > "$DB.new"
+    for rule in "$@"; do [ ! -f "$PACKS/$rule.rules" ] || echo "$rule"; done > "$TMP/rules"
+    jq -Rnc --arg id "$(lower "$mode")" --arg name "$mode" --arg final "$final" --arg preference "$preference" \
+      '{id:$id,name:$name,subscriptions:[],nodes:[],rules:[inputs],final:$final,preference:$preference}' < "$TMP/rules"
+  done > "$TMP/profiles.json"
+  jq -s '{version:1,subscriptions:[],profiles:.}' "$TMP/profiles.json" > "$DB.new"
   mv "$DB.new" "$DB"
 )
 
@@ -385,19 +342,8 @@ build_profile() (
   rm -f "$rollback_config"
 )
 
-migrate
+init_catalog
 case "${1:-snapshot}" in
-  migrate) ;;
-  migrate-cache)
-    jq -r '.subscriptions[]|[.id,.name]|@tsv' "$DB" | while IFS="$(printf '\t')" read -r id name; do
-      case "$id" in source-black-*) mode=BLACK ;; source-white-*) mode=WHITE ;; *) continue ;; esac
-      jq --arg id "$id" '.subscriptions[]|select(.id==$id)|.urls' "$DB" > "$TMP/urls.json"
-      if ! import_legacy_cache "$id" "$name" "$mode" "$TMP/urls.json"; then
-        mkdir -p "$BASE/profiles/unverified"
-        for file in "$STORE/$id."*; do [ ! -f "$file" ] || mv "$file" "$BASE/profiles/unverified/"; done
-      fi
-    done
-    ;;
   snapshot) snapshot ;;
   save)
     [ "${2:-}" = "$(revision)" ] || error 'Catalog changed; reload before saving'

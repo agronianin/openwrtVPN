@@ -1,5 +1,5 @@
 'use strict';
-// Проверяем миграцию, CRUD профилей и сохранение рабочего config при редактировании каталога.
+// Проверяем создание каталога, CRUD профилей и сохранение рабочего config при редактировании.
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
@@ -30,27 +30,25 @@ try {
   write('subscriptions.d/white.txt', '[test-white]\nhttps://example.net/subscription\n');
   write('config.json', '{"old":"working-config"}');
   write('rule-packs/available/00-private-direct.rules', 'rule local\noutbound direct\nip_cidr 10.0.0.0/8\n');
-  // После перестановки подписок исходный кэш может иметь другой номер: сопоставляем по URL, не позиции.
+  // При первом открытии старые подписки и узлы не попадают в новый каталог.
   write('subscriptions-cache/black-09.nodes', '{"tag":"black-09-001","type":"vless","server":"example.com","server_port":443},\n');
-  write('subscriptions-cache/black-09.tags', 'black-09-001\n');
-  write('subscriptions-cache/black-09.titles', 'black-09-001\tTest title\n');
-  write('subscriptions-cache/black-09.preferred', '');
-  write('subscriptions-cache/black-09.count', '1\n');
   write('subscriptions-cache/black-09.url', 'https://example.com/subscription\n');
   const initial = snapshot();
-  assert.equal(initial.data.profiles.length, 2);
-  assert.equal(initial.data.subscriptions.length, 2);
-  assert.equal(initial.nodes[0].title, 'Test title');
-  assert.match(initial.nodes[0].tag, /^source-black-01-[a-f0-9]{24}$/);
+  assert.deepEqual(initial.data.profiles.map(profile => profile.id), ['black', 'white']);
+  assert.ok(initial.data.profiles.every(profile => profile.subscriptions.length === 0));
+  assert.deepEqual(initial.data.subscriptions, []);
+  assert.deepEqual(initial.nodes, []);
   const data = initial.data;
-  data.profiles.push({id: 'third-place', name: 'Третье место', subscriptions: ['source-black-01'], nodes: [], rules: [], final: 'vpn-out', preference: 'any'});
+  data.subscriptions.push({id: 'test-source', name: 'Test source', urls: ['https://example.com/subscription']});
+  data.profiles[0].subscriptions.push('test-source');
+  data.profiles.push({id: 'third-place', name: 'Третье место', subscriptions: ['test-source'], nodes: [], rules: [], final: 'vpn-out', preference: 'any'});
   assert.equal(run(['save', initial.revision], JSON.stringify(data)).status, 0);
   const next = snapshot();
   assert.equal(next.data.profiles.length, 3);
   assert.equal(run(['save', initial.revision], JSON.stringify(data)).status, 1);
   data.profiles[2].subscriptions = ['missing'];
   assert.equal(run(['save', next.revision], JSON.stringify(data)).status, 1);
-  data.profiles[2].subscriptions = ['source-black-01'];
+  data.profiles[2].subscriptions = ['test-source'];
   data.profiles[2].rules = ['../../etc/shadow'];
   assert.equal(run(['save', next.revision], JSON.stringify(data)).status, 1);
   assert.equal(run(['rule-save', '../../bad'], 'bad').status, 1);
@@ -71,12 +69,13 @@ try {
   const importedFile = path.join(work, 'subscription.txt');
   fs.writeFileSync(importedFile, Buffer.from(uri).toString('base64'));
   const catalogBefore = fs.readFileSync(path.join(root, 'profiles/catalog.json'), 'utf8');
-  const cacheImport = run(['import-cache', 'source-black-01', importedFile]);
+  const cacheImport = run(['import-cache', 'test-source', importedFile]);
   assert.equal(cacheImport.status, 0, cacheImport.stderr);
-  const nodesFile = path.join(root, 'profiles/cache/source-black-01.nodes');
+  const nodesFile = path.join(root, 'profiles/cache/test-source.nodes');
   const nodesBefore = fs.readFileSync(nodesFile, 'utf8');
+  assert.match(snapshot().nodes.find(node => node.subscription === 'test-source').tag, /^test-source-[a-f0-9]{24}$/);
   fs.writeFileSync(importedFile, 'invalid data');
-  assert.equal(run(['import-cache', 'source-black-01', importedFile]).status, 1);
+  assert.equal(run(['import-cache', 'test-source', importedFile]).status, 1);
   assert.equal(fs.readFileSync(nodesFile, 'utf8'), nodesBefore);
   assert.equal(fs.readFileSync(path.join(root, 'profiles/catalog.json'), 'utf8'), catalogBefore);
   assert.equal(fs.readFileSync(path.join(root, 'config.json'), 'utf8'), '{"old":"working-config"}');
@@ -139,5 +138,5 @@ if(process.argv.includes('PUT')) {
   assert.equal(select('auto').status, 1);
   assert.equal(select('not-loaded').status, 1);
   assert.equal(fs.readFileSync(path.join(root, 'config.json'), 'utf8'), '{"old":"working-config"}');
-  console.log('PASS: profile migration, stable node IDs, arbitrary profiles, stale revision, invalid refs, rule CRUD, no config restart');
+  console.log('PASS: clean catalog initialization, stable node IDs, arbitrary profiles, stale revision, invalid refs, rule CRUD, no config restart');
 } finally { fs.rmSync(work, {recursive: true, force: true}); }
