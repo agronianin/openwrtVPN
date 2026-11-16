@@ -15,6 +15,8 @@ try {
   }
   let script = fs.readFileSync(path.join(project,'install.sh'),'utf8');
   script = script.replace(/(?<![\w/])\/(etc|usr|opt|root|sys)\b/g,'${SANDBOX}/$1').replaceAll('"/$1"','"$SANDBOX/$1"');
+  script = script.replace('$backup$(dirname "$path")', '$backup$(dirname "${path#"$SANDBOX"}")')
+    .replace('"$backup$path"', '"$backup${path#"$SANDBOX"}"');
   // Never execute the unmodified installer on the developer machine.
   fs.writeFileSync(path.join(code,'install.sh'),script);
   const bin = path.join(work,'bin'); fs.mkdirSync(bin);
@@ -40,15 +42,31 @@ else if(args[0]==='set'||args[0]==='add_list') { const pos=args[1].indexOf('=');
     fs.writeFileSync(path.join(sandbox,'etc/init.d/sing-box'),'#!/bin/sh\n[ "$1" != status ]\n'); fs.chmodSync(path.join(sandbox,'etc/init.d/sing-box'),0o755);
     const original={'firewall.@zone[0].network':'wan wan6 existing-uplink','firewall.@zone[0].device':'existing-device','network.lan.ipaddr':'10.50.1.1'};
     fs.writeFileSync(path.join(sandbox,'state.json'),JSON.stringify(original));
+    // Обновление сохраняет предыдущие CLI профилей и диагностики для полного отката.
+    fs.mkdirSync(path.join(sandbox, 'usr/bin'), {recursive: true});
+    for (const tool of ['vpn-profiles', 'vpn-node-tests', 'vpn-connection']) {
+      fs.writeFileSync(path.join(sandbox, 'usr/bin', tool), 'previous-' + tool);
+    }
+    // Отдельные учётные данные панели переживают повторную установку.
+    if (modem === '0') {
+      fs.mkdirSync(path.join(sandbox, 'opt/router-control'), {recursive: true});
+      fs.writeFileSync(path.join(sandbox, 'opt/router-control/httpd.conf'), '/:test-user:test-hash\n');
+    }
     // procd scripts are copied but not executed by a non-OpenWrt host shell.
     script=fs.readFileSync(path.join(code,'install.sh'),'utf8').replace(/^.*\/etc\/init\.d\/(router-control-web|modem-t77w968-qmi|sing-box) (enable|disable|restart)$/gm,'true');
     fs.writeFileSync(path.join(code,'run.sh'),script);
     execFileSync('sh',[path.join(code,'run.sh')],{env:{...process.env,PATH:bin+':'+process.env.PATH,SANDBOX:sandbox,INSTALL_MODEM:modem}});
     const state=JSON.parse(fs.readFileSync(path.join(sandbox,'state.json')));
+    const backup = fs.readdirSync(path.join(sandbox, 'root')).find(name => name.startsWith('backup-openwrtvpn-'));
+    for (const tool of ['vpn-profiles', 'vpn-node-tests', 'vpn-connection']) {
+      assert.equal(fs.readFileSync(path.join(sandbox, 'root', backup, 'usr/bin', tool), 'utf8'), 'previous-' + tool);
+    }
     assert.equal(state['network.lan.ipaddr'],original['network.lan.ipaddr']);
     assert.ok(state['firewall.@zone[0].network'].includes('existing-uplink'));
     assert.ok(state['firewall.@zone[0].device'].includes('tun0'));
     assert.equal(state['openwrtvpn.main.modem_enabled'],modem);
+    const auth = fs.readFileSync(path.join(sandbox, 'opt/router-control/httpd.conf'), 'utf8');
+    assert.equal(auth, modem === '0' ? '/:test-user:test-hash\n' : fs.readFileSync(path.join(project, 'defaults/httpd.conf'), 'utf8'));
     assert.equal(fs.existsSync(path.join(sandbox,'usr/bin/modem-t77w968')),modem==='1');
     assert.ok(fs.existsSync(path.join(sandbox,'opt/router-control/www/vpn.js')));
     // Новый контроллер должен устанавливаться исполняемым с обоими вариантами модемного модуля.

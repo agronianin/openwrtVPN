@@ -8,4 +8,4 @@ node tests/test-profiles.js
 node tests/test-node-tests.js
 node tests/test-connection.js
 node tests/test-profiles-ui.js
-if [ -d .git ]; then node tests/test-publication.js; fi
+if [ -e .git ]; then node tests/test-publication.js; fi

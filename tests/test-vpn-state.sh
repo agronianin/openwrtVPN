@@ -36,10 +36,29 @@ grep -q '^route replace table 9910 10.42.0.0/24 dev br-test' "$work/ip-calls"
 ! grep -q '^route replace table 9910 .*dev tun0' "$work/ip-calls"
 grep -q 'vpn-toggle prepare' router-reinstall-kit/files/etc/init.d/sing-box
 echo 'PASS: service startup prepares the marked WAN bypass'
-sed -n '/^vpn_on() {/,/^vpn_off() {/p' router-reinstall-kit/files/usr/bin/vpn-toggle | sed '$d' > "$work/on"
+sed -n '/^vpn_on() {/,/^vpn_off() {/p' router-reinstall-kit/files/usr/bin/vpn-toggle \
+    | sed '$d; s|/usr/bin/vpn-connection|/nonexistent/vpn-connection|g' > "$work/on"
 . "$work/on"
 jq() { return 1; }
 log() { :; }
 set_baseline_dns() { echo 'Unexpected DNS mutation before bootstrap' >&2; exit 99; }
 if vpn_on; then exit 99; fi
 echo 'PASS: unconfigured VPN cannot change DNS or routes before bootstrap'
+# Ошибка запуска или остановки должна возвращаться вызывающей стороне.
+sed -n '/^vpn_on() {/,/^vpn_status() {/p' router-reinstall-kit/files/usr/bin/vpn-toggle \
+    | sed '$d; s|/etc/init.d/sing-box|service|g; s|/etc/sing-box|/nonexistent/sing-box|g; s|/usr/bin/vpn-connection|/nonexistent/vpn-connection|g' \
+    > "$work/toggle"
+. "$work/toggle"
+jq() { return 0; }
+set_baseline_dns() { :; }
+set_default_novpn_policy_enabled() { :; }
+set_gl_vpn_rules_disabled() { :; }
+add_support_rules() { :; }
+sleep() { :; }
+uci() { :; }
+service() { return 1; }
+if vpn_on; then exit 99; fi
+service() { [ "$1" = status ]; }
+cleanup_runtime_rules() { echo 'Should not remove live routing rules after stop failure' >&2; exit 99; }
+if vpn_off; then exit 99; fi
+echo 'PASS: toggle reports failed service transitions'

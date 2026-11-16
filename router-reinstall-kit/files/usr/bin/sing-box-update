@@ -52,7 +52,7 @@ case "$digest" in sha256:*) ;; *) echo 'ERROR: missing SHA256 digest'; exit 1 ;;
 fetch "$url" -o "$work/release.tar.gz"
 printf '%s  %s\n' "${digest#sha256:}" "$work/release.tar.gz" | sha256sum -c -
 tar -xzf "$work/release.tar.gz" -C "$work"
-candidate="$work/sing-box-${version#v}-linux-arm64-musl/sing-box"
+candidate="$work/${asset%.tar.gz}/sing-box"
 "$candidate" version
 "$candidate" check -c /etc/sing-box/config.json
 cp /usr/bin/sing-box /usr/bin/sing-box.previous

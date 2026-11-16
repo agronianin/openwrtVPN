@@ -23,9 +23,15 @@ if(process.env.TEST_COLD_API) fs.writeFileSync(root+'/api-not-ready','3');
 `);
 const engine = mock('engine', String.raw`#!/usr/bin/env node
 const fs=require('node:fs'),root=process.env.TEST_ROOT;
-if(process.argv[2]==='targets') {console.log(JSON.stringify({items:[{id:'google',name:'Google',url:'https://example.org/check',status:204}]}));process.exit(0);}
+if(process.argv[2]==='targets') {
+ console.log(JSON.stringify({items:[{id:process.env.TEST_TARGET||'google',name:'Test',url:'https://example.org/check',status:204}]}));
+ process.exit(0);
+}
 if(process.argv[2]==='cancel') process.exit(0);
+if(process.argv[2]==='discard') {fs.appendFileSync(root+'/discarded',process.argv[3]+'\n');process.exit(0);}
 const request=JSON.parse(fs.readFileSync(0,'utf8')), results=JSON.parse(fs.readFileSync(root+'/results.json'));
+const targets=JSON.parse(fs.readFileSync(process.env.VPN_DATA_ROOT+'/profiles/test-targets.json'));
+if (!targets.some(target=>target.id===request.target)) process.exit(1);
 fs.appendFileSync(root+'/tested',JSON.stringify(request.tags)+'\n');
 if(process.env.TEST_CONTEXT_CHANGE) {
  const file=root+'/profiles/catalog.json', catalog=JSON.parse(fs.readFileSync(file));catalog.profiles[0].name='Changed during search';
@@ -44,6 +50,7 @@ if(url.includes('127.0.0.1:9090') && fs.existsSync(root+'/api-not-ready')) {
 }
 if(url.endsWith('/proxies/vpn-out')) {
  const state=JSON.parse(fs.readFileSync(root+'/api.json')); state.proxies['vpn-out'].now=JSON.parse(fs.readFileSync(0,'utf8')).name;
+ if (process.env.TEST_PIN_FAIL && state.proxies['vpn-out'].now==='src-fast') fs.mkdirSync(root+'/config.json.new');
  fs.writeFileSync(root+'/api.json',JSON.stringify(state)); fs.appendFileSync(root+'/events','select '+state.proxies['vpn-out'].now+'\n'); process.exit(0);
 }
 if(url.endsWith('/proxies')) {console.log(fs.readFileSync(root+'/api.json','utf8'));process.exit(0);}
@@ -54,7 +61,13 @@ const results=JSON.parse(fs.readFileSync(root+'/results.json'));
 const good=n>=Number(process.env.TEST_FAIL_FIRST||0) && results[current]?.passed===2;
 console.log(good?'204 0.1':'000 0.1');process.exit(good?0:28);
 `);
-mock('sing-box', '#!/bin/sh\nexit 0\n');
+mock('sing-box', String.raw`#!/usr/bin/env node
+if(process.env.TEST_CHANGE_RELOAD) {
+ const fs=require('node:fs'), file=process.env.VPN_DATA_ROOT+'/profiles/connection-settings.json';
+ const settings=JSON.parse(fs.readFileSync(file));settings.allow_reload=false;
+ fs.writeFileSync(file,JSON.stringify(settings));
+}
+`);
 mock('date', '#!/bin/sh\necho "${TEST_NOW:-10000}"\n');
 mock('sleep', '#!/bin/sh\nexit 0\n');
 mock('ip', '#!/bin/sh\necho "77.88.8.8 via 192.0.2.1 dev testwan"\n');
@@ -101,15 +114,31 @@ async function start(fixture,kind) {
 }
 async function test() {
   // Проверка сохраняется независимо от панели и не вызывает подбор; при OFF сеть вообще не запускается.
-  let f=setup('check'); let result=await start(f,'check');
+  let f=setup('check');
+  // После перевода часов назад новое задание сохраняется, а самое старое из предыдущих удаляется.
+  const runtime=path.join(f.root,'runtime');
+  for(let i=0;i<20;i++) fs.mkdirSync(path.join(runtime,`${20000+i}-123`));
+  let result=await start(f,'check');
   assert.equal(result.job.state,'done',JSON.stringify(result));assert.equal(result.lastCheck.ok,true);
+  const retained=fs.readdirSync(runtime,{withFileTypes:true}).filter(entry=>entry.isDirectory()).map(entry=>entry.name);
+  assert.equal(retained.length,20);
+  assert.ok(retained.includes(result.job.id));
+  assert.ok(!retained.includes('20000-123'));
   assert.equal(result.lastCheck.node,'src-old');assert.equal(fs.existsSync(path.join(f.root,'tested')),false);
-  f.write('off','1');assert.equal(f.run(['start','find']).status,1);
+  f.write('runtime/off','1');assert.equal(f.run(['start','find']).status,1);
   // Подбор новых узлов не трогает правила, находит минимум задержки и делает единственный restart после успешных тестов.
   f=setup('find'); const route=JSON.parse(fs.readFileSync(path.join(f.root,'config.json'))).route;
+  f.env.TEST_TARGET='custom'; f.settings.target='custom'; f.save();
+  fs.appendFileSync(
+    path.join(f.root,'profiles/cache/src.nodes'),
+    JSON.stringify({type:'vless',tag:'src-old',server:'cache.example.org',server_port:443})+',\n'
+  );
   result=await start(f,'find');assert.equal(result.job.state,'done',JSON.stringify(result));
   assert.equal(result.job.selected.tag,'src-fast');assert.equal(result.lastCheck.node,'src-fast');
-  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.root,'config.json'))).route,route);
+  const newConfig=JSON.parse(fs.readFileSync(path.join(f.root,'config.json')));
+  assert.deepEqual(newConfig.route,route);
+  assert.equal(newConfig.outbounds.find(node=>node.tag==='src-old').server,'src-old.example.org');
+  assert.equal(fs.readFileSync(path.join(f.root,'discarded'),'utf8'),'test-job\n');
   assert.equal(fs.readFileSync(path.join(f.root,'events'),'utf8').split('\n').filter(x=>x==='restart').length,1);
   // Медленный старт API — не отказ узла: ждём готовности и не делаем лишний restart/откат.
   f=setup('cold-api');f.env.TEST_COLD_API='1';result=await start(f,'find');
@@ -138,6 +167,24 @@ async function test() {
   result=await start(f,'find');assert.equal(result.job.state,'failed');
   assert.equal(fs.readFileSync(path.join(f.root,'config.json'),'utf8'),before);
   assert.equal(JSON.parse(fs.readFileSync(path.join(f.root,'api.json'))).proxies['vpn-out'].now,'src-old');
+  // Изменение разрешения во время проверки конфига отменяет применение.
+  f=setup('reload-changed'); f.env.TEST_CHANGE_RELOAD='1';
+  result=await start(f,'find');
+  assert.equal(result.job.state,'failed');
+  assert.equal(fs.readFileSync(path.join(f.root,'config.json'),'utf8'),before);
+  assert.equal(fs.existsSync(path.join(f.root,'events')),false);
+  // Если выбор не удалось сохранить, selector возвращается к прежнему узлу без рестарта.
+  f=setup('pin-failed'); f.env.TEST_PIN_FAIL='1';
+  const loadedConfig=JSON.parse(before);
+  const selector=loadedConfig.outbounds.find(outbound=>outbound.tag==='vpn-out');
+  selector.outbounds.push('src-fast');
+  loadedConfig.outbounds.push({type:'vless',tag:'src-fast',server:'loaded.example.org',server_port:443});
+  f.write('config.json',loadedConfig);
+  f.write('api.json',{proxies:{'vpn-out':{all:selector.outbounds,now:'src-old'},'src-old':{type:'VLESS'},'src-fast':{type:'VLESS'}}});
+  result=await start(f,'find');
+  assert.equal(result.job.state,'failed');
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.root,'config.json'))),loadedConfig);
+  assert.equal(fs.readFileSync(path.join(f.root,'events'),'utf8'),'select src-fast\nselect src-old\n');
   // Предпочтение страны и порядок подписок важнее миллисекунд; остальные источники в профиль не попадают.
   f=setup('priority');let catalog=JSON.parse(fs.readFileSync(path.join(f.root,'profiles/catalog.json')));
   catalog.profiles[0].preference='ru';f.write('profiles/catalog.json',catalog);result=await start(f,'find');

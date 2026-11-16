@@ -65,6 +65,28 @@ fetch_to https://example.invalid/subscription "$work/data" && exit 99
 [ "$(tail -n 1 "$work/fetch-attempts")" = vpn ]
 unset TEST_OFF TEST_OFF_AFTER_PROXY TEST_PROXY_RC TEST_DIRECT_RC
 SUBSCRIPTION_FETCH_MODE=vpn
+# Ошибки зеркал не раскрывают адреса подписки, а управляющие символы сохраняются в корректном JSON.
+(
+  sed '/^load_settings$/,$d' router-reinstall-kit/files/usr/bin/vpn-subscriptions-update > "$work/library"
+  VPN_LIBRARY_ONLY=1 . "$work/library"
+  WORKDIR="$work/parse"
+  CACHE_DIR="$work/cache"
+  mkdir "$WORKDIR"
+  logger() { printf '%s\n' "$*" >> "$work/syslog"; }
+  fetch_to() {
+    case "$1" in
+      *first*) echo "curl failed: $1" >&2; return 1 ;;
+      *second*) echo 'unsupported format' > "$2" ;;
+      *) printf 'vless://test-user@vpn.example:443?type=ws&path=/has\ttab#test\n' > "$2" ;;
+    esac
+  }
+  refresh_group source Source 'https://first.invalid/secret' 'https://second.invalid/?token=secret' 'https://third.invalid/' \
+    > "$work/stdout" 2> "$work/stderr"
+  grep -q 'mirror 1 download failed' "$work/stderr"
+  grep -q 'mirror 2 cannot decode subscription' "$work/stderr"
+  if grep -q 'secret' "$work/stdout" "$work/stderr" "$work/syslog"; then exit 99; fi
+  sed '$s/,$//' "$CACHE_DIR/source.nodes" | jq -e '.transport.path=="/has\ttab"' >/dev/null
+)
 export TEST_BOOTSTRAP="$work/bootstrap"
 sh -c '
   is_running() { return 0; }

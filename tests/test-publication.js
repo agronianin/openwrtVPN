@@ -8,8 +8,9 @@ const files = execFileSync('git', ['ls-files', '-z'], {encoding:'utf8'}).split('
 assert.ok(files.length > 20, 'publication file list is available');
 const privatePath = /(^backups\/|packages\/|subscriptions-cache\/|subscriptions\.d\/|vpn-config\/|manual-subscriptions\/|\/config\.json$|rule-packs\/(available|enabled)\/|local-setup\.md$|AGENTS\.md$)/;
 const privateValue = /[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}|withblancvpn\.online|BEGIN (?:OPENSSH |RSA |EC )?PRIVATE KEY|\/Users\/argo\//i;
+const publicInstructions = new Set(['AGENTS.md', 'tests/AGENTS.md']);
 for (const file of files) {
-  assert.ok(file === 'defaults/config.json' || file === 'AGENTS.md' || !privatePath.test(file), `private path: ${file}`);
+  assert.ok(file === 'defaults/config.json' || publicInstructions.has(file) || !privatePath.test(file), `private path: ${file}`);
   assert.ok(!fs.lstatSync(file).isSymbolicLink(), `symlink: ${file}`);
   assert.ok(!privateValue.test(fs.readFileSync(file,'utf8')), `private value: ${file}`);
 }

@@ -26,7 +26,10 @@ if [ "$major" -lt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -lt 14 ]; }; then ec
 backup="/root/backup-openwrtvpn-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$backup"
 sysupgrade -b "$backup/system-settings.tar.gz"
-for path in /etc/sing-box /opt/router-control /etc/config/openwrtvpn /etc/init.d/sing-box /etc/init.d/router-control-web /etc/init.d/modem-t77w968-qmi /usr/bin/vpnctl /usr/bin/vpn-subscriptions-update /usr/bin/vpn-toggle /usr/bin/vpn-health-check /usr/bin/vpn-auto-update /usr/bin/vpn-mode /usr/bin/sing-box-update /usr/bin/modem-t77w968; do
+for path in /etc/sing-box /opt/router-control /etc/config/openwrtvpn /etc/init.d/sing-box /etc/init.d/router-control-web \
+  /etc/init.d/modem-t77w968-qmi /usr/bin/vpnctl /usr/bin/vpn-subscriptions-update /usr/bin/vpn-toggle /usr/bin/vpn-health-check \
+  /usr/bin/vpn-auto-update /usr/bin/vpn-mode /usr/bin/sing-box-update /usr/bin/modem-t77w968 \
+  /usr/bin/vpn-profiles /usr/bin/vpn-node-tests /usr/bin/vpn-connection; do
   [ ! -e "$path" ] || { mkdir -p "$backup$(dirname "$path")"; cp -a "$path" "$backup$path"; }
 done
 packages='curl jq uhttpd flock ip-full kmod-tun ca-bundle'
@@ -107,7 +110,7 @@ if [ "$INSTALL_MODEM" = 1 ]; then
   uci commit firewall
 fi
 if [ "$(uci -q get openwrtvpn.main.web_auth || echo 1)" = 1 ]; then
-  cp "$ROOT/defaults/httpd.conf" /opt/router-control/httpd.conf
+  [ -s /opt/router-control/httpd.conf ] || cp "$ROOT/defaults/httpd.conf" /opt/router-control/httpd.conf
 fi
 touch /etc/crontabs/root
 for job in 'vpn-auto-update' 'vpn-health-check auto'; do

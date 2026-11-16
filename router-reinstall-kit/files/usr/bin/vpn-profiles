@@ -9,7 +9,10 @@ MANAGED="$BASE/profiles/managed"
 STORE="$BASE/profiles/cache"
 PACKS="$BASE/rule-packs/available"
 error() { echo "$*" >&2; exit 1; }
-valid_id() { printf '%s' "$1" | grep -Eq '^[a-zA-Z0-9_-][a-zA-Z0-9_.-]{0,79}$'; }
+valid_id() {
+  case "$1" in ''|.*|*[!a-zA-Z0-9_.-]*) return 1 ;; esac
+  [ "${#1}" -le 80 ]
+}
 revision() { sha256sum "$DB" | cut -d' ' -f1; }
 set_job() {
   printf '%s\n' "$1" > "$BASE/profiles/update-job.json.new.$$"
@@ -82,23 +85,22 @@ init_catalog() (
 )
 
 validate() {
-  jq -e '
-    def id: type=="string" and length>0 and length<=80;
+  jq -e -s '
+    def id: type=="string" and test("\\A[a-zA-Z0-9_-][a-zA-Z0-9_.-]{0,79}\\z");
     def ids: type=="array" and length<=500 and all(.[]; id) and (unique|length)==length;
+    length==1 and (.[0] |
     . as $d | .version==1 and (.subscriptions|type)=="array" and (.profiles|type)=="array"
     and (.subscriptions|length)<=100 and (.profiles|length)<=100
     and ([.subscriptions[].id]|ids) and ([.profiles[].id]|ids)
     and all(.subscriptions[]; (.id|length)<=48 and (.name|type)=="string" and (.name|length)>0 and (.name|length)<=160
       and (.urls|type)=="array" and (.urls|length)>0 and (.urls|length)<=30
-      and all(.urls[]; type=="string" and length<=4096))
+      and all(.urls[]; type=="string" and length<=4096 and (explode|all(.>32 and .!=127))))
     and all(.profiles[]; (.name|type)=="string" and (.name|length)>0 and (.name|length)<=160
       and (.subscriptions|ids) and (.nodes|ids) and (.rules|ids)
       and (.final=="direct" or .final=="vpn-out")
       and (.preference=="ru" or .preference=="non-ru" or .preference=="any")
-      and all(.subscriptions[]; . as $s | any($d.subscriptions[]; .id==$s)))
+      and all(.subscriptions[]; . as $s | any($d.subscriptions[]; .id==$s))))
   ' "$1" >/dev/null || error 'Invalid catalog: check IDs, references, URLs and profile fields'
-  jq -r '.subscriptions[].id,.profiles[]|if type=="object" then (.id,.subscriptions[],.nodes[],.rules[]) else . end' "$1" \
-    | while IFS= read -r id; do valid_id "$id" || error 'Invalid identifier'; done
   jq -r '.subscriptions[].urls[]' "$1" | while IFS= read -r url; do
     if printf '%s' "$url" | grep -Eq '[[:space:][:cntrl:]]|(^|/)\.\.(/|$)'; then error 'Invalid subscription URL'; fi
     case "$url" in

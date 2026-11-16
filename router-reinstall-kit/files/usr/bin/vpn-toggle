@@ -129,7 +129,11 @@ vpn_on() {
     sleep 2
     set_default_novpn_policy_enabled 0
     add_support_rules
-    /etc/init.d/sing-box status >/dev/null 2>&1 && log "VPN is on" || log "VPN start failed"
+    if ! /etc/init.d/sing-box status >/dev/null 2>&1; then
+        log "VPN start failed"
+        return 1
+    fi
+    log "VPN is on"
 }
 
 vpn_off() {
@@ -139,6 +143,10 @@ vpn_off() {
     /etc/init.d/sing-box disable >/dev/null 2>&1 || true
     /etc/init.d/sing-box stop >/dev/null 2>&1 || true
     sleep 1
+    if /etc/init.d/sing-box status >/dev/null 2>&1; then
+        log "VPN stop failed"
+        return 1
+    fi
     cleanup_runtime_rules
     set_default_novpn_policy_enabled 1
     set_gl_vpn_rules_disabled 1

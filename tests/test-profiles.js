@@ -51,7 +51,17 @@ try {
   data.profiles[2].subscriptions = ['test-source'];
   data.profiles[2].rules = ['../../etc/shadow'];
   assert.equal(run(['save', next.revision], JSON.stringify(data)).status, 1);
+  data.profiles[2].rules = [];
+  // Один JSON-документ и целые значения ID/URL обязательны до записи каталога.
+  assert.equal(run(['save', next.revision], JSON.stringify(data).repeat(2)).status, 1);
+  data.subscriptions[0].urls = ['https://example.com/\nsubscription'];
+  assert.equal(run(['save', next.revision], JSON.stringify(data)).status, 1);
+  data.subscriptions[0].urls = ['https://example.com/subscription'];
+  data.profiles[2].id = 'third\nplace';
+  assert.equal(run(['save', next.revision], JSON.stringify(data)).status, 1);
   assert.equal(run(['rule-save', '../../bad'], 'bad').status, 1);
+  assert.equal(run(['rule-save', '../../../\nvalid', 'new'], 'bad').status, 1);
+  assert.ok(!fs.existsSync(path.join(work, '\nvalid.rules')));
   assert.equal(run(['rule-delete', '00-private-direct']).status, 1);
   assert.equal(run(['rule-save', 'my-rule', 'new'], 'rule example\noutbound direct\ndomain example.com\n').status, 0);
   const rule = snapshot().rules.find(rule => rule.id === 'my-rule');

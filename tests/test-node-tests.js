@@ -27,6 +27,7 @@ async function finish(job) {
   }
   throw new Error('Test worker did not finish');
 }
+// Проверяет сетевые результаты, приоритет загруженного узла и ограничение истории.
 async function test() {
   // На Mac нет flock: сетевой сценарий использует заглушку, настоящая блокировка проверяется на OpenWrt отдельно.
   mock('flock', '#!/bin/sh\nexit 0\n');
@@ -42,7 +43,7 @@ const file=process.env.TEST_WORK+'/attempt-'+proxy.slice(-5); const n=fs.existsS
 fs.writeFileSync(file,String(n+1));
 if(proxy.endsWith('21081') && n===0) console.log('403 0.02'); else console.log('204 0.15');
 `);
-  const liveConfig = JSON.stringify({working: true});
+  const liveConfig = JSON.stringify({outbounds: [{type: 'vless', tag: 'one', server: 'loaded.example', server_port: 443}]});
   fs.writeFileSync(path.join(root, 'config.json'), liveConfig);
   fs.writeFileSync(path.join(root, 'profiles/cache/source.nodes'),
     '{"type":"vless","tag":"one","server":"vpn.example","server_port":443},\n' +
@@ -66,6 +67,8 @@ if(proxy.endsWith('21081') && n===0) console.log('403 0.02'); else console.log('
   assert.equal(run(['start'], JSON.stringify({tags: ['missing'], target: 'own', speed: false})).status, 1);
   assert.equal(run(['start'], JSON.stringify({tags: Array.from({length: 61}, (_, i) => 'tag-' + i), target: 'own', speed: false})).status, 1);
   assert.equal(run(['status', '../../etc/passwd']).status, 1);
+  assert.match(run(['status', '../\nvalid']).stderr, /Invalid test ID/);
+  assert.match(run(['discard', '../\nvalid']).stderr, /Invalid test ID/);
   // 403 не считается успешным туннелем к ресурсу; 1/2 дает «нестабильно», скорость меряется лишь при 2/2.
   fs.rmSync(path.join(root, 'profiles/test-targets.json'));
   const started = run(['start'], JSON.stringify({tags: ['one', 'two'], target: 'google', speed: true}));
@@ -79,16 +82,23 @@ if(proxy.endsWith('21081') && n===0) console.log('403 0.02'); else console.log('
   const config = JSON.parse(fs.readFileSync(path.join(work, 'checked.json')));
   assert.ok(config.inbounds.every(item => item.listen === '127.0.0.1'));
   assert.ok(config.outbounds.every(item => item.routing_mark === 32768 && item.type !== 'direct'));
+  assert.equal(config.outbounds[0].server, 'loaded.example');
   assert.equal(config.route.rules[1].outbound, 'two');
   assert.equal(config.dns.servers[0].routing_mark, 32768);
   // Две ошибки TLS — недоступность ресурса, а не ложный успех по открытому TCP-порту.
   env.STUB_CURL_MODE = 'tls-error';
+  // После отката часов новая задача может оказаться раньше сохранённых по имени.
+  for (let index = 0; index < 20; index++) fs.mkdirSync(path.join(jobs, `9999999999-${index}`));
   const failedStart = run(['start'], JSON.stringify({tags: ['one'], target: 'google', speed: false}));
   assert.equal(failedStart.status, 0, failedStart.stderr);
   const failed = await finish(JSON.parse(failedStart.stdout));
   assert.equal(failed.state, 'done', JSON.stringify(failed));
   assert.equal(failed.results[0].passed, 0); assert.equal(failed.results[0].ok, false);
   assert.equal(failed.results[0].latency_ms, null); assert.match(failed.results[0].error, /Certificate/);
+  assert.equal(fs.readdirSync(jobs).filter(name => /^\d+-\d+$/.test(name)).length, 20);
+  assert.ok(!fs.existsSync(path.join(jobs, '9999999999-0')));
+  assert.equal(run(['discard', failed.id]).status, 0);
+  assert.equal(run(['status', failed.id]).status, 1);
   assert.equal(fs.readFileSync(path.join(root, 'config.json'), 'utf8'), liveConfig);
   console.log('PASS: forced per-node proxy, repeat HTTPS checks, bounded speed, custom targets and unchanged active config');
 }

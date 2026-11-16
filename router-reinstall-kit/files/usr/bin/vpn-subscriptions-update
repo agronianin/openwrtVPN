@@ -280,7 +280,7 @@ query_get() {
 }
 
 json_escape() {
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+  printf '%s' "$1" | jq -Rrs '@json|.[1:-1]'
 }
 
 parse_group() {
@@ -558,22 +558,23 @@ try_refresh_group_url() {
   label="$2"
   url="$3"
   source_name="$4"
+  mirror_number="$5"
   raw="$WORKDIR/$group.raw"
   links="$WORKDIR/$group.links"
 
-  if ! fetch_to "$url" "$raw"; then
-    warn "$label: mirror download failed: $url"
+  if ! fetch_to "$url" "$raw" 2>/dev/null; then
+    warn "$label: mirror $mirror_number download failed"
     return 1
   fi
 
   if ! decode_subscription "$raw" "$links"; then
-    warn "$label: mirror cannot decode subscription: $url"
+    warn "$label: mirror $mirror_number cannot decode subscription"
     return 1
   fi
 
   parse_group "$group" "$links.nodes"
   if [ "$parsed_count" -lt "$MIN_NODES" ]; then
-    warn "$label: mirror has only $parsed_count usable nodes: $url"
+    warn "$label: mirror $mirror_number has only $parsed_count usable nodes"
     return 1
   fi
 
@@ -594,9 +595,11 @@ refresh_group() {
   source_name="$2"
   shift 2
   label="$(group_label "$group")"
+  mirror_number=0
 
   for url in "$@"; do
-    if try_refresh_group_url "$group" "$label" "$url" "$source_name"; then
+    mirror_number=$((mirror_number+1))
+    if try_refresh_group_url "$group" "$label" "$url" "$source_name" "$mirror_number"; then
       return 0
     fi
   done

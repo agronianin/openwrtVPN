@@ -11,7 +11,9 @@ fail() { echo "$*" >&2; exit 1; }
 running() { [ ! -e "$ROOT/off" ] && /etc/init.d/sing-box status >/dev/null 2>&1; }
 defaults() { echo '{"enabled":false,"interval_minutes":5,"failures":3,"target":"google","refresh_on_failure":false,"allow_reload":true}'; }
 settings() { if [ -f "$SETTINGS" ]; then cat "$SETTINGS"; else defaults; fi; }
-revision() { settings | jq -cS . | sha256sum | cut -d' ' -f1; }
+settings_hash() { jq -cS . | sha256sum | cut -d' ' -f1; }
+revision() { settings | settings_hash; }
+lock_settings() { exec 8> "$ROOT/settings.lock"; flock -n 8 || fail 'Настройки заняты'; }
 api() { curl -q -fsS --noproxy '*' --max-time 4 http://127.0.0.1:9090/proxies; }
 context() {
   running || return 1
@@ -40,7 +42,7 @@ status() {
     fi
   fi
   settings > "$ROOT/settings-read.$$"
-  jq -n --arg revision "$(jq -cS . "$ROOT/settings-read.$$" | sha256sum | cut -d' ' -f1)" --slurpfile settings "$ROOT/settings-read.$$" \
+  jq -n --arg revision "$(settings_hash < "$ROOT/settings-read.$$")" --slurpfile settings "$ROOT/settings-read.$$" \
     --slurpfile last "$ROOT/last-check.json" --slurpfile job "$ROOT/job.json" \
     '{revision:$revision,settings:$settings[0],lastCheck:($last[0]//null),job:($job[0]//null)}'
   rm -f "$ROOT/settings-read.$$"
@@ -74,15 +76,8 @@ wait_select() {
   return 1
 }
 pin_default() {
-  old_hash=$(sha256sum "$BASE/config.json" | cut -d' ' -f1)
   jq --arg tag "$1" '(.outbounds[]|select(.tag=="vpn-out" and .type=="selector")).default=$tag' \
-    "$BASE/config.json" > "$BASE/config.json.new"
-  mv "$BASE/config.json.new" "$BASE/config.json"
-  if [ -s "$BASE/profiles/loaded-titles.json" ]; then
-    jq --arg old "$old_hash" --arg new "$(sha256sum "$BASE/config.json" | cut -d' ' -f1)" \
-      'if .config==$old then .config=$new else . end' "$BASE/profiles/loaded-titles.json" > "$BASE/profiles/loaded-titles.json.new"
-    mv "$BASE/profiles/loaded-titles.json.new" "$BASE/profiles/loaded-titles.json"
-  fi
+    "$BASE/config.json" > "$BASE/config.json.new" && mv "$BASE/config.json.new" "$BASE/config.json"
 }
 probe_current() {
   context > "$J/probe-before.json" || { echo 'Не удалось определить текущий узел через API' >&2; return 1; }
@@ -110,6 +105,7 @@ collect_pool() {
   tested=0
   mkdir -p "$J/data/profiles/cache"
   cp "$BASE/config.json" "$J/data/config.json"
+  jq -s '.' "$J/target.json" > "$J/data/profiles/test-targets.json"
   : > "$J/all.nodes"; : > "$J/all.titles"; : > "$J/ru-tags"
   for file in "$BASE/profiles/cache/"*.nodes; do
     [ -s "$file" ] || continue
@@ -133,11 +129,11 @@ collect_pool() {
   jq -Rn '[inputs]' < "$J/ru-tags" > "$J/ru.json"
   jq --slurpfile cache "$J/cached.json" --slurpfile profile "$J/profile.json" --slurpfile titles "$J/titles.json" \
     --slurpfile ru "$J/ru.json" '
-    (($cache[0]|map(.+{_loaded:false}))+[.outbounds[]|select(.type=="vless" or .type=="hysteria2")|.+{_loaded:true}])
+    ([.outbounds[]|select(.type=="vless" or .type=="hysteria2")]+$cache[0])
     | unique_by(.tag) | map(. as $node | $profile[0] as $p |
       ([$p.subscriptions|to_entries[]|. as $entry|select($node.tag|startswith($entry.value+"-"))|.key][0]) as $rank |
       select($rank!=null or ($p.nodes|index($node.tag))!=null) |
-      {node:(del(._loaded)),title:($titles[0][.tag]//.tag),rank:($rank//($p.subscriptions|length)),
+      {node:$node,title:($titles[0][.tag]//.tag),rank:($rank//($p.subscriptions|length)),
        country_rank:(if $p.preference=="any" then 0 elif ($titles[0]|has($node.tag)|not) then 1
          elif ($ru[0]|index($node.tag))!=null or ($titles[0][$node.tag]|contains("🇷🇺") or contains("Russia") or contains("Россия")) then
          (if $p.preference=="ru" then 0 else 1 end) else (if $p.preference=="non-ru" then 0 else 1 end) end)})
@@ -175,6 +171,7 @@ search_pool() {
       [ "$(jq -r .state "$J/test.json")" = done ] || fail 'Проверка кандидатов завершилась ошибкой; старый узел сохранён'
       jq -c '.results[]' "$J/test.json" >> "$J/results.jsonl"
       tested=$((tested+$(jq .total "$J/test.json"))); offset=$((offset+60))
+      /usr/bin/vpn-node-tests discard "$test_id" >/dev/null 2>&1 || true
       rm -f "$J/test-id"
     done
     jq -s '[.[]|select(.ok)]|sort_by(.latency_ms)|.[0]//null' "$J/results.jsonl" > "$J/winner.json"
@@ -189,18 +186,22 @@ commit_winner() {
   jq --slurpfile pool "$J/pool.json" '.tag as $tag | .title=([$pool[0][]|select(.node.tag==$tag)|.title][0]//.title)' \
     "$J/winner.json" > "$J/winner.new"; mv "$J/winner.new" "$J/winner.json"
   if api | jq -e --arg tag "$winner" '.proxies["vpn-out"].all|index($tag)!=null' >/dev/null; then
+    lock_settings
+    same_context || fail 'Контекст изменился перед переключением'
     selection_pending=1
     restore_selection() {
       trap - EXIT HUP INT TERM
-      [ "$selection_pending" != 1 ] || select_node "$(jq -r .selector "$J/context.json")" || true
+      [ "$selection_pending" != 1 ] || select_node "$(jq -r .selector "$J/context.json")" \
+        || echo 'Не удалось восстановить предыдущий выбор' >&2
     }
-    trap restore_selection EXIT HUP INT TERM
+    trap restore_selection EXIT
+    trap 'exit 1' HUP INT TERM
     select_node "$winner" || fail 'Не удалось подтвердить переключение'
     if ! probe_current || [ "$passed" != 2 ]; then
-      fail 'После переключения проверка не прошла; восстановлен предыдущий выбор'
+      fail 'После переключения проверка не прошла'
     fi
+    pin_default "$winner" || fail 'Не удалось сохранить выбранный узел'
     selection_pending=0; trap - EXIT HUP INT TERM
-    pin_default "$winner"
   else
     [ "$(jq -r .allow_reload "$J/settings.json")" = true ] || fail 'Найден новый рабочий узел, но применение новых узлов запрещено настройкой'
     message switching 'Новый узел проверен; применяю его, возможен краткий разрыв'
@@ -209,27 +210,32 @@ commit_winner() {
       +[$pool[0][].node]+[{type:"selector",tag:"vpn-out",outbounds:[$pool[0][].node.tag],default:$selected,interrupt_exist_connections:false}])' \
       "$BASE/config.json" > "$J/candidate.json"
     sing-box check -c "$J/candidate.json" > "$J/config-check.log" 2>&1 || fail 'Новый конфиг отклонён, старый не менялся'
+    lock_settings
+    same_context || fail 'Контекст изменился перед применением'
     cp "$BASE/config.json" "$J/rollback.json"
+    cp "$J/candidate.json" "$BASE/config.json.new"
     rollback_required=1
     rollback_config() {
       trap - EXIT HUP INT TERM
       [ "$rollback_required" != 1 ] || {
-        cp "$J/rollback.json" "$BASE/config.json.new"; mv "$BASE/config.json.new" "$BASE/config.json"
-        if [ -e "$ROOT/off" ]; then /etc/init.d/sing-box stop || true
-        else
-          /etc/init.d/sing-box restart || true
-          wait_select "$(jq -r .selector "$J/context.json")" || true
+        if ! cp "$J/rollback.json" "$BASE/config.json.new" || ! mv "$BASE/config.json.new" "$BASE/config.json"; then
+          echo 'Не удалось вернуть прежний файл конфигурации' >&2
+        elif [ -e "$ROOT/off" ]; then
+          /etc/init.d/sing-box stop || echo 'Не удалось остановить VPN при откате' >&2
+        elif ! /etc/init.d/sing-box restart || ! wait_select "$(jq -r .selector "$J/context.json")"; then
+          echo 'Не удалось восстановить прежнее подключение' >&2
         fi
       }
     }
-    trap rollback_config EXIT HUP INT TERM
-    cp "$J/candidate.json" "$BASE/config.json.new"; mv "$BASE/config.json.new" "$BASE/config.json"
+    trap rollback_config EXIT
+    trap 'exit 1' HUP INT TERM
+    mv "$BASE/config.json.new" "$BASE/config.json"
     restored=0
     if [ ! -e "$ROOT/off" ] && /etc/init.d/sing-box restart; then
       if wait_select "$winner" && probe_current && [ "$passed" = 2 ]; then restored=1; fi
     fi
     if [ "$restored" != 1 ]; then
-      fail 'Применение не прошло проверку; возвращена прежняя конфигурация'
+      fail 'Применение не прошло проверку'
     fi
     rollback_required=0; trap - EXIT HUP INT TERM
   fi
@@ -244,7 +250,11 @@ worker() {
   J="$ROOT/$1"; success=0; tested=0
   cleanup() {
     trap - EXIT HUP INT TERM
-    [ ! -f "$J/test-id" ] || /usr/bin/vpn-node-tests cancel "$(cat "$J/test-id")" >/dev/null 2>&1 || true
+    if [ -f "$J/test-id" ]; then
+      test_id=$(cat "$J/test-id")
+      /usr/bin/vpn-node-tests cancel "$test_id" >/dev/null 2>&1 || true
+      /usr/bin/vpn-node-tests discard "$test_id" >/dev/null 2>&1 || true
+    fi
     if [ "$success" != 1 ]; then
       tail -c 1500 "$J/worker.log" > "$J/error-tail"
       jq --rawfile error "$J/error-tail" '.state="failed" | .error=$error | .message="Операция не завершена; проверьте причину"' \
@@ -322,7 +332,7 @@ worker() {
 case "${1:-status}" in
   status) status ;;
   configure)
-    exec 8> "$ROOT/settings.lock"; flock -n 8 || fail 'Настройки заняты'
+    lock_settings
     [ "${2:-}" = "$(revision)" ] || fail 'Настройки изменились; обновите страницу'
     tmp=$(mktemp "$ROOT/settings.XXXXXX"); trap 'rm -f "$tmp"' EXIT HUP INT TERM
     head -c 4097 > "$tmp"; [ "$(wc -c < "$tmp")" -le 4096 ] || fail 'Слишком большой запрос'
@@ -335,10 +345,10 @@ case "${1:-status}" in
     ;;
   start|auto)
     kind="${2:-check}"
+    job_settings=$(settings)
     if [ "$1" = auto ]; then
-      settings > "$ROOT/auto-settings.$$"
-      enabled=$(jq -r .enabled "$ROOT/auto-settings.$$"); minutes=$(jq -r .interval_minutes "$ROOT/auto-settings.$$")
-      rm "$ROOT/auto-settings.$$"
+      enabled=$(printf '%s\n' "$job_settings" | jq -r .enabled)
+      minutes=$(printf '%s\n' "$job_settings" | jq -r .interval_minutes)
       [ "$enabled" = true ] && running || exit 0
       last=$(jq -r '.time//0' "$ROOT/last-check.json"); last="${last:-0}"
       [ "$(( $(date +%s)-last ))" -ge "$((minutes*60))" ] || exit 0
@@ -348,7 +358,16 @@ case "${1:-status}" in
     running || fail 'VPN выключен; проверка и подбор не запускаются'
     exec 9> "$ROOT/run.lock"; flock -n 9 || fail 'Проверка или подбор уже выполняется'
     id="$(date +%s)-$$"; J="$ROOT/$id"; mkdir "$J"
-    settings > "$J/settings.json"; revision > "$J/settings-revision"
+    printf '%s\n' "$job_settings" > "$J/settings.json"
+    settings_hash < "$J/settings.json" > "$J/settings-revision"
+    set -- "$ROOT"/[0-9]*-[0-9]*
+    remaining=$#
+    for previous_job do
+      [ "$remaining" -gt 20 ] || break
+      [ "$previous_job" != "$J" ] && [ -d "$previous_job" ] || continue
+      rm -rf "$previous_job"
+      remaining=$((remaining-1))
+    done
     jq -n --arg id "$id" --arg kind "$kind" \
       '{id:$id,kind:$kind,state:"running",phase:"starting",message:"Запускаю операцию",done:0,total:0}' > "$ROOT/job.new"
     mv "$ROOT/job.new" "$ROOT/job.json"
@@ -365,9 +384,19 @@ case "${1:-status}" in
     ;;
   _freeze)
     [ "${VPN_CONNECTION_COMMIT:-}" = 1 ] || fail 'Internal action'
-    J="$ROOT/${2:?}"; same_context || fail 'Подключение изменилось'
+    J="$ROOT/${2:?}"; lock_settings; same_context || fail 'Подключение изменилось'
     current=$(jq -r .node "$J/context.json")
-    select_node "$current"; pin_default "$current"; context > "$J/context.json"
+    select_node "$current"
+    if ! pin_default "$current"; then
+      select_node "$(jq -r .selector "$J/context.json")" || echo 'Не удалось восстановить предыдущий выбор' >&2
+      fail 'Не удалось сохранить текущий узел'
+    fi
+    if [ -s "$BASE/profiles/loaded-titles.json" ]; then
+      jq --arg old "$(jq -r .config "$J/context.json")" --arg new "$(sha256sum "$BASE/config.json" | cut -d' ' -f1)" \
+        'if .config==$old then .config=$new else . end' "$BASE/profiles/loaded-titles.json" > "$BASE/profiles/loaded-titles.json.new"
+      mv "$BASE/profiles/loaded-titles.json.new" "$BASE/profiles/loaded-titles.json"
+    fi
+    context > "$J/context.json"
     ;;
   *) fail 'Usage: vpn-connection status|configure REV|start check|start find|auto' ;;
 esac

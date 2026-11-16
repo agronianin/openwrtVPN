@@ -6,7 +6,10 @@ ROOT="${VPN_TEST_ROOT:-/tmp/vpn-node-tests}"
 TARGETS="$BASE/profiles/test-targets.json"
 mkdir -p "$ROOT" "$BASE/profiles"
 fail() { echo "$*" >&2; exit 1; }
-valid_id() { printf '%s' "$1" | grep -Eq '^[a-zA-Z0-9_-]{1,80}$'; }
+valid_id() {
+  case "$1" in ''|*[!a-zA-Z0-9_-]*) return 1 ;; esac
+  [ "${#1}" -le 80 ]
+}
 defaults() {
   printf '%s\n' '[{"id":"google","name":"Google","url":"https://www.google.com/generate_204","status":204},{"id":"youtube","name":"YouTube","url":"https://www.youtube.com/generate_204","status":204},{"id":"cloudflare","name":"Cloudflare","url":"https://cp.cloudflare.com/generate_204","status":204}]'
 }
@@ -161,7 +164,7 @@ case "${1:-targets}" in
     else echo '[]' > "$JOB/loaded.json"; fi
     { printf '[\n'; sed '$s/,[[:space:]]*$//' "$JOB/all.nodes"; printf '\n]\n'; } > "$JOB/all.json"
     jq --slurpfile request "$JOB/request.json" --slurpfile loaded "$JOB/loaded.json" \
-      '(.+$loaded[0]|unique_by(.tag)) as $all | [$request[0].tags[] as $tag | $all[]|select(.tag==$tag)]' \
+      '($loaded[0]+.|unique_by(.tag)) as $all | [$request[0].tags[] as $tag | $all[]|select(.tag==$tag)]' \
       "$JOB/all.json" > "$JOB/nodes.json"
     [ "$(jq length "$JOB/nodes.json")" = "$(jq '.tags|length' "$JOB/request.json")" ] || fail 'Node cache changed; refresh the node list'
     jq -e 'all(.[]; .type!="direct" and .type!="block" and .type!="selector" and .type!="urltest")' "$JOB/nodes.json" >/dev/null \
@@ -176,6 +179,14 @@ case "${1:-targets}" in
       --argjson started "$(date +%s)" \
       '{id:$id,state:"running",phase:"https",started_at:$started,target:$target[0],speed:$request[0].speed,total:($request[0].tags|length),done:0,results:[]}' > "$JOB/job.json"
     rm -f "$JOB/all.nodes" "$JOB/all.json" "$JOB/all.titles" "$JOB/titles.json" "$JOB/loaded.json"
+    set -- "$ROOT"/[0-9]*-[0-9]*
+    remaining=$#
+    for previous_job do
+      [ "$remaining" -gt 20 ] || break
+      [ "$previous_job" != "$JOB" ] && [ -d "$previous_job" ] || continue
+      rm -rf "$previous_job"
+      remaining=$((remaining-1))
+    done
     # The child inherits the lock; all descriptors returned to CGI are closed before background work.
     (trap '' HUP; export VPN_TEST_WORKER=1; exec "$0" _worker "$id") </dev/null >"$JOB/worker.log" 2>&1 &
     echo "$!" > "$JOB/pid"
@@ -202,6 +213,11 @@ case "${1:-targets}" in
     if [ -r "/proc/$pid/cmdline" ] && tr '\000' '\n' < "/proc/$pid/cmdline" | grep -Fxq "$2"; then
       kill -TERM "$pid" 2>/dev/null || true
     fi
+    ;;
+  discard)
+    valid_id "${2:-}" || fail 'Invalid test ID'
+    exec 9> "$ROOT/run.lock"; flock -w 2 9 || fail 'A node test is still running'
+    rm -rf "$ROOT/$2"
     ;;
   *) fail 'Usage: vpn-node-tests targets|targets-save REV|start|status ID' ;;
 esac
