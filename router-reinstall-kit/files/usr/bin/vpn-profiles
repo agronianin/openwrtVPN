@@ -86,7 +86,8 @@ init_catalog() (
 
 validate() {
   jq -e -s '
-    def id: type=="string" and test("\\A[a-zA-Z0-9_-][a-zA-Z0-9_.-]{0,79}\\z");
+    def id_char: .==45 or .==95 or (.>=48 and .<=57) or (.>=65 and .<=90) or (.>=97 and .<=122);
+    def id: type=="string" and length>=1 and length<=80 and (explode | (.[0]|id_char) and all(.[]; id_char or .==46));
     def ids: type=="array" and length<=500 and all(.[]; id) and (unique|length)==length;
     length==1 and (.[0] |
     . as $d | .version==1 and (.subscriptions|type)=="array" and (.profiles|type)=="array"
