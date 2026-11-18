@@ -63,9 +63,11 @@ try {
   assert.equal(run(['rule-save', '../../../\nvalid', 'new'], 'bad').status, 1);
   assert.ok(!fs.existsSync(path.join(work, '\nvalid.rules')));
   assert.equal(run(['rule-delete', '00-private-direct']).status, 1);
-  assert.equal(run(['rule-save', 'my-rule', 'new'], 'rule example\noutbound direct\ndomain example.com\n').status, 0);
+  assert.equal(run(['rule-save', 'my-rule', 'new'], '# profile-name: My route\nrule example\noutbound direct\ndomain example.com\n').status, 0);
   const rule = snapshot().rules.find(rule => rule.id === 'my-rule');
   assert.ok(rule);
+  assert.equal(rule.name, 'My route');
+  assert.equal(rule.content, 'rule example\noutbound direct\ndomain example.com\n');
   assert.equal(run(['rule-save', 'my-rule', 'stale'], 'bad').status, 1);
   assert.equal(run(['rule-delete', 'my-rule', rule.revision]).status, 0);
   // Ручной URI превращается в отдельный источник и узел; повторный импорт не создает дубликат.
@@ -74,6 +76,7 @@ try {
   assert.equal(run(['node-import', 'Own node', current.revision], uri).status, 0);
   const imported = snapshot();
   assert.ok(imported.nodes.some(node => node.subscription.startsWith('manual-')));
+  assert.equal(imported.nodes.find(node => node.subscription.startsWith('manual-')).title, 'Own node');
   assert.equal(run(['node-import', 'Own node', imported.revision], uri).status, 1);
   // Готовую подписку можно подложить в существующий источник без изменения URL, профиля и рабочего config.
   const importedFile = path.join(work, 'subscription.txt');
@@ -113,6 +116,20 @@ try {
   assert.equal(checked.route.rules[0].outbound, 'direct');
   assert.ok(checked.route.rules[0].ip_cidr.includes('10.0.0.0/8'));
   assert.equal(checked.outbounds.find(outbound => outbound.tag === 'vpn-out').type, 'selector');
+  // Старый кэш может содержать повторы одного тега. Порядок задаёт первый выбранный узел группы.
+  const cached = JSON.parse(nodesBefore.trim().replace(/,$/, ''));
+  const second = {...cached, tag: 'test-source-second', server: 'second.example.com'};
+  write('profiles/cache/test-source.nodes', [cached, cached, second].map(node => JSON.stringify(node)+',\n').join(''));
+  const withPriority = snapshot();
+  withPriority.data.subscriptions.find(source => source.id === 'test-source').priority = [second.tag];
+  // Импорт в sandbox пишет локальный путь; сохранение каталога принимает штатные пути роутера.
+  withPriority.data.subscriptions.find(source => source.id.startsWith('manual-')).urls = ['file:///etc/sing-box/manual-subscriptions/test.txt'];
+  const savedPriority = run(['save', withPriority.revision], JSON.stringify(withPriority.data));
+  assert.equal(savedPriority.status, 0, savedPriority.stderr);
+  assert.equal(spawnSync('sh', [safeCli, 'check', 'black'], {env, encoding: 'utf8'}).status, 0);
+  const prioritized = JSON.parse(fs.readFileSync(path.join(root, 'last-checked.json'), 'utf8'));
+  assert.equal(prioritized.outbounds.filter(node => node.tag === cached.tag).length, 1);
+  assert.deepEqual(prioritized.outbounds.find(node => node.tag === 'vpn-out').outbounds, [second.tag, cached.tag]);
   write('profiles/active', 'old-profile\n');
   mock('cp', 'case "$2" in */config.json.new) exit 1 ;; esac\nexec /bin/cp "$@"\n');
   failed = spawnSync('sh', [safeCli, 'activate', 'black'], {env, encoding: 'utf8'});
@@ -131,7 +148,8 @@ try {
   const curl = mock('curl', '');
   fs.writeFileSync(curl, `#!/usr/bin/env node
 const fs=require('node:fs'), file=process.env.TEST_SELECTOR, state=JSON.parse(fs.readFileSync(file));
-if(process.argv.includes('PUT')) {
+if(process.argv.some(arg=>arg.endsWith('/delay'))) { console.log(JSON.stringify(process.env.TEST_DELAY_FAIL ? {} : {delay:14})); }
+else if(process.argv.includes('PUT')) {
   const value=JSON.parse(fs.readFileSync(0,'utf8')).name;
   if(!process.env.TEST_REJECT_SELECTION) { state.proxies['vpn-out'].now=value; fs.writeFileSync(file,JSON.stringify(state)); }
 } else console.log(JSON.stringify(state));
@@ -148,5 +166,27 @@ if(process.argv.includes('PUT')) {
   assert.equal(select('auto').status, 1);
   assert.equal(select('not-loaded').status, 1);
   assert.equal(fs.readFileSync(path.join(root, 'config.json'), 'utf8'), '{"old":"working-config"}');
+  // Переключение из панели требует свежего результата и повторной проверки реального загруженного узла.
+  delete selectorEnv.TEST_REJECT_SELECTION;
+  write('profiles/active', 'black');
+  const api = JSON.parse(fs.readFileSync(selector));
+  api.proxies['vpn-out'].all.push(cached.tag);
+  fs.writeFileSync(selector, JSON.stringify(api));
+  selectorEnv.VPN_TEST_ROOT = path.join(root, 'probe-jobs');
+  const revision = snapshot().revision;
+  const checkedSelect = () => spawnSync('sh', [safeCli, 'node-checked', cached.tag, 'black', 'job-1', revision], {env: selectorEnv, encoding: 'utf8'});
+  const now = Math.floor(Date.now()/1000);
+  function proof(start, ok) {
+    write('probe-jobs/job-1/job.json', JSON.stringify({state:'done', started_at:start, target:{url:'https://example.com/check'},
+      results:[{tag:cached.tag, ok, attempts:2, passed:ok ? 2 : 1}]}));
+  }
+  write('probe-jobs/job-1/config.sha256', require('node:crypto').createHash('sha256').update(fs.readFileSync(path.join(root,'config.json'))).digest('hex'));
+  proof(now-400, true); assert.notEqual(checkedSelect().status, 0);
+  proof(now, false); assert.notEqual(checkedSelect().status, 0);
+  proof(now, true); selectorEnv.TEST_DELAY_FAIL = '1'; assert.notEqual(checkedSelect().status, 0);
+  assert.equal(JSON.parse(fs.readFileSync(selector)).proxies['vpn-out'].now, 'loaded-node');
+  delete selectorEnv.TEST_DELAY_FAIL;
+  const switched = checkedSelect(); assert.equal(switched.status, 0, switched.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(selector)).proxies['vpn-out'].now, cached.tag);
   console.log('PASS: clean catalog initialization, stable node IDs, arbitrary profiles, stale revision, invalid refs, rule CRUD, no config restart');
 } finally { fs.rmSync(work, {recursive: true, force: true}); }

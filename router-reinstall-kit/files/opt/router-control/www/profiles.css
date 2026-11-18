@@ -25,7 +25,6 @@
 #vpn-app .vp-order-row label { display: flex; align-items: center; gap: 8px; margin: 0; min-height: 48px; font-weight: 400; }
 #vpn-app .vp-order-row input[type=checkbox] { appearance: auto; width: 20px; height: 20px; min-height: 20px; margin: 0; flex: 0 0 20px; }
 #vpn-app .vp-order-row button { width: 44px; height: 44px; padding: 0; font-size: 20px; }
-#vpn-app .vp-node { border-bottom: 1px solid #c7d3dd; padding: 16px 0; overflow-wrap: anywhere; }
 #vpn-app .vp-result { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0; }
 #vpn-app .vp-result:empty { display: none; }
 #vpn-app .vp-error { color: #a51d2b; }
@@ -40,9 +39,28 @@
 #vpn-app .vp-compact { border-bottom: 1px solid #c7d3dd; margin-top: 8px; }
 #vpn-app .vp-compact > summary { cursor: pointer; min-height: 48px; padding: 12px 0; overflow-wrap: anywhere; }
 #vpn-app .vp-compact > summary:focus-visible { outline: 3px solid #1777b9; outline-offset: 2px; }
+#vpn-app .vp-node { border: 1px solid #bac6cf; border-radius: 6px; }
+#vpn-app .vp-node > summary { padding: 8px 12px; }
+#vpn-app .vp-node[open] { border-color: #145b91; }
+#vpn-app .vp-node[open] > summary { border-bottom: 1px solid #bac6cf; background: #e5f0f7; border-radius: 5px 5px 0 0; }
+#vpn-app .vp-import { border: 2px solid #39749f; border-radius: 6px; padding: 0 12px; margin-bottom: 16px; }
+#vpn-app .vp-import > summary { margin: 0 -12px; padding: 12px; border-radius: 4px; background: #e5f0f7; color: #153b55; font-weight: 700; }
+#vpn-app .vp-import[open] { padding-bottom: 12px; }
+#vpn-app .vp-import[open] > summary { border-bottom: 1px solid #91afc5; border-radius: 4px 4px 0 0; }
+#vpn-app .vp-node-source { display: block; color: #52616d; font-size: 13px; padding-left: 16px; }
+#vpn-app .vp-node-body { padding: 12px; }
 #vpn-app code { display: block; overflow-wrap: anywhere; font-size: 13px; }
-#vpn-app .vp-tests { border-block: 1px solid #c7d3dd; padding: 12px 0; }
-#vpn-app .vp-tests h3 { font-size: 16px; margin: 0; }
+#vpn-app .vp-tests { border: 1px solid #bac6cf; border-radius: 6px; padding: 0 12px; }
+#vpn-app .vp-tests[open] { padding-bottom: 12px; }
+#vpn-app .vp-test-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 10px 0; max-width: 38rem; }
+#vpn-app .vp-test-pair button { width: 100%; padding-inline: 6px; }
+#vpn-app[data-view=overview] .vp-section { padding: 0; }
+#vpn-app[data-view=overview] .vp-status { margin-block: 4px; }
+#vpn-app[data-view=overview] .vp-overview-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 10px; }
+#vpn-app[data-view=overview] .vp-overview-grid > div { padding: 12px 16px; border: 1px solid #c7d3dd; border-radius: 8px; background: #f5f9fc; margin: 0; }
+#vpn-app[data-view=overview] .vp-overview-grid p { margin: 4px 0; }
+#vpn-app[data-view=overview] .vp-actions button:first-child { background: #145b91; color: white; }
+#vpn-app[data-view=overview] a { margin-inline-start: 12px; }
 #vpn-app .vp-tests progress { width: 100%; accent-color: #147a52; }
 #vpn-app .vp-section > progress { display: block; width: 100%; accent-color: #147a52; margin: 8px 0; }
 #vpn-app .vp-section > progress[hidden] { display: none; }
@@ -53,19 +71,17 @@
 #vpn-app .vp-checkbox input { appearance: auto; flex: 0 0 20px; width: 20px; height: 20px; margin: 2px 0; }
 #vpn-app .vp-target-row { border-bottom: 1px solid #e1e6ea; padding: 8px 0; }
 #vpn-app .vp-target-row label { font-size: 13px; margin: 4px 0; }
-#vpn-app .vp-probe-results { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 13px; }
-#vpn-app .vp-probe-results :is(th, td) { text-align: left; padding: 8px; border-bottom: 1px solid #c7d3dd; overflow-wrap: anywhere; }
-#vpn-app .vp-probe-results th:first-child { width: 36%; }
 @media (max-width: 480px) {
   #vpn-app .vp-recovery-grid { grid-template-columns: minmax(0, 1fr); gap: 0; }
-  #vpn-app .vp-probe-results :is(table, tbody, tr, td) { display: block; }
-  #vpn-app .vp-probe-results thead { display: none; }
-  #vpn-app .vp-probe-results tr { border-bottom: 1px solid #c7d3dd; padding: 8px 0; }
-  #vpn-app .vp-probe-results td { display: grid; grid-template-columns: 80px minmax(0, 1fr); gap: 8px; border: 0; padding: 3px 0; }
-  #vpn-app .vp-probe-results td::before { content: attr(data-label); color: #52616d; }
-  #vpn-app .vp-probe-results td p { grid-column: 2; margin: 0; }
   #vpn-app .vp-nav { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
   #vpn-app input:not([type=checkbox]), #vpn-app select, #vpn-app textarea { font-size: 16px; }
   #vpn-app .vp-save { align-items: stretch; flex-direction: column; }
   #vpn-app .vp-nav button { padding: 8px; }
 }
+
+#vpn-app .vp-measurements { display: flex; flex-wrap: wrap; gap: 4px 12px; padding-left: 16px; font-size: 13px; font-weight: 600; }
+#vpn-app .vp-metric-good { color: #14623e; }
+#vpn-app .vp-metric-warn { color: #875000; }
+#vpn-app .vp-metric-bad { color: #a51d2b; }
+#vpn-app .vp-info { color: #145b91; }
+#vpn-app .vp-muted { color: #52616d; }

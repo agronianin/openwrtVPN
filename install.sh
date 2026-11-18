@@ -50,7 +50,7 @@ for name in vpnctl vpn-subscriptions-update vpn-toggle vpn-health-check vpn-auto
 done
 for name in sing-box router-control-web; do copy_file "etc/init.d/$name" 755; done
 copy_file opt/router-control/www/cgi-bin/router-control 755
-for name in vpn.js vpn.css profiles.js profiles.css index.html; do copy_file "opt/router-control/www/$name" 644; done
+for name in vpn.js vpn.css profiles.js profiles.css jsQR-1.4.0.js jsQR-LICENSE.txt index.html; do copy_file "opt/router-control/www/$name" 644; done
 copy_file etc/sing-box/rule-packs/apply-rules 755
 copy_file etc/sing-box/rule-packs/RULES-FORMAT.md 644
 [ -f /etc/config/openwrtvpn ] || cp "$ROOT/defaults/openwrtvpn" /etc/config/openwrtvpn

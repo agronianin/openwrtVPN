@@ -20,6 +20,9 @@ class Element {
   remove() { this.parent.children.splice(this.parent.children.indexOf(this), 1); this.parent = null; }
   get isConnected() { return this === root || !!(this.parent && this.parent.isConnected); }
   setAttribute(key, value) { this.attributes[key] = value; }
+  getAttribute(key) { return this.attributes[key]; }
+  querySelector(selector) { return this.querySelectorAll(selector)[0]; }
+  focus() {}
   removeAttribute(key) { delete this.attributes[key]; }
   addEventListener(type, callback) { (this.listeners[type] ||= []).push(callback); }
   async fire(type) { for (const callback of this.listeners[type] || []) await callback({ target: this }); await settle(); }
@@ -56,19 +59,22 @@ const initial = {
   rules: [{ id: '05-proxy', name: 'Proxy', content: 'proxy content', revision: 'sha-proxy' },
     { id: '20-direct', name: 'Direct', content: 'direct content', revision: 'sha-direct' }]
 };
-function boot(snapshot = initial) {
+function boot(snapshot = initial, localStorage, view) {
   root = new Element('main'); requests = []; replies = []; confirmAnswer = true; timers = new Map();
+  if (view) root.setAttribute('data-view', view);
   const seed = new Element('script'); seed.textContent = JSON.stringify(snapshot);
   context = {
     document: { getElementById: id => id === 'vpn-app' ? root : seed, createElement: tag => new Element(tag) },
-    window: { location: { pathname: '/cgi-bin/router-control' }, confirm: () => confirmAnswer,
+    window: { localStorage, location: { pathname: '/cgi-bin/router-control' }, confirm: () => confirmAnswer,
       addEventListener: (name, callback) => { if (name === 'beforeunload') unload = callback; } },
     URLSearchParams, URL, AbortController,
     setTimeout: (callback, delay) => { const id = {}; timers.set(id, { callback, delay }); return id; },
     clearTimeout: id => timers.delete(id),
     fetch: async (url, options) => {
       requests.push({ url, options, fields: Object.fromEntries(options.body) });
-      const reply = replies.shift() || { ok: true, snapshot: initial };
+      const fields = requests.at(-1).fields;
+      const saved = fields.action === 'vpn_profiles_save' ? { ...snapshot, data: JSON.parse(fields.content) } : initial;
+      const reply = replies.shift() || { ok: true, snapshot: saved };
       if (reply instanceof Error) throw reply;
       if (reply.hang) return new Promise(() => {});
       return { ok: reply.http === undefined, status: reply.http, statusText: 'Failure', json: async () => {
@@ -81,28 +87,44 @@ function boot(snapshot = initial) {
 }
 function buttons(parent = root) { return parent.querySelectorAll('button'); }
 function named(text, parent = root) {
-  const match = buttons(parent).find(node => node.textContent === text || node.attributes['aria-label'] === text);
+  const match = buttons(parent).find(node => node.textContent === text || node.textContent.startsWith(text + ' · ') || node.attributes['aria-label'] === text);
   assert.ok(match, 'Missing button: ' + text); return match;
 }
 async function click(text, parent) { const node = named(text, parent); assert.ok(!node.disabled, text); await node.fire('click'); }
 async function edit(node, value, type = 'input') { node.value = value; await node.fire(type); }
-function editor(id) {
-  const details = root.querySelectorAll('details').find(node => node.attributes['data-editor-id'] === id);
+function openDetails(details) {
   if (details && !details.open) { details.open = true; details.fire('toggle'); }
-  return root.querySelectorAll('fieldset').find(node => node.children.some(child => child.tagName === 'code' && child.textContent === id));
+  return details;
+}
+function editor(id) {
+  const details = openDetails(root.querySelectorAll('details').find(node => node.attributes['data-editor-id'] === id));
+  return details && details.querySelectorAll('fieldset')[0];
+}
+function disclosure(title, parent = root) {
+  return parent.querySelectorAll('details').find(node => node.children[0].textContent === title);
 }
 function group(title) { return root.querySelectorAll('fieldset').find(node => node.children[0].textContent === title); }
 function postedData() { return JSON.parse(requests.at(-1).fields.content); }
 function nodeSearch() { return root.querySelectorAll('input').find(node => node.type === 'search'); }
+function nodeCards() { return root.querySelectorAll('details').filter(node => node.classes.has('vp-node')); }
+function nodeCard(tag) { return nodeCards().find(node => node.attributes['data-editor-id'] === tag); }
 
-// Приоритеты не сортируются сами, идентификаторы стабильны, сохранение отправляет весь документ с исходной ревизией.
+// Приоритеты не сортируются сами, идентификаторы стабильны, сохранение одного профиля отправляет его правки с исходной ревизией.
 async function testAtomicSaveAndOrdering() {
   boot(); await click('Профили');
-  editor('work');
-  assert.deepEqual(group('Подписки по приоритету').querySelectorAll('span').map(node => node.textContent), ['1. Second', '2. First']);
+  const profile = editor('work');
+  const groups = disclosure('Группы и узлы', profile);
+  const rules = disclosure('Правила', profile);
+  assert.equal(groups.open, false);
+  assert.equal(rules.open, false);
+  openDetails(rules);
+  assert.equal(group('Группы узлов по приоритету'), undefined);
+  assert.ok(group('Правила по приоритету'));
+  openDetails(groups);
+  assert.deepEqual(group('Группы узлов по приоритету').querySelectorAll('span').map(node => node.textContent), ['1. Second', '2. First']);
   await edit(editor('work').querySelectorAll('input')[0], 'Renamed');
   await click('Выше: First'); await click('Ниже: Direct');
-  await click('Сохранить изменения');
+  await click('Сохранить профиль');
   assert.equal(requests[0].url, '/cgi-bin/router-control');
   assert.equal(requests[0].options.method, 'POST');
   assert.equal(requests[0].fields.revision, 'revision-1');
@@ -119,58 +141,162 @@ async function testAtomicSaveAndOrdering() {
 async function testFailuresAndDiscard() {
   for (const reply of [{ ok: false, error: 'Revision conflict' }, { http: 503 }, new Error('Network unavailable')]) {
     boot(); await click('Профили'); await edit(editor('work').querySelectorAll('input')[0], 'Unsaved');
-    replies.push(reply); await click('Сохранить изменения');
+    replies.push(reply); await click('Сохранить профиль');
     assert.ok(root.textContent.includes(reply.error || (reply.http ? 'HTTP 503' : reply.message)));
     assert.equal(editor('work').querySelectorAll('input')[0].value, 'Unsaved');
-    assert.equal(named('Сохранить изменения').disabled, false);
+    assert.equal(named('Сохранить профиль').disabled, false);
     let prevented = false; unload({ preventDefault: () => { prevented = true; } }); assert.ok(prevented);
-    await click('Статус'); confirmAnswer = false; await edit(root.querySelectorAll('select')[1], 'b', 'change');
+    await click('Статус'); confirmAnswer = false; await click('Обновить состояние');
     assert.equal(requests.length, 1);
-    confirmAnswer = true; await edit(root.querySelectorAll('select')[1], 'b', 'change');
-    assert.equal(requests.at(-1).fields.arg, 'b');
+    confirmAnswer = true; await click('Обновить состояние');
+    assert.equal(requests.at(-1).fields.action, 'vpn_profiles_snapshot');
     assert.ok(!root.textContent.includes('Есть несохраненные изменения'));
   }
 }
 
 // Главный экран ограничивает узлы источниками профиля и явными добавлениями; данные остаются текстом, а не HTML.
 async function testConnectionAndSearch() {
-  boot();
-  const manual = root.querySelectorAll('select')[1];
-  assert.deepEqual(manual.children.map(node => node.value), ['', 'a', 'b', 'extra']);
+  const fixture = JSON.parse(JSON.stringify(initial));
+  fixture.nodes.find(node => node.tag === 'extra').selectable = true;
+  boot(fixture); openDetails(disclosure('Подбор узла профиля «Work»'));
+  assert.deepEqual(nodeCards().map(card => card.attributes['data-editor-id']), ['a', 'b', 'extra']);
   assert.equal(root.querySelectorAll('img').length, 0);
-  await edit(manual, 'extra', 'change'); assert.equal(requests.at(-1).fields.arg, 'extra');
-  await edit(root.querySelectorAll('select')[0], 'off', 'change');
+  const card = openDetails(nodeCard('extra'));
+  const apply = named('Переключить VPN на этот узел', card);
+  assert.ok(apply.disabled); assert.equal(requests.length, 0);
+  const measured = { tag: 'extra', ok: true, passed: 2, attempts: 2, latency_ms: 14 };
+  replies.push({ ok: true, job: { ...probeJob('done', 1, [measured]), started_at: Date.now()/1000, total: 1 } });
+  await click('Быстрый тест', card);
+  assert.equal(requests.length, 1); assert.equal(requests[0].fields.action, 'vpn_profiles_probe_start');
+  await click('Переключить VPN на этот узел', card);
+  assert.equal(requests.at(-1).fields.arg, 'extra');
+  assert.equal(requests.at(-1).fields.content, 'job-1');
+  replies.push({ ok: true, snapshot: { ...initial, running: false, selection: null, effective: null } });
+  await click('Выключить VPN');
   assert.equal(requests.at(-1).fields.action, 'vpn_profiles_activate'); assert.equal(requests.at(-1).fields.arg, 'off');
+  assert.equal(root.querySelectorAll('select')[0].value, 'work');
+  await click('Включить VPN');
+  assert.equal(requests.at(-1).fields.action, 'vpn_profiles_on');
+  assert.ok(named('Выключить VPN'));
   await click('Узлы'); await edit(nodeSearch(), 'Node B');
-  assert.equal(buttons().filter(node => node.textContent === 'Проверить узел').length, 1);
-  replies.push({ ok: true, job: { ...probeJob('done', 1), total: 1 } }); await click('Проверить узел');
-  assert.equal(requests.at(-1).fields.action, 'vpn_profiles_probe_start');
-  assert.deepEqual(postedData(), { tags: ['b'], target: 'google', speed: false });
+  assert.deepEqual(nodeCards(), [nodeCard('b')]);
   assert.equal(root.querySelectorAll('script').length, 0);
   await click('Узлы'); await edit(root.querySelectorAll('select')[0], 'second', 'change');
-  assert.equal(buttons().filter(node => node.textContent === 'Проверить узел').length, 1);
+  assert.deepEqual(nodeCards(), [nodeCard('b')]);
+}
+
+// Одиночная проверка обновляет только карточку узла и сохраняет её при переходах по вкладкам.
+async function testSingleNodeProbe() {
+  boot(); await click('Узлы');
+  assert.equal(nodeCards().length, initial.nodes.length);
+  const card = nodeCard('b'), neighbor = nodeCard('a');
+  assert.ok(nodeCards().every(node => !node.open && buttons(node).length === 0));
+  assert.equal(card.children[0].querySelectorAll('strong')[0].textContent, 'Node B');
+  assert.equal(card.children[0].querySelectorAll('span')[0].textContent, 'hy2 · Second');
+  openDetails(card);
+  const check = named('Быстрый тест', card);
+  const batchStatus = root.querySelectorAll('p').find(node => node.textContent.includes('К тесту:'));
+  const batchText = batchStatus.textContent;
+  replies.push({ ok: true, job: { ...probeJob(), total: 1 } }); await click('Быстрый тест', card);
+  assert.equal(requests.at(-1).fields.action, 'vpn_profiles_probe_start');
+  assert.deepEqual(postedData(), { tags: ['b'], target: 'google', speed: false });
+  assert.ok(card.textContent.includes('Проверка HTTPS'));
+  assert.equal(check.disabled, true);
+  const measurement = { tag: 'b', passed: 2, attempts: 2, ok: true, http_code: 204, latency_ms: 13 };
+  replies.push({ ok: true, job: { ...probeJob('done', 1, [measurement]), total: 1 } }); await tick();
+  assert.equal(nodeCard('b'), card); assert.equal(named('Быстрый тест', card), check);
+  assert.equal(check.disabled, false); assert.equal(card.open, true);
+  assert.equal(neighbor.open, false);
+  assert.equal(batchStatus.textContent, batchText);
+  const reading = 'Google · Доступен · 2/2 · HTTP 204 · 13 мс';
+  assert.ok(card.textContent.includes(reading)); assert.ok(!neighbor.textContent.includes(reading));
+  assert.equal(root.querySelectorAll('table').length, 0);
+  replies.push(new Error('Проверка недоступна')); await click('Быстрый тест', card);
+  assert.ok(card.textContent.includes('Проверка недоступна'));
+  assert.equal(batchStatus.textContent, batchText);
+  await click('Статус'); await click('Узлы');
+  assert.equal(nodeCard('b').open, true); assert.ok(nodeCard('b').textContent.includes(reading));
+}
+
+// Сортировка учитывает последние замеры свёрнутых узлов, быстрый тест сохраняет известную скорость.
+async function testNodeMeasurements() {
+  const cache = new Map();
+  const storage = { getItem: key => cache.get(key), setItem: (key, value) => cache.set(key, value) };
+  boot(initial, storage); await click('Узлы');
+  const sort = root.querySelectorAll('select').find(control => control.children.some(option => option.value === 'latency_ms'));
+  for (const [tag, latency, speed] of [['b', 400, 25], ['extra', 50, 3]]) {
+    const card = openDetails(nodeCard(tag));
+    const item = { tag, passed: 2, attempts: 2, ok: true, latency_ms: latency, speed_mbps: speed };
+    replies.push({ ok: true, job: { ...probeJob('done', 1, [item]), total: 1, speed: true } });
+    await click('Тест скорости', card);
+    assert.deepEqual(postedData(), { tags: [tag], target: 'google', speed: true });
+    card.open = false; await card.fire('toggle');
+    const metrics = card.children[0].querySelectorAll('span');
+    assert.ok(metrics.some(metric => metric.textContent === speed + ' Мбит/с' && metric.className === (speed < 5 ? 'vp-metric-bad' : 'vp-metric-good')));
+  }
+  await edit(sort, 'speed_mbps', 'change'); assert.deepEqual(nodeCards().slice(0, 2), [nodeCard('b'), nodeCard('extra')]);
+  await edit(sort, 'latency_ms', 'change'); assert.deepEqual(nodeCards().slice(0, 2), [nodeCard('extra'), nodeCard('b')]);
+  const item = { tag: 'b', passed: 2, attempts: 2, ok: true, latency_ms: 10, speed_mbps: null };
+  replies.push({ ok: true, job: { ...probeJob('done', 1, [item]), total: 1 } });
+  await click('Быстрый тест', openDetails(nodeCard('b')));
+  assert.equal(nodeCards()[0], nodeCard('b'));
+  assert.ok(nodeCard('b').children[0].textContent.includes('25 Мбит/с'));
+  await edit(sort, 'name', 'change');
+  assert.deepEqual(nodeCards().map(card => card.attributes['data-editor-id']), ['a', 'excluded', 'extra', 'b']);
+  boot(initial, storage); await click('Узлы');
+  assert.ok(!nodeCard('b').open);
+  assert.ok(nodeCard('b').children[0].textContent.includes('25 Мбит/с'));
+  assert.ok(nodeCard('b').children[0].textContent.includes('10 мс'));
 }
 
 // CRUD подписок и профилей сохраняет порядок зеркал и блокирует удаление используемого источника.
 async function testCatalogCrud() {
-  boot(); await click('Подписки'); await click('Удалить подписку', editor('first'));
+  boot(); await click('Группы узлов'); await click('Удалить подписку', editor('first'));
   assert.ok(root.textContent.includes('Подписка используется')); await click('Добавить подписку');
   const subscription = editor('source-1');
   await edit(subscription.querySelectorAll('input')[0], 'New source');
   await edit(subscription.querySelectorAll('textarea')[0], 'https://z.example\nhttps://a.example');
   await click('Профили'); await click('Добавить профиль');
   const profile = editor('profile-1');
+  openDetails(disclosure('Группы и узлы', profile));
   const checks = profile.querySelectorAll('input').filter(node => node.type === 'checkbox');
   checks[0].checked = true; await checks[0].fire('change');
-  await click('Сохранить изменения');
-  assert.deepEqual(postedData().subscriptions[2].urls, ['https://z.example', 'https://a.example']);
+  await click('Сохранить профиль', profile);
+  assert.deepEqual(postedData().subscriptions, initial.data.subscriptions);
   assert.equal(postedData().profiles[1].id, 'profile-1');
   assert.deepEqual(postedData().profiles[1].subscriptions, ['first']);
+  await click('Группы узлов');
+  assert.equal(editor('source-1').querySelectorAll('input')[0].value, 'New source');
+  await click('Сохранить подписку', editor('source-1'));
+  assert.deepEqual(postedData().subscriptions[2].urls, ['https://z.example', 'https://a.example']);
+  await click('Профили'); await click('Удалить профиль', editor('profile-1'));
   await click('Профили'); await click('Добавить профиль'); await click('Удалить профиль', editor('profile-1'));
   assert.equal(editor('profile-1'), undefined);
-  await click('Подписки'); await click('Добавить подписку'); await click('Удалить подписку', editor('source-1'));
-  assert.equal(editor('source-1'), undefined);
+  await click('Группы узлов'); await click('Добавить подписку'); await click('Удалить подписку', editor('source-2'));
+  assert.equal(editor('source-2'), undefined);
   await click('Обновить все'); assert.equal(requests.at(-1).fields.arg, 'all');
+}
+
+// Имя узла сохраняется по тегу, а локальный источник обозначается как ручная группа.
+async function testNodeNameAndLocalGroup() {
+  const local = JSON.parse(JSON.stringify(initial));
+  local.data.subscriptions[0].urls = ['file:///etc/sing-box/manual-subscriptions/test.txt'];
+  boot(local); await click('Группы узлов');
+  assert.ok(root.textContent.includes('First · Ручная группа'));
+  assert.equal(editor('first').querySelectorAll('textarea').length, 0);
+  const heading = root.querySelectorAll('details').find(node => node.attributes['data-editor-id'] === 'first').children[0];
+  assert.equal(heading.textContent, 'First · Ручная группа');
+  assert.equal(heading.title, 'ID: first');
+  const priority = group('Приоритет узлов внутри группы').querySelectorAll('input').find(node => node.type === 'checkbox');
+  priority.checked = true; await priority.fire('change');
+  await click('Сохранить группу', editor('first'));
+  assert.deepEqual(postedData().subscriptions[0].priority, ['a']);
+  await click('Узлы');
+  const card = openDetails(nodeCard('b'));
+  await edit(card.querySelectorAll('input')[0], 'New node label');
+  await click('Сохранить узел', card);
+  assert.deepEqual(postedData().nodeNames, { b: 'New node label' });
+  assert.deepEqual(postedData().profiles, initial.data.profiles);
 }
 
 // Правила сохраняются отдельным действием, переживают переходы между разделами и не удаляются при наличии ссылок.
@@ -181,7 +307,7 @@ async function testRuleActions() {
   await click('Статус'); await click('Правила'); assert.equal(editor('05-proxy').querySelectorAll('textarea')[0].value, 'updated content');
   replies.push({ ok: false, error: 'Invalid rule' }); await click('Сохранить правило', editor('05-proxy'));
   assert.equal(requests.at(-1).fields.action, 'vpn_profiles_rule_save');
-  assert.equal(requests.at(-1).fields.arg, '05-proxy'); assert.equal(requests.at(-1).fields.content, 'updated content');
+  assert.equal(requests.at(-1).fields.arg, '05-proxy'); assert.equal(requests.at(-1).fields.content, '# profile-name: Proxy\nupdated content');
   assert.equal(requests.at(-1).fields.revision, 'sha-proxy');
   assert.equal(editor('05-proxy').querySelectorAll('textarea')[0].value, 'updated content');
   const fresh = root.querySelectorAll('fieldset').find(node => node.children[0].textContent === 'Новое правило');
@@ -205,7 +331,7 @@ async function testLargeCatalog() {
   large.data.profiles[0].nodes = ['node-599', 'node-598'];
   boot(large); assert.equal(buttons().some(node => node.textContent === 'Сохранить изменения'), false);
   await click('Профили'); assert.equal(root.querySelectorAll('input').length, 0);
-  editor('work');
+  openDetails(disclosure('Группы и узлы', editor('work')));
   const chooser = group('Дополнительные узлы по приоритету');
   let checks = chooser.querySelectorAll('input').filter(node => node.type === 'checkbox');
   assert.equal(checks.length, 32); assert.equal(checks.filter(node => node.checked).length, 2);
@@ -215,10 +341,10 @@ async function testLargeCatalog() {
   assert.ok(chooser.textContent.includes('1. Server 599')); assert.ok(chooser.textContent.includes('2. Server 598'));
   checks[2].checked = true; await checks[2].fire('change');
   assert.ok(chooser.textContent.includes('3. Server 500'));
-  await click('Узлы'); assert.equal(buttons().filter(node => node.textContent === 'Проверить узел').length, 30);
+  await click('Узлы'); assert.equal(nodeCards().length, 30);
   await click('Далее'); assert.ok(root.textContent.includes('Server 30')); assert.ok(!root.textContent.includes('Server 0'));
   await edit(nodeSearch(), 'node-599');
-  assert.equal(buttons().filter(node => node.textContent === 'Проверить узел').length, 1);
+  assert.deepEqual(nodeCards(), [nodeCard('node-599')]);
 }
 
 // Фактическое подключение не маскируется состоянием «выключен», а сохранение своего правила не требует потери чужих правок.
@@ -234,13 +360,23 @@ async function testEffectiveAndRuleGuard() {
   confirmAnswer = false; await click('Сохранить правило', editor('05-proxy')); assert.equal(requests.length, 1);
   await edit(editor('05-proxy').querySelectorAll('textarea')[0], 'changed again');
   await edit(editor('20-direct').querySelectorAll('textarea')[0], 'another draft');
-  await click('Сохранить правило', editor('05-proxy')); assert.equal(requests.length, 1);
+  await click('Сохранить правило', editor('05-proxy')); assert.equal(requests.length, 2);
   assert.equal(editor('20-direct').querySelectorAll('textarea')[0].value, 'another draft');
 }
 
 // Импорт передает имя, один URI и ревизию; ошибки сохраняют ввод, успех удаляет URI, обновление защищает чужие черновики.
 async function testImportAndRefresh() {
   boot(); await click('Узлы');
+  const importer = disclosure('Добавить узел');
+  assert.equal(importer.open, false); openDetails(importer);
+  await edit(importer.querySelectorAll('textarea')[0], 'https://sub.example/list');
+  await click('Продолжить в подписках');
+  const subscription = editor('source-1');
+  assert.equal(requests.length, 0);
+  assert.equal(subscription.querySelectorAll('textarea')[0].value, 'https://sub.example/list');
+  await click('Сохранить подписку', subscription);
+  assert.deepEqual(postedData().subscriptions.at(-1).urls, ['https://sub.example/list']);
+  boot(); await click('Узлы'); openDetails(disclosure('Добавить узел'));
   const name = root.querySelectorAll('input').find(node => node.type !== 'search');
   const uri = root.querySelectorAll('textarea')[0];
   await edit(name, 'Local node'); await edit(uri, 'vless://example@test.example:443');
@@ -268,11 +404,11 @@ async function testUpdateJob() {
   for (const [state, text] of Object.entries(states)) {
     const snapshot = JSON.parse(JSON.stringify(initial));
     snapshot.updateJob = { state, message: '<test>job message</test>' };
-    boot(snapshot); await click('Подписки');
+    boot(snapshot); await click('Группы узлов');
     assert.ok(root.textContent.includes(text)); assert.ok(root.textContent.includes('<test>job message</test>'));
     assert.equal(root.querySelectorAll('test').length, 0);
   }
-  boot(); await click('Подписки');
+  boot(); await click('Группы узлов');
   const queued = JSON.parse(JSON.stringify(initial)); queued.updateJob = { state: 'queued' };
   replies.push({ ok: true, snapshot: queued, output: 'Обновление поставлено в очередь' });
   await click('Обновить все');
@@ -297,15 +433,37 @@ async function testLastCheck() {
     boot({ ...initial, connection: { ...initial.connection, lastCheck: check }, ...overrides });
     assert.ok(root.textContent.includes('Последняя проверка:')); assert.ok(root.textContent.includes('Нестабильно · 1/2 · 0 мс · HTTP 503'));
     assert.ok(root.textContent.includes(check.reason)); assert.equal(root.querySelectorAll('img').length, 0);
-    assert.equal(root.textContent.includes('Устарело:'), Object.keys(overrides).length > 0);
+    const stale = Object.keys(overrides).length > 0;
+    assert.equal(root.textContent.includes('Устарело:'), stale);
+    const current = root.querySelectorAll('p').find(node => node.textContent.startsWith('Текущий узел:'));
+    assert.ok(current.className.includes(stale ? 'vp-muted' : 'vp-metric-warn'));
+    assert.equal(root.querySelectorAll('p').find(node => node.textContent.startsWith('Нестабильно')).className, stale ? 'vp-muted' : 'vp-metric-warn');
     await click('Узлы'); await click('Статус'); assert.ok(root.textContent.includes(check.reason));
   }
   boot({ ...initial, connection: { ...initial.connection, lastCheck: { ...check, ok: true, passed: 2, latency_ms: null, reason: '' } } });
   assert.ok(root.textContent.includes('HTTPS доступен · 2/2')); assert.ok(!root.textContent.includes('null мс'));
   replies.push({ ok: true, snapshot: { ...initial, effective: { tag: 'extra', title: 'Extra' },
     connection: { ...initial.connection, lastCheck: check } } });
-  await edit(root.querySelectorAll('select')[1], 'extra', 'change');
+  await click('Обновить состояние');
   assert.ok(root.textContent.includes(check.reason)); assert.ok(root.textContent.includes('Устарело:'));
+}
+
+// Обзор показывает сводку без редакторов и запускает те же задания проверки и подбора.
+async function testOverview() {
+  for (const [label, kind] of [['Проверить текущий узел', 'check'], ['Подобрать и включить узел', 'find']]) {
+    boot(initial, null, 'overview');
+    assert.equal(root.querySelectorAll('nav, select').length, 0);
+    assert.ok(root.textContent.includes('Профиль: Work'));
+    assert.ok(root.textContent.includes('Текущий узел: Node B'));
+    replies.push(connectionReply('running', { job: {kind} })); await click(label);
+    assert.equal(requests[0].fields.arg, kind);
+    assert.equal(requests[0].fields.action, 'vpn_profiles_connection_start');
+    assert.equal(named(label).disabled, true);
+    replies.push(connectionReply('done', {job: {kind}}), {ok:true, snapshot: initial}); await tick();
+    assert.equal(named(label).disabled, false);
+  }
+  boot({...initial, running:false}, null, 'overview');
+  assert.ok(named('Подобрать и включить узел').disabled);
 }
 
 // Автовыбор — конечное задание: polling показывает прогресс, блокирует конфликтующие команды и один раз читает итоговый снимок.
@@ -325,7 +483,7 @@ async function testSelectionFeedback() {
   for (const name of ['Автовыбор узла', 'Проверить подключение', 'Применить профиль', 'Обновить состояние', 'Сохранить автовосстановление']) {
     assert.equal(named(name).disabled, true);
   }
-  assert.equal(root.querySelectorAll('select')[1].disabled, true);
+  assert.equal(root.querySelectorAll('select')[0].disabled, true);
   await named('Автовыбор узла').fire('click'); assert.equal(requests.length, 1);
   const nav = root.querySelectorAll('nav')[0];
   replies.push(connectionReply('running', { job: { done: 3, message: '<b>testing</b>' } })); await tick();
@@ -334,7 +492,7 @@ async function testSelectionFeedback() {
   const selected = { tag: 'extra', title: 'Extra', latency_ms: 12 };
   replies.push(connectionReply('done', { job: { done: 4, selected } }),
     { ok: true, snapshot: { ...initial, effective: { tag: 'extra', title: 'Extra', delay_ms: 12 } } });
-  await tick(); assert.ok(root.textContent.includes('Завершено · проверено 4/4')); assert.ok(root.textContent.includes('Выбран: Extra · 12 мс'));
+  await tick(); assert.ok(root.textContent.includes('Завершено · проверено 4/4')); assert.ok(root.textContent.includes('Текущий узел: Extra'));
   assert.ok(root.textContent.includes('Текущий узел: Extra')); assert.equal(timers.size, 0);
   assert.equal(requests.filter(request => request.fields.action === 'vpn_profiles_snapshot').length, 1);
   assert.equal(named('Автовыбор узла').disabled, false); assert.equal(root.attributes['aria-busy'], undefined);
@@ -467,15 +625,25 @@ function testMobileLayout() {
     for (const width of [320, 390, 1200]) {
       const shell = '<!doctype html><body style="margin:0"><script>' +
         'const frame=document.createElement("iframe");frame.style="border:0;width:' + width + 'px;height:1800px";' +
-        'frame.onload=()=>{try{const d=frame.contentDocument,w=frame.contentWindow,app=d.getElementById("vpn-app");' +
+        'frame.onload=async()=>{try{const d=frame.contentDocument,w=frame.contentWindow,app=d.getElementById("vpn-app");' +
         'if(!app)throw Error("Missing app");if(w.innerWidth!==' + width + ')throw Error("Wrong viewport");' +
-        'for(const view of ["Статус","Профили","Подписки","Правила","Узлы"]){' +
+        'for(const view of ["Статус","Профили","Группы узлов","Правила","Узлы"]){' +
         '[...app.querySelectorAll("nav button")].find(b=>b.textContent===view).click();' +
-        'app.querySelectorAll("details").forEach(n=>n.open=true);' +
+        'if(view==="Узлы" && ![...app.querySelectorAll(".vp-node")].every(n=>!n.open))throw Error("Open node on entry");' +
+        'if(view==="Узлы" && app.querySelector(".vp-tests").open)throw Error("HTTPS settings initially open");' +
+        'app.querySelectorAll("details").forEach(n=>{n.open=true;n.dispatchEvent(new Event("toggle"));});' +
         'if(d.documentElement.scrollWidth>w.innerWidth)throw Error("Page overflow: "+view);' +
         'for(const n of app.querySelectorAll("button,input,select,textarea,summary,progress")){' +
         'if(!n.getClientRects().length)continue;const r=n.getBoundingClientRect();' +
         'if(r.left<0||r.right>w.innerWidth+1)throw Error("Control overflow: "+view+" "+n.tagName);}' +
+        'if(view==="Узлы"){const card=app.querySelector(".vp-node"),top=card.getBoundingClientRect().top;' +
+        'w.fetch=async()=>({ok:true,json:async()=>({ok:true,job:{id:"test",state:"done",total:1,done:1,' +
+        'results:[{tag:"a",ok:true,passed:2,attempts:2,latency_ms:13}]}})});' +
+        '[...card.querySelectorAll("button")].find(b=>b.textContent==="Быстрый тест").click();' +
+        'await new Promise(resolve=>w.setTimeout(resolve,0));' +
+        'for(const pair of app.querySelectorAll(".vp-test-pair")){const [a,b]=pair.querySelectorAll("button");' +
+        'if(a.getBoundingClientRect().top!==b.getBoundingClientRect().top)throw Error("Test buttons wrapped");}' +
+        'if(!card.open||!card.textContent.includes("13 мс")||card.getBoundingClientRect().top!==top)throw Error("Node result moved the list");}' +
         '}[...app.querySelectorAll("nav button")].find(b=>b.textContent==="Статус").click();' +
         'app.querySelector("details").open=true;' +
         'const columns=w.getComputedStyle(app.querySelector(".vp-recovery-grid")).gridTemplateColumns.split(" ").length;' +
@@ -493,7 +661,7 @@ function testMobileLayout() {
       assert.ok(output.includes('data-layout="pass"'), 'Layout ' + width + ': ' + (output.match(/data-layout="([^"]*)"/) || [])[1]);
     }
   } finally { fs.rmSync(profile, { recursive: true, force: true }); }
-  console.log('PASS: Chrome layouts at 320, 390 and 1200 px, all five views and recovery controls');
+  console.log('PASS: Chrome layouts at 320, 390 and 1200 px, including inline probe results and stable node position');
 }
 
 // Ответы заданий и виртуальное время позволяют проверить polling без реальной сети и ожидания.
@@ -518,24 +686,32 @@ async function testFilteredProbeAndProgress() {
   await click('Далее');
   const nav = root.querySelectorAll('nav')[0], search = nodeSearch(), uri = root.querySelectorAll('textarea')[0];
   const targetSelect = root.querySelectorAll('select')[1]; await edit(targetSelect, 'youtube', 'change');
+  assert.equal(named('Быстрый тест').textContent, 'Быстрый тест · первые 60 из 70 по фильтру');
+  const visibleCard = openDetails(nodeCards()[0]);
   replies.push({ ok: true, job: probeJob() }); await click('Быстрый тест');
   assert.equal(requests.at(-1).fields.action, 'vpn_profiles_probe_start');
   assert.deepEqual(postedData(), { tags: Array.from({ length: 60 }, (_, i) => 'tag-' + (i * 2 + 1)), target: 'youtube', speed: false });
   assert.ok(root.textContent.includes('Найдено: 70. Проверяются первые 60'));
   assert.equal(named('Быстрый тест').disabled, true); assert.equal(named('Тест скорости').disabled, true);
-  assert.ok(buttons().filter(node => node.textContent === 'Проверить узел').every(node => node.disabled));
+  assert.equal(named('Быстрый тест', visibleCard).disabled, true);
   await named('Быстрый тест').fire('click'); assert.equal(requests.length, 1);
   const result = { tag: 'tag-1', title: '<img src=x>', type: 'vless', passed: 1, attempts: 2, ok: false,
     http_code: 503, latency_ms: 0, error: 'TLS failed', speed_mbps: null, speed_error: 'No download' };
   replies.push({ ok: true, job: probeJob('running', 1, [result]) }); await tick();
   assert.equal(requests.at(-1).fields.arg, 'job-1'); assert.equal(requests.at(-1).fields.action, 'vpn_profiles_probe_status');
   assert.ok(root.textContent.includes('1/60')); assert.equal(root.querySelectorAll('progress')[0].value, 1);
-  assert.ok(root.textContent.includes('TLS failed')); assert.ok(root.textContent.includes('No download'));
+  assert.ok(!root.textContent.includes('TLS failed')); assert.ok(!root.textContent.includes('No download'));
   assert.equal(root.querySelectorAll('img').length, 0);
   assert.equal(root.querySelectorAll('nav')[0], nav); assert.equal(nodeSearch(), search);
   assert.equal(uri.value, 'vless://draft@host:443'); assert.equal(targetSelect.value, 'youtube');
   replies.push({ ok: true, job: probeJob('done', 60, [result]) }); await tick();
   assert.ok(root.textContent.includes('Готово: 60/60')); assert.equal(named('Быстрый тест').disabled, false);
+  await click('Назад');
+  const testedCard = openDetails(nodeCard('tag-1'));
+  assert.ok(testedCard.textContent.includes('TLS failed'));
+  assert.ok(testedCard.textContent.includes('0 мс'));
+  assert.ok(testedCard.textContent.includes('Ошибка замера скорости: No download'));
+  assert.ok(!openDetails(nodeCard('tag-3')).textContent.includes('TLS failed'));
   assert.equal(timers.size, 0);
   assert.ok(requests.every(request => !['vpn_profiles_activate', 'vpn_profiles_node', 'vpn_profiles_snapshot'].includes(request.fields.action)));
 }
@@ -592,12 +768,12 @@ async function testTargetEditing() {
 }
 
 (async function () {
-  const tests = [testAtomicSaveAndOrdering, testFailuresAndDiscard, testConnectionAndSearch, testCatalogCrud, testRuleActions,
+  const tests = [testAtomicSaveAndOrdering, testFailuresAndDiscard, testConnectionAndSearch, testSingleNodeProbe, testNodeMeasurements, testCatalogCrud, testNodeNameAndLocalGroup, testRuleActions,
     testLargeCatalog, testEffectiveAndRuleGuard, testImportAndRefresh, testUpdateJob, testLastCheck,
-    testFilteredProbeAndProgress, testProbeErrorsAndSpeed, testTargetEditing, testSelectionFeedback,
+    testFilteredProbeAndProgress, testProbeErrorsAndSpeed, testTargetEditing, testOverview, testSelectionFeedback,
     testConnectionDraftsAndNoCandidate, testConnectionErrorsAndCheck, testRecoverySettings, testConnectionSnapshotRace];
   for (const test of tests) await test();
   assert.ok(!source.includes('innerHTML'));
-  console.log('PASS: 18 profiles UI scenarios, including finite search, polling, recovery settings, stale checks and retained drafts');
+  console.log('PASS: profiles UI scenarios, including entity saves, local groups, aliases, polling and retained drafts');
   testMobileLayout();
 })().catch(error => { console.error(error); process.exitCode = 1; });
