@@ -20,6 +20,9 @@ class Element {
   remove() { this.parent.children.splice(this.parent.children.indexOf(this), 1); this.parent = null; }
   get isConnected() { return this === root || !!(this.parent && this.parent.isConnected); }
   setAttribute(key, value) { this.attributes[key] = value; }
+  getAttribute(key) { return this.attributes[key]; }
+  querySelector(selector) { return this.querySelectorAll(selector)[0]; }
+  focus() {}
   removeAttribute(key) { delete this.attributes[key]; }
   addEventListener(type, callback) { (this.listeners[type] ||= []).push(callback); }
   async fire(type) { for (const callback of this.listeners[type] || []) await callback({ target: this }); await settle(); }
@@ -322,6 +325,16 @@ async function testEffectiveAndRuleGuard() {
 // Импорт передает имя, один URI и ревизию; ошибки сохраняют ввод, успех удаляет URI, обновление защищает чужие черновики.
 async function testImportAndRefresh() {
   boot(); await click('Узлы');
+  const importer = disclosure('Добавить узел');
+  assert.equal(importer.open, false); openDetails(importer);
+  await edit(importer.querySelectorAll('textarea')[0], 'https://sub.example/list');
+  await click('Продолжить в подписках');
+  const subscription = editor('source-1');
+  assert.equal(requests.length, 0);
+  assert.equal(subscription.querySelectorAll('textarea')[0].value, 'https://sub.example/list');
+  await click('Сохранить подписку', subscription);
+  assert.deepEqual(postedData().subscriptions.at(-1).urls, ['https://sub.example/list']);
+  boot(); await click('Узлы'); openDetails(disclosure('Добавить узел'));
   const name = root.querySelectorAll('input').find(node => node.type !== 'search');
   const uri = root.querySelectorAll('textarea')[0];
   await edit(name, 'Local node'); await edit(uri, 'vless://example@test.example:443');

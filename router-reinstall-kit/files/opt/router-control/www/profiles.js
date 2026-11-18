@@ -621,6 +621,57 @@
       });
     });
   }
+  function linkKind(value) {
+    if (/\s/.test(value)) return '';
+    if (/^(vless|hy2|hysteria2):\/\/.+/i.test(value)) return 'node';
+    if (/^https?:\/\/[^/?#]/i.test(value)) {
+      try { if (new URL(value).hostname) return 'subscription'; } catch (_) {}
+    }
+    return '';
+  }
+  function qrField(parent, receive) {
+    var file = field(parent, 'Изображение с QR-кодом', el('input'));
+    file.type = 'file'; file.accept = 'image/*';
+    var message = result(parent);
+    file.addEventListener('change', async function () {
+      var selected = file.files[0];
+      if (!selected) return;
+      file.disabled = true;
+      var url = URL.createObjectURL(selected);
+      try {
+        message.classList.remove('vp-error');
+        message.textContent = 'Чтение QR-кода…';
+        var image = new Image();
+        image.src = url;
+        await Promise.all([image.decode(), import('/jsQR-1.4.0.js')]);
+        var scale = Math.min(1, 1800 / Math.max(image.naturalWidth, image.naturalHeight));
+        var canvas = el('canvas');
+        canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+        canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+        var context = canvas.getContext('2d');
+        context.fillStyle = 'white';
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        var pixels = context.getImageData(0, 0, canvas.width, canvas.height);
+        var code = window.jsQR(pixels.data, pixels.width, pixels.height);
+        if (!code) { fail(message, 'QR-код не найден. Выберите более чёткое изображение.'); return; }
+        if (!file.isConnected) return;
+        var error = receive(code.data.trim());
+        if (error) fail(message, error);
+        else message.textContent = 'Ссылка из QR-кода добавлена в форму.';
+      } catch (_) { fail(message, 'Не удалось прочитать изображение. Выберите другой файл или вставьте ссылку.'); }
+      finally { URL.revokeObjectURL(url); file.value = ''; file.disabled = false; }
+    });
+  }
+  function newSubscription(url, name) {
+    var id = nextId('source', data.subscriptions);
+    expanded.add('source:' + id);
+    data.subscriptions.push({ id: id, name: name || 'Новая подписка', urls: url ? [url] : [] });
+    view = 'Subscriptions'; render();
+    var card = panel.querySelectorAll('details');
+    var created = Array.from(card).find(function (item) { return item.getAttribute('data-editor-id') === id; });
+    if (created) created.querySelector('input').focus();
+  }
   function subscriptions() {
     var area = section('Группы узлов'), target = result(area);
     area.append(el('p', 'Группа получает узлы из подписки или содержит узлы, добавленные вручную. Зеркала одной подписки проверяются по порядку.'));
@@ -637,23 +688,33 @@
       if (job.state === 'failed') status.classList.add('vp-error');
     }
     area.append(button('Добавить подписку', function () {
-      var id = nextId('source', data.subscriptions); expanded.add('source:' + id);
-      data.subscriptions.push({ id: id, name: 'Новая подписка', urls: [] }); render();
+      newSubscription();
     }), command('Обновить все', function () { request('vpn_profiles_update', 'all', target); }));
     data.subscriptions.forEach(function (subscription) {
       var local = localGroup(subscription);
       var heading = subscription.name + (local ? ' · Ручная группа' : ' · Подписка');
       compactEditor(area, heading, subscription.id, 'source', function (group) {
       field(group, 'Название группы', input(subscription.name, function (value) { subscription.name = value; }));
-      if (!local) field(group, 'Зеркала по приоритету', input(subscription.urls.join('\n'), function (value) {
-        subscription.urls = value.split(/\r?\n/).map(function (url) { return url.trim(); }).filter(Boolean);
-      }, true));
+      if (!local) {
+        var mirrors = field(group, 'Зеркала по приоритету', input(subscription.urls.join('\n'), function (value) {
+          subscription.urls = value.split(/\r?\n/).map(function (url) { return url.trim(); }).filter(Boolean);
+        }, true));
+        qrField(group, function (value) {
+          if (linkKind(value) === 'node') return 'Это отдельный узел. Откройте «Узлы» → «Добавить узел».';
+          if (linkKind(value) !== 'subscription') return 'Нужна HTTP(S)-ссылка подписки.';
+          if (!subscription.urls.includes(value)) subscription.urls.push(value);
+          mirrors.value = subscription.urls.join('\n'); changed();
+        });
+      }
       var priority = subscription.priority || [];
       ordered(group, 'Приоритет узлов внутри группы', priority, snapshot.nodes.filter(function (node) {
         return node.subscription === subscription.id;
       }).map(function (node) { return [node.tag, node.title || node.tag]; }), true, function () { subscription.priority = priority; });
       var output = result(group);
       group.append(command(local ? 'Сохранить группу' : 'Сохранить подписку', function () {
+        if (subscription.urls.some(function (url) { return linkKind(url) === 'node'; })) {
+          fail(output, 'В зеркалах есть ссылка на узел. Добавьте её в разделе «Узлы».'); return;
+        }
         return saveEntity('subscriptions', subscription, output);
       }));
       group.append(command('Обновить', function () { request('vpn_profiles_update', subscription.id, output); }));
@@ -720,21 +781,39 @@
   }
   function nodes() {
     var area = section('Узлы'), query = '', sourceId = '', page = 0;
-    var importer = editor(area, 'Добавить узел');
+    var importer = el('details', undefined, 'vp-compact');
+    importer.append(el('summary', 'Добавить узел')); area.append(importer);
+    importer.open = expanded.has('node-import');
+    importer.addEventListener('toggle', function () { if (importer.open) expanded.add('node-import'); else expanded.delete('node-import'); });
     importer.append(el('p', 'Для узла будет создана ручная группа. Её можно добавить в профиль целиком.'));
-    var nodeName = field(importer, 'Название узла', input(drafts.get('__node_name') || '', function (value) {
+    var nodeName = field(importer, 'Название', input(drafts.get('__node_name') || '', function (value) {
       if (value) drafts.set('__node_name', value); else drafts.delete('__node_name');
     }));
-    var uri = field(importer, 'URI VLESS / Hysteria2', input(drafts.get('__node_uri') || '', function (value) {
+    var uri = field(importer, 'Ссылка на узел или подписку', input(drafts.get('__node_uri') || '', function (value) {
       if (value) drafts.set('__node_uri', value); else drafts.delete('__node_uri');
+      updateImport();
     }, true));
     uri.rows = 3; uri.autocomplete = 'off'; uri.spellcheck = false;
     var importResult = result(importer);
-    importer.append(command('Добавить узел', function () {
-      if (!nodeName.value.trim()) { fail(importResult, 'Укажите название узла.'); return; }
-      if (!/^(vless|hy2|hysteria2):\/\/[^\r\n]+$/i.test(uri.value.trim())) {
-        fail(importResult, 'Укажите один URI VLESS или Hysteria2.'); return;
+    qrField(importer, function (value) {
+      if (!linkKind(value)) return 'QR-код должен содержать ссылку VLESS, Hysteria2 или HTTP(S).';
+      uri.value = value; drafts.set('__node_uri', value); changed(); updateImport();
+    });
+    function updateImport() {
+      var subscription = linkKind(uri.value.trim()) === 'subscription';
+      submit.textContent = subscription ? 'Продолжить в подписках' : 'Добавить узел';
+      importResult.classList.remove('vp-error');
+      importResult.textContent = subscription ? 'Это ссылка на подписку. Проверьте название и сохраните её в разделе «Группы узлов».': '';
+    }
+    var submit = command('Добавить узел', function () {
+      if (linkKind(uri.value.trim()) === 'subscription') {
+        drafts.delete('__node_name'); drafts.delete('__node_uri');
+        newSubscription(uri.value.trim(), nodeName.value.trim()); return;
       }
+      if (linkKind(uri.value.trim()) !== 'node') {
+        fail(importResult, 'Нужна ссылка VLESS, Hysteria2 или HTTP(S)-ссылка подписки.'); return;
+      }
+      if (!nodeName.value.trim()) { fail(importResult, 'Укажите название узла.'); return; }
       request(
         'vpn_profiles_node_import',
         nodeName.value.trim(),
@@ -743,7 +822,8 @@
         true,
         ['__node_name', '__node_uri']
       );
-    }));
+    });
+    importer.append(submit); updateImport();
     var search = field(area, 'Поиск узлов', input('', function (value) { query = value.toLocaleLowerCase(); page = 0; draw(); }));
     search.type = 'search';
     field(area, 'Группа', select([['', 'Все группы']].concat(data.subscriptions.map(function (item) {
