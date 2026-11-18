@@ -448,6 +448,8 @@
   function compactEditor(parent, name, id, kind, build) {
     disclosure(parent, name, kind + ':' + id, function (details) { build(editor(details, name)); }, id);
   }
+  function availabilityLevel(check) { return check.ok ? 'good' : check.passed ? 'warn' : 'bad'; }
+  function latencyLevel(ms) { return ms <= 300 ? 'good' : ms <= 1000 ? 'warn' : 'bad'; }
   function vpn() {
     var area = section('Статус');
     var current = snapshot.data.profiles.find(function (profile) { return profile.id === snapshot.active; });
@@ -507,19 +509,24 @@
     drawConnection = function () {
       var connection = snapshot.connection, job = connection && connection.job, latest = connection && connection.lastCheck;
       serviceStatus.textContent = snapshot.running ? 'Сервис VPN запущен' : 'VPN выключен';
+      serviceStatus.className = 'vp-status ' + (snapshot.running ? 'vp-info' : 'vp-muted');
+      var stale = !snapshot.running || !latest || latest.profile !== snapshot.active || !snapshot.effective || latest.node !== snapshot.effective.tag;
+      var healthColor = stale ? 'vp-muted' : 'vp-metric-' + availabilityLevel(latest);
       runtime.replaceChildren(); lastCheck.replaceChildren();
       if (snapshot.effective) {
         var effective = snapshot.effective, delay = effective.delay_ms === undefined ? effective.delay : effective.delay_ms;
-        runtime.append(el('p', 'Текущий узел: ' + (effective.title || effective.tag) + (effective.type ? ' · ' + effective.type : '')));
-        if (delay !== undefined && delay !== null) runtime.append(el('p', 'Задержка: ' + delay + ' мс'));
+        var health = !snapshot.running ? 'VPN выключен' : stale ? 'Доступность не проверена' :
+          latest.ok ? 'Доступен' : latest.passed ? 'Нестабильно' : 'Недоступен';
+        runtime.append(el('p', 'Текущий узел: ' + (effective.title || effective.tag) + (effective.type ? ' · ' + effective.type : '') +
+          ' · ' + health, 'vp-status ' + healthColor));
+        if (delay !== undefined && delay !== null) runtime.append(el('p', 'Задержка: ' + delay + ' мс', snapshot.running ? 'vp-metric-' + latencyLevel(delay) : 'vp-muted'));
       }
-      runtime.append(el('p', 'Автовосстановление ' + (connection && connection.settings.enabled ? 'включено' : 'выключено')));
-      if (!latest) lastCheck.append(el('p', 'Последняя проверка: ещё не выполнялась'));
+      runtime.append(el('p', 'Автовосстановление ' + (connection && connection.settings.enabled ? 'включено' : 'выключено'), connection && connection.settings.enabled ? 'vp-info' : 'vp-muted'));
+      if (!latest) lastCheck.append(el('p', 'Последняя проверка: ещё не выполнялась', 'vp-muted'));
       else {
-        var stale = !snapshot.running || latest.profile !== snapshot.active || !snapshot.effective || latest.node !== snapshot.effective.tag;
         lastCheck.append(el('p', 'Последняя проверка: ' + new Date(latest.time * 1000).toLocaleString()));
         lastCheck.append(el('p', (latest.ok ? 'HTTPS доступен' : latest.passed ? 'Нестабильно' : 'HTTPS недоступен') + ' · ' + latest.passed + '/' + latest.attempts +
-          (latest.latency_ms === null ? '' : ' · ' + latest.latency_ms + ' мс') + (latest.http_code ? ' · HTTP ' + latest.http_code : '')));
+          (latest.latency_ms === null ? '' : ' · ' + latest.latency_ms + ' мс') + (latest.http_code ? ' · HTTP ' + latest.http_code : ''), healthColor));
         lastCheck.append(el('p', 'Профиль: ' + latest.profile + ' · Узел: ' + latest.node));
         if (latest.reason) lastCheck.append(el('p', latest.reason));
         if (stale) lastCheck.append(el('p', 'Устарело: проверка не относится к текущему подключению', 'vp-warning'));
@@ -529,9 +536,11 @@
         (job.total ? ' · проверено ' + job.done + '/' + job.total : '') + (job.message ? '\n' + job.message : '') +
         (job.selected ? '\nВыбран: ' + (job.selected.title || job.selected.tag) +
           (job.selected.latency_ms === null ? '' : ' · ' + job.selected.latency_ms + ' мс') : '') + (job.error ? '\n' + job.error : '') : '';
-      jobStatus.classList.remove('vp-error'); jobStatus.classList.remove('vp-pending');
-      if (job && job.state === 'failed') jobStatus.classList.add('vp-error');
-      if (connectionStarting || (job && job.state === 'running')) jobStatus.classList.add('vp-pending');
+      jobStatus.className = 'vp-result';
+      if (connectionStarting || (job && job.state === 'running')) jobStatus.className += ' vp-pending vp-info';
+      else if (job && job.state === 'failed') jobStatus.className += ' vp-error';
+      else if (job && job.selected) jobStatus.className += ' vp-metric-good';
+      else if (job && job.kind === 'find') jobStatus.className += ' vp-warning';
       progress.hidden = !job || job.state !== 'running' || !job.total;
       progress.max = job ? job.total || 1 : 1; progress.value = job ? job.done : 0;
       power.textContent = snapshot.running ? 'Выключить VPN' : 'Включить VPN';
@@ -1049,8 +1058,8 @@
           var item = last.item;
           summary.replaceChildren();
           function metric(text, level) { summary.append(el('span', text, 'vp-metric-' + level)); }
-          metric((item.ok ? 'Доступен' : item.passed ? 'Нестабильно' : 'Недоступен') + ' · ' + item.passed + '/2', item.ok ? 'good' : item.passed ? 'warn' : 'bad');
-          if (item.latency_ms != null) metric(item.latency_ms + ' мс', item.latency_ms <= 300 ? 'good' : item.latency_ms <= 1000 ? 'warn' : 'bad');
+          metric((item.ok ? 'Доступен' : item.passed ? 'Нестабильно' : 'Недоступен') + ' · ' + item.passed + '/2', availabilityLevel(item));
+          if (item.latency_ms != null) metric(item.latency_ms + ' мс', latencyLevel(item.latency_ms));
           if (item.speed_error) metric('Сбой замера скорости', 'bad');
           else if (item.speed_mbps != null) metric(item.speed_mbps + ' Мбит/с', item.speed_mbps >= 20 ? 'good' : item.speed_mbps >= 5 ? 'warn' : 'bad');
         });

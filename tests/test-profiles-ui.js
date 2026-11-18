@@ -422,7 +422,11 @@ async function testLastCheck() {
     boot({ ...initial, connection: { ...initial.connection, lastCheck: check }, ...overrides });
     assert.ok(root.textContent.includes('Последняя проверка:')); assert.ok(root.textContent.includes('Нестабильно · 1/2 · 0 мс · HTTP 503'));
     assert.ok(root.textContent.includes(check.reason)); assert.equal(root.querySelectorAll('img').length, 0);
-    assert.equal(root.textContent.includes('Устарело:'), Object.keys(overrides).length > 0);
+    const stale = Object.keys(overrides).length > 0;
+    assert.equal(root.textContent.includes('Устарело:'), stale);
+    const current = root.querySelectorAll('p').find(node => node.textContent.startsWith('Текущий узел:'));
+    assert.ok(current.className.includes(stale ? 'vp-muted' : 'vp-metric-warn'));
+    assert.equal(root.querySelectorAll('p').find(node => node.textContent.startsWith('Нестабильно')).className, stale ? 'vp-muted' : 'vp-metric-warn');
     await click('Узлы'); await click('Статус'); assert.ok(root.textContent.includes(check.reason));
   }
   boot({ ...initial, connection: { ...initial.connection, lastCheck: { ...check, ok: true, passed: 2, latency_ms: null, reason: '' } } });

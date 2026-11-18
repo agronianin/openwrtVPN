@@ -74,3 +74,5 @@
 #vpn-app .vp-metric-good { color: #14623e; }
 #vpn-app .vp-metric-warn { color: #875000; }
 #vpn-app .vp-metric-bad { color: #a51d2b; }
+#vpn-app .vp-info { color: #145b91; }
+#vpn-app .vp-muted { color: #52616d; }
