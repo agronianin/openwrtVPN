@@ -59,12 +59,12 @@ const initial = {
   rules: [{ id: '05-proxy', name: 'Proxy', content: 'proxy content', revision: 'sha-proxy' },
     { id: '20-direct', name: 'Direct', content: 'direct content', revision: 'sha-direct' }]
 };
-function boot(snapshot = initial) {
+function boot(snapshot = initial, localStorage) {
   root = new Element('main'); requests = []; replies = []; confirmAnswer = true; timers = new Map();
   const seed = new Element('script'); seed.textContent = JSON.stringify(snapshot);
   context = {
     document: { getElementById: id => id === 'vpn-app' ? root : seed, createElement: tag => new Element(tag) },
-    window: { location: { pathname: '/cgi-bin/router-control' }, confirm: () => confirmAnswer,
+    window: { localStorage, location: { pathname: '/cgi-bin/router-control' }, confirm: () => confirmAnswer,
       addEventListener: (name, callback) => { if (name === 'beforeunload') unload = callback; } },
     URLSearchParams, URL, AbortController,
     setTimeout: (callback, delay) => { const id = {}; timers.set(id, { callback, delay }); return id; },
@@ -86,7 +86,7 @@ function boot(snapshot = initial) {
 }
 function buttons(parent = root) { return parent.querySelectorAll('button'); }
 function named(text, parent = root) {
-  const match = buttons(parent).find(node => node.textContent === text || node.attributes['aria-label'] === text);
+  const match = buttons(parent).find(node => node.textContent === text || node.textContent.startsWith(text + ' · ') || node.attributes['aria-label'] === text);
   assert.ok(match, 'Missing button: ' + text); return match;
 }
 async function click(text, parent) { const node = named(text, parent); assert.ok(!node.disabled, text); await node.fire('click'); }
@@ -183,28 +183,59 @@ async function testSingleNodeProbe() {
   assert.equal(card.children[0].querySelectorAll('strong')[0].textContent, 'Node B');
   assert.equal(card.children[0].querySelectorAll('span')[0].textContent, 'hy2 · Second');
   openDetails(card);
-  const check = named('Проверить узел', card);
+  const check = named('Быстрый тест', card);
   const batchStatus = root.querySelectorAll('p').find(node => node.textContent.includes('К тесту:'));
   const batchText = batchStatus.textContent;
-  replies.push({ ok: true, job: { ...probeJob(), total: 1 } }); await click('Проверить узел', card);
+  replies.push({ ok: true, job: { ...probeJob(), total: 1 } }); await click('Быстрый тест', card);
   assert.equal(requests.at(-1).fields.action, 'vpn_profiles_probe_start');
   assert.deepEqual(postedData(), { tags: ['b'], target: 'google', speed: false });
   assert.ok(card.textContent.includes('Проверка HTTPS'));
   assert.equal(check.disabled, true);
   const measurement = { tag: 'b', passed: 2, attempts: 2, ok: true, http_code: 204, latency_ms: 13 };
   replies.push({ ok: true, job: { ...probeJob('done', 1, [measurement]), total: 1 } }); await tick();
-  assert.equal(nodeCard('b'), card); assert.equal(named('Проверить узел', card), check);
+  assert.equal(nodeCard('b'), card); assert.equal(named('Быстрый тест', card), check);
   assert.equal(check.disabled, false); assert.equal(card.open, true);
   assert.equal(neighbor.open, false);
   assert.equal(batchStatus.textContent, batchText);
   const reading = 'Google · Доступен · 2/2 · HTTP 204 · 13 мс';
   assert.ok(card.textContent.includes(reading)); assert.ok(!neighbor.textContent.includes(reading));
   assert.equal(root.querySelectorAll('table').length, 0);
-  replies.push(new Error('Проверка недоступна')); await click('Проверить узел', card);
+  replies.push(new Error('Проверка недоступна')); await click('Быстрый тест', card);
   assert.ok(card.textContent.includes('Проверка недоступна'));
   assert.equal(batchStatus.textContent, batchText);
   await click('Статус'); await click('Узлы');
   assert.equal(nodeCard('b').open, true); assert.ok(nodeCard('b').textContent.includes(reading));
+}
+
+// Сортировка учитывает последние замеры свёрнутых узлов, быстрый тест сохраняет известную скорость.
+async function testNodeMeasurements() {
+  const cache = new Map();
+  const storage = { getItem: key => cache.get(key), setItem: (key, value) => cache.set(key, value) };
+  boot(initial, storage); await click('Узлы');
+  const sort = root.querySelectorAll('select').find(control => control.children.some(option => option.value === 'latency_ms'));
+  for (const [tag, latency, speed] of [['b', 400, 25], ['extra', 50, 3]]) {
+    const card = openDetails(nodeCard(tag));
+    const item = { tag, passed: 2, attempts: 2, ok: true, latency_ms: latency, speed_mbps: speed };
+    replies.push({ ok: true, job: { ...probeJob('done', 1, [item]), total: 1, speed: true } });
+    await click('Тест скорости', card);
+    assert.deepEqual(postedData(), { tags: [tag], target: 'google', speed: true });
+    card.open = false; await card.fire('toggle');
+    const metrics = card.children[0].querySelectorAll('span');
+    assert.ok(metrics.some(metric => metric.textContent === speed + ' Мбит/с' && metric.className === (speed < 5 ? 'vp-metric-bad' : 'vp-metric-good')));
+  }
+  await edit(sort, 'speed_mbps', 'change'); assert.deepEqual(nodeCards().slice(0, 2), [nodeCard('b'), nodeCard('extra')]);
+  await edit(sort, 'latency_ms', 'change'); assert.deepEqual(nodeCards().slice(0, 2), [nodeCard('extra'), nodeCard('b')]);
+  const item = { tag: 'b', passed: 2, attempts: 2, ok: true, latency_ms: 10, speed_mbps: null };
+  replies.push({ ok: true, job: { ...probeJob('done', 1, [item]), total: 1 } });
+  await click('Быстрый тест', openDetails(nodeCard('b')));
+  assert.equal(nodeCards()[0], nodeCard('b'));
+  assert.ok(nodeCard('b').children[0].textContent.includes('25 Мбит/с'));
+  await edit(sort, 'name', 'change');
+  assert.deepEqual(nodeCards().map(card => card.attributes['data-editor-id']), ['a', 'excluded', 'extra', 'b']);
+  boot(initial, storage); await click('Узлы');
+  assert.ok(!nodeCard('b').open);
+  assert.ok(nodeCard('b').children[0].textContent.includes('25 Мбит/с'));
+  assert.ok(nodeCard('b').children[0].textContent.includes('10 мс'));
 }
 
 // CRUD подписок и профилей сохраняет порядок зеркал и блокирует удаление используемого источника.
@@ -574,7 +605,7 @@ function testMobileLayout() {
         'if(view==="Узлы"){const card=app.querySelector(".vp-node"),top=card.getBoundingClientRect().top;' +
         'w.fetch=async()=>({ok:true,json:async()=>({ok:true,job:{id:"test",state:"done",total:1,done:1,' +
         'results:[{tag:"a",ok:true,passed:2,attempts:2,latency_ms:13}]}})});' +
-        '[...card.querySelectorAll("button")].find(b=>b.textContent==="Проверить узел").click();' +
+        '[...card.querySelectorAll("button")].find(b=>b.textContent==="Быстрый тест").click();' +
         'await new Promise(resolve=>w.setTimeout(resolve,0));' +
         'if(!card.open||!card.textContent.includes("13 мс")||card.getBoundingClientRect().top!==top)throw Error("Node result moved the list");}' +
         '}[...app.querySelectorAll("nav button")].find(b=>b.textContent==="Статус").click();' +
@@ -619,13 +650,14 @@ async function testFilteredProbeAndProgress() {
   await click('Далее');
   const nav = root.querySelectorAll('nav')[0], search = nodeSearch(), uri = root.querySelectorAll('textarea')[0];
   const targetSelect = root.querySelectorAll('select')[1]; await edit(targetSelect, 'youtube', 'change');
+  assert.equal(named('Быстрый тест').textContent, 'Быстрый тест · первые 60 из 70 по фильтру');
   const visibleCard = openDetails(nodeCards()[0]);
   replies.push({ ok: true, job: probeJob() }); await click('Быстрый тест');
   assert.equal(requests.at(-1).fields.action, 'vpn_profiles_probe_start');
   assert.deepEqual(postedData(), { tags: Array.from({ length: 60 }, (_, i) => 'tag-' + (i * 2 + 1)), target: 'youtube', speed: false });
   assert.ok(root.textContent.includes('Найдено: 70. Проверяются первые 60'));
   assert.equal(named('Быстрый тест').disabled, true); assert.equal(named('Тест скорости').disabled, true);
-  assert.equal(named('Проверить узел', visibleCard).disabled, true);
+  assert.equal(named('Быстрый тест', visibleCard).disabled, true);
   await named('Быстрый тест').fire('click'); assert.equal(requests.length, 1);
   const result = { tag: 'tag-1', title: '<img src=x>', type: 'vless', passed: 1, attempts: 2, ok: false,
     http_code: 503, latency_ms: 0, error: 'TLS failed', speed_mbps: null, speed_error: 'No download' };
@@ -700,7 +732,7 @@ async function testTargetEditing() {
 }
 
 (async function () {
-  const tests = [testAtomicSaveAndOrdering, testFailuresAndDiscard, testConnectionAndSearch, testSingleNodeProbe, testCatalogCrud, testNodeNameAndLocalGroup, testRuleActions,
+  const tests = [testAtomicSaveAndOrdering, testFailuresAndDiscard, testConnectionAndSearch, testSingleNodeProbe, testNodeMeasurements, testCatalogCrud, testNodeNameAndLocalGroup, testRuleActions,
     testLargeCatalog, testEffectiveAndRuleGuard, testImportAndRefresh, testUpdateJob, testLastCheck,
     testFilteredProbeAndProgress, testProbeErrorsAndSpeed, testTargetEditing, testSelectionFeedback,
     testConnectionDraftsAndNoCandidate, testConnectionErrorsAndCheck, testRecoverySettings, testConnectionSnapshotRace];

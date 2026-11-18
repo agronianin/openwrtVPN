@@ -69,3 +69,8 @@
   #vpn-app .vp-save { align-items: stretch; flex-direction: column; }
   #vpn-app .vp-nav button { padding: 8px; }
 }
+
+#vpn-app .vp-measurements { display: flex; flex-wrap: wrap; gap: 4px 12px; padding-left: 16px; font-size: 13px; font-weight: 600; }
+#vpn-app .vp-metric-good { color: #14623e; }
+#vpn-app .vp-metric-warn { color: #875000; }
+#vpn-app .vp-metric-bad { color: #a51d2b; }

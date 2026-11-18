@@ -32,6 +32,14 @@
     root.append(el('p', 'Не удалось прочитать данные VPN: ' + error.message, 'vp-error'));
     return;
   }
+  // Only numeric measurements and outcomes belong in browser storage.
+  try {
+    var savedMeasurements = new Map(JSON.parse(window.localStorage.getItem('vpn-node-measurements') || '[]'));
+    snapshot.nodes.forEach(function (node) {
+      var item = savedMeasurements.get(node.tag);
+      if (item && [0, 1, 2].includes(item.passed)) nodeResults.set(node.tag, { item: item });
+    });
+  } catch (_) {}
   function dirty() { return JSON.stringify(data) !== baseline || drafts.size > 0; }
   function changed() {
     saveState.textContent = dirty() ? 'Есть несохраненные изменения' : 'Сохранено';
@@ -197,7 +205,23 @@
           item.passed < 0 || item.passed > 2 || item.attempts !== 2 || typeof item.ok !== 'boolean'; })) {
       throw new Error('Некорректный ответ задания проверки');
     }
-    job.results.forEach(function (item) { nodeResults.set(item.tag, { item: item, target: job.target }); });
+    job.results.forEach(function (item) {
+      var previous = nodeResults.get(item.tag);
+      if (previous && item.speed_mbps == null && !item.speed_error) {
+        item = Object.assign({}, item, { speed_mbps: previous.item.speed_mbps, speed_error: previous.item.speed_error });
+      }
+      nodeResults.set(item.tag, { item: item, target: job.target });
+    });
+    if (job.state !== 'running') {
+      try {
+        var measurements = Array.from(nodeResults, function (entry) {
+          var item = entry[1].item;
+          return [entry[0], { passed: item.passed, attempts: 2, ok: item.ok, latency_ms: item.latency_ms,
+            speed_mbps: item.speed_mbps, speed_error: item.speed_error ? 'Замер не удался' : '', http_code: item.http_code }];
+        });
+        window.localStorage.setItem('vpn-node-measurements', JSON.stringify(measurements));
+      } catch (_) {}
+    }
     return job;
   }
   async function pollProbe() {
@@ -896,15 +920,28 @@
     targetURLs.append(el('summary', 'URL проверки')); tests.append(targetURLs);
     var urls = el('div'); targetURLs.append(urls);
     var testActions = el('div', undefined, 'vp-actions'); tests.append(testActions);
+    var sort = 'catalog', visibleTags = [];
+    field(area, 'Сортировка узлов', select([
+      ['catalog', 'Порядок каталога'], ['name', 'По имени (А–Я)'], ['speed_mbps', 'По скорости (быстрые сначала)'],
+      ['latency_ms', 'По задержке (меньшая сначала)']
+    ], sort, function (value) { sort = value; page = 0; draw(); }));
     function filteredNodes() {
-      return snapshot.nodes.filter(function (node) {
+      var matches = snapshot.nodes.filter(function (node) {
         return (!sourceId || node.subscription === sourceId) && [node.title, node.tag, node.type].join(' ').toLocaleLowerCase().includes(query);
       });
+      if (sort === 'name') matches.sort(function (a, b) { return (a.title || a.tag).localeCompare(b.title || b.tag, 'ru', { numeric: true }); });
+      if (sort === 'latency_ms' || sort === 'speed_mbps') matches.sort(function (a, b) {
+        var left = nodeResults.get(a.tag)?.item[sort], right = nodeResults.get(b.tag)?.item[sort];
+        if (left == null || right == null) return Number(left == null) - Number(right == null);
+        return sort === 'latency_ms' ? left - right : right - left;
+      });
+      return matches;
     }
     function batch(speed) {
       var matches = filteredNodes();
       return startProbe(matches.slice(0, 60).map(function (node) { return node.tag; }), speed, matches.length);
     }
+    testActions.append(el('p', 'Быстрый тест делает два HTTPS-запроса. Тест скорости дополнительно скачивает до 2 МиБ через каждый узел с результатом 2/2.'));
     var quick = button('Быстрый тест', function () { return batch(false); });
     var speed = button('Тест скорости', function () { return batch(true); }); testActions.append(quick, speed);
     var probeStatus = result(tests), progress = el('progress'), drawNodes = new Map();
@@ -917,8 +954,15 @@
     }
     drawProbe = function () {
       var matches = filteredNodes(), active = probing(), blocked = active || busy || connectionWorking();
+      if (!active && (sort === 'latency_ms' || sort === 'speed_mbps') &&
+          matches.slice(page * 30, (page + 1) * 30).some(function (node, i) { return node.tag !== visibleTags[i]; })) { draw(); return; }
+      var scope = matches.length > 60 ? 'первые 60 из ' + matches.length : 'все (' + matches.length + ')';
+      if (query || sourceId) scope += ' по фильтру';
+      quick.textContent = 'Быстрый тест · ' + scope;
+      speed.textContent = 'Тест скорости · ' + scope;
       quick.disabled = speed.disabled = blocked || !matches.length || !targetId;
       targetSelect.disabled = blocked;
+      summaries.forEach(function (update) { update(); });
       drawNodes.forEach(function (drawNode) { drawNode(); });
       urls.replaceChildren();
       targets.items.forEach(function (item) { urls.append(el('p', item.name + ' · HTTP ' + item.status), el('code', item.url)); });
@@ -940,22 +984,26 @@
       progress.hidden = probeNode !== null || !active;
       progress.max = batchJob ? batchJob.total : 1; progress.value = batchJob ? batchJob.done : 0;
     };
+    var summaries = new Map();
     var list = el('div'), pages = el('div', undefined, 'vp-actions'); area.append(list, pages);
     function draw() {
       list.replaceChildren();
-      drawNodes.clear();
+      drawNodes.clear(); summaries.clear();
       var matches = filteredNodes();
       if (!matches.length) list.append(el('p', 'Узлы не найдены'));
-      matches.slice(page * 30, (page + 1) * 30).forEach(function (node) {
+      var visible = matches.slice(page * 30, (page + 1) * 30);
+      visibleTags = visible.map(function (node) { return node.tag; });
+      visible.forEach(function (node) {
         var row = disclosure(list, undefined, 'node:' + node.tag, function (details) {
           var group = el('div', undefined, 'vp-node-body'); details.append(group);
-          var check = button('Проверить узел', function () { return startProbe([node.tag], false, 1, node.tag); });
-          group.append(check);
+          var check = button('Быстрый тест', function () { return startProbe([node.tag], false, 1, node.tag); });
+          var speedCheck = button('Тест скорости', function () { return startProbe([node.tag], true, 1, node.tag); });
+          var actions = el('div', undefined, 'vp-actions'); actions.append(check, speedCheck); group.append(actions);
           var status = result(group), measurement = result(group);
           function drawNode() {
-            check.disabled = probing() || busy || connectionWorking() || !targetId;
+            check.disabled = speedCheck.disabled = probing() || busy || connectionWorking() || !targetId;
             if (probeNode === node.tag) {
-              jobStatus(status, probeStarting ? 'Запуск проверки…' : probing() ? 'Проверка HTTPS…' :
+              jobStatus(status, probeStarting ? 'Запуск проверки…' : probing() ? (probeJob.phase === 'speed' ? 'Замер скорости…' : 'Проверка HTTPS…') :
                 probeJob && probeJob.state === 'failed' ? 'Ошибка проверки' : '');
             } else {
               status.textContent = '';
@@ -991,6 +1039,21 @@
         row.classList.add('vp-node');
         row.children[0].append(el('strong', node.title || node.tag),
           el('span', node.type + ' · ' + groupName(node.subscription), 'vp-node-source'));
+        var summary = el('span', undefined, 'vp-measurements'); row.children[0].append(summary);
+        summary.title = 'Последние замеры. Задержка: до 300 мс — низкая, свыше 1000 мс — высокая. Скорость: менее 5 Мбит/с — низкая, от 20 Мбит/с — высокая.';
+        var rendered;
+        summaries.set(node.tag, function () {
+          var last = nodeResults.get(node.tag);
+          if (!last || last === rendered) return;
+          rendered = last;
+          var item = last.item;
+          summary.replaceChildren();
+          function metric(text, level) { summary.append(el('span', text, 'vp-metric-' + level)); }
+          metric((item.ok ? 'Доступен' : item.passed ? 'Нестабильно' : 'Недоступен') + ' · ' + item.passed + '/2', item.ok ? 'good' : item.passed ? 'warn' : 'bad');
+          if (item.latency_ms != null) metric(item.latency_ms + ' мс', item.latency_ms <= 300 ? 'good' : item.latency_ms <= 1000 ? 'warn' : 'bad');
+          if (item.speed_error) metric('Сбой замера скорости', 'bad');
+          else if (item.speed_mbps != null) metric(item.speed_mbps + ' Мбит/с', item.speed_mbps >= 20 ? 'good' : item.speed_mbps >= 5 ? 'warn' : 'bad');
+        });
       });
       pages.replaceChildren();
       if (matches.length > 30) {
