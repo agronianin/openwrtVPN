@@ -145,21 +145,31 @@ async function testFailuresAndDiscard() {
     assert.equal(editor('work').querySelectorAll('input')[0].value, 'Unsaved');
     assert.equal(named('Сохранить профиль').disabled, false);
     let prevented = false; unload({ preventDefault: () => { prevented = true; } }); assert.ok(prevented);
-    await click('Статус'); confirmAnswer = false; await edit(root.querySelectorAll('select')[1], 'b', 'change');
+    await click('Статус'); confirmAnswer = false; await click('Обновить состояние');
     assert.equal(requests.length, 1);
-    confirmAnswer = true; await edit(root.querySelectorAll('select')[1], 'b', 'change');
-    assert.equal(requests.at(-1).fields.arg, 'b');
+    confirmAnswer = true; await click('Обновить состояние');
+    assert.equal(requests.at(-1).fields.action, 'vpn_profiles_snapshot');
     assert.ok(!root.textContent.includes('Есть несохраненные изменения'));
   }
 }
 
 // Главный экран ограничивает узлы источниками профиля и явными добавлениями; данные остаются текстом, а не HTML.
 async function testConnectionAndSearch() {
-  boot();
-  const manual = root.querySelectorAll('select')[1];
-  assert.deepEqual(manual.children.map(node => node.value), ['', 'a', 'b', 'extra']);
+  const fixture = JSON.parse(JSON.stringify(initial));
+  fixture.nodes.find(node => node.tag === 'extra').selectable = true;
+  boot(fixture); openDetails(disclosure('Подбор узла профиля «Work»'));
+  assert.deepEqual(nodeCards().map(card => card.attributes['data-editor-id']), ['a', 'b', 'extra']);
   assert.equal(root.querySelectorAll('img').length, 0);
-  await edit(manual, 'extra', 'change'); assert.equal(requests.at(-1).fields.arg, 'extra');
+  const card = openDetails(nodeCard('extra'));
+  const apply = named('Переключить VPN на этот узел', card);
+  assert.ok(apply.disabled); assert.equal(requests.length, 0);
+  const measured = { tag: 'extra', ok: true, passed: 2, attempts: 2, latency_ms: 14 };
+  replies.push({ ok: true, job: { ...probeJob('done', 1, [measured]), started_at: Date.now()/1000, total: 1 } });
+  await click('Быстрый тест', card);
+  assert.equal(requests.length, 1); assert.equal(requests[0].fields.action, 'vpn_profiles_probe_start');
+  await click('Переключить VPN на этот узел', card);
+  assert.equal(requests.at(-1).fields.arg, 'extra');
+  assert.equal(requests.at(-1).fields.content, 'job-1');
   replies.push({ ok: true, snapshot: { ...initial, running: false, selection: null, effective: null } });
   await click('Выключить VPN');
   assert.equal(requests.at(-1).fields.action, 'vpn_profiles_activate'); assert.equal(requests.at(-1).fields.arg, 'off');
@@ -433,7 +443,7 @@ async function testLastCheck() {
   assert.ok(root.textContent.includes('HTTPS доступен · 2/2')); assert.ok(!root.textContent.includes('null мс'));
   replies.push({ ok: true, snapshot: { ...initial, effective: { tag: 'extra', title: 'Extra' },
     connection: { ...initial.connection, lastCheck: check } } });
-  await edit(root.querySelectorAll('select')[1], 'extra', 'change');
+  await click('Обновить состояние');
   assert.ok(root.textContent.includes(check.reason)); assert.ok(root.textContent.includes('Устарело:'));
 }
 
@@ -454,7 +464,7 @@ async function testSelectionFeedback() {
   for (const name of ['Автовыбор узла', 'Проверить подключение', 'Применить профиль', 'Обновить состояние', 'Сохранить автовосстановление']) {
     assert.equal(named(name).disabled, true);
   }
-  assert.equal(root.querySelectorAll('select')[1].disabled, true);
+  assert.equal(root.querySelectorAll('select')[0].disabled, true);
   await named('Автовыбор узла').fire('click'); assert.equal(requests.length, 1);
   const nav = root.querySelectorAll('nav')[0];
   replies.push(connectionReply('running', { job: { done: 3, message: '<b>testing</b>' } })); await tick();
@@ -463,7 +473,7 @@ async function testSelectionFeedback() {
   const selected = { tag: 'extra', title: 'Extra', latency_ms: 12 };
   replies.push(connectionReply('done', { job: { done: 4, selected } }),
     { ok: true, snapshot: { ...initial, effective: { tag: 'extra', title: 'Extra', delay_ms: 12 } } });
-  await tick(); assert.ok(root.textContent.includes('Завершено · проверено 4/4')); assert.ok(root.textContent.includes('Выбран: Extra · 12 мс'));
+  await tick(); assert.ok(root.textContent.includes('Завершено · проверено 4/4')); assert.ok(root.textContent.includes('Текущий узел: Extra'));
   assert.ok(root.textContent.includes('Текущий узел: Extra')); assert.equal(timers.size, 0);
   assert.equal(requests.filter(request => request.fields.action === 'vpn_profiles_snapshot').length, 1);
   assert.equal(named('Автовыбор узла').disabled, false); assert.equal(root.attributes['aria-busy'], undefined);

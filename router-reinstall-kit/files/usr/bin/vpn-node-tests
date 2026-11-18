@@ -159,6 +159,7 @@ case "${1:-targets}" in
       [ ! -f "${file%.nodes}.titles" ] || cat "${file%.nodes}.titles" >> "$JOB/all.titles"
     done
     if [ -s "$BASE/config.json" ]; then
+      sha256sum "$BASE/config.json" | cut -d' ' -f1 > "$JOB/config.sha256"
       jq '.outbounds//[]|map(select(.type=="vless" or .type=="hysteria2"))' "$BASE/config.json" > "$JOB/loaded.json" \
         || fail 'Working configuration cannot be read'
     else echo '[]' > "$JOB/loaded.json"; fi

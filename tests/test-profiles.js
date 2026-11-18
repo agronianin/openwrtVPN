@@ -148,7 +148,8 @@ try {
   const curl = mock('curl', '');
   fs.writeFileSync(curl, `#!/usr/bin/env node
 const fs=require('node:fs'), file=process.env.TEST_SELECTOR, state=JSON.parse(fs.readFileSync(file));
-if(process.argv.includes('PUT')) {
+if(process.argv.some(arg=>arg.endsWith('/delay'))) { console.log(JSON.stringify(process.env.TEST_DELAY_FAIL ? {} : {delay:14})); }
+else if(process.argv.includes('PUT')) {
   const value=JSON.parse(fs.readFileSync(0,'utf8')).name;
   if(!process.env.TEST_REJECT_SELECTION) { state.proxies['vpn-out'].now=value; fs.writeFileSync(file,JSON.stringify(state)); }
 } else console.log(JSON.stringify(state));
@@ -165,5 +166,27 @@ if(process.argv.includes('PUT')) {
   assert.equal(select('auto').status, 1);
   assert.equal(select('not-loaded').status, 1);
   assert.equal(fs.readFileSync(path.join(root, 'config.json'), 'utf8'), '{"old":"working-config"}');
+  // Переключение из панели требует свежего результата и повторной проверки реального загруженного узла.
+  delete selectorEnv.TEST_REJECT_SELECTION;
+  write('profiles/active', 'black');
+  const api = JSON.parse(fs.readFileSync(selector));
+  api.proxies['vpn-out'].all.push(cached.tag);
+  fs.writeFileSync(selector, JSON.stringify(api));
+  selectorEnv.VPN_TEST_ROOT = path.join(root, 'probe-jobs');
+  const revision = snapshot().revision;
+  const checkedSelect = () => spawnSync('sh', [safeCli, 'node-checked', cached.tag, 'black', 'job-1', revision], {env: selectorEnv, encoding: 'utf8'});
+  const now = Math.floor(Date.now()/1000);
+  function proof(start, ok) {
+    write('probe-jobs/job-1/job.json', JSON.stringify({state:'done', started_at:start, target:{url:'https://example.com/check'},
+      results:[{tag:cached.tag, ok, attempts:2, passed:ok ? 2 : 1}]}));
+  }
+  write('probe-jobs/job-1/config.sha256', require('node:crypto').createHash('sha256').update(fs.readFileSync(path.join(root,'config.json'))).digest('hex'));
+  proof(now-400, true); assert.notEqual(checkedSelect().status, 0);
+  proof(now, false); assert.notEqual(checkedSelect().status, 0);
+  proof(now, true); selectorEnv.TEST_DELAY_FAIL = '1'; assert.notEqual(checkedSelect().status, 0);
+  assert.equal(JSON.parse(fs.readFileSync(selector)).proxies['vpn-out'].now, 'loaded-node');
+  delete selectorEnv.TEST_DELAY_FAIL;
+  const switched = checkedSelect(); assert.equal(switched.status, 0, switched.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(selector)).proxies['vpn-out'].now, cached.tag);
   console.log('PASS: clean catalog initialization, stable node IDs, arbitrary profiles, stale revision, invalid refs, rule CRUD, no config restart');
 } finally { fs.rmSync(work, {recursive: true, force: true}); }

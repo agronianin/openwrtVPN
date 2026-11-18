@@ -165,6 +165,7 @@ snapshot() (
   managed=false; [ ! -s "$MANAGED" ] || managed=true
   echo null > "$TMP/effective.json"
   echo null > "$TMP/selection.json"
+  echo '{}' > "$TMP/selectable.json"
   echo null > "$TMP/job.json"
   echo null > "$TMP/connection.json"
   [ ! -x /usr/bin/vpn-connection ] || /usr/bin/vpn-connection status > "$TMP/connection.json"
@@ -172,6 +173,7 @@ snapshot() (
   if [ -x /usr/bin/vpn-node-tests ]; then /usr/bin/vpn-node-tests targets > "$TMP/test-targets.json"; fi
   [ ! -f "$BASE/profiles/update-job.json" ] || cp "$BASE/profiles/update-job.json" "$TMP/job.json"
   if running && curl -fsS --max-time 2 http://127.0.0.1:9090/proxies > "$TMP/api.json"; then
+    jq '(.proxies["vpn-out"].all // []) | map({key:.,value:true}) | from_entries' "$TMP/api.json" > "$TMP/selectable.json" || echo '{}' > "$TMP/selectable.json"
     jq '.proxies["vpn-out"].now as $tag | if ($tag|type)!="string" or $tag=="" then null else
       {tag:$tag,mode:(if $tag=="profile-auto" then "auto" else "manual" end)} end' \
       "$TMP/api.json" > "$TMP/selection.json" || echo null > "$TMP/selection.json"
@@ -188,11 +190,11 @@ snapshot() (
     --slurpfile nodes "$TMP/nodes.json" --slurpfile rules "$TMP/rules.json" --argjson managed "$managed" \
     --slurpfile effective "$TMP/effective.json" \
     --slurpfile selection "$TMP/selection.json" \
-    --slurpfile job "$TMP/job.json" \
+    --slurpfile selectable "$TMP/selectable.json" --slurpfile job "$TMP/job.json" \
     --slurpfile targets "$TMP/test-targets.json" \
     --slurpfile connection "$TMP/connection.json" \
     '{revision:$revision,data:$data[0],active:(if $active=="" then null else $active end),running:$running,managed:$managed,
-      effective:$effective[0],selection:$selection[0],connection:$connection[0],updateJob:$job[0],testTargets:$targets[0],nodes:$nodes[0],rules:$rules[0]}'
+      effective:$effective[0],selection:$selection[0],connection:$connection[0],updateJob:$job[0],testTargets:$targets[0],nodes:($nodes[0]|map(.selectable=($selectable[0][.tag]//false))),rules:$rules[0]}'
 )
 
 refresh_sources() {
@@ -449,13 +451,35 @@ case "${1:-snapshot}" in
       exit 1
     fi
     ;;
-  node)
+  node|node-checked)
     [ -s "$MANAGED" ] || error 'Select a profile first'
     tag="${2:-auto}"
+    if [ "$1" = node-checked ]; then
+      profile=${3:-}; proof=${4:-}
+      valid_id "$tag" && valid_id "$profile" && valid_id "$proof" || error 'Сначала проверьте узел в текущем профиле.'
+      [ "$(cat "$ACTIVE")" = "$profile" ] && [ "$(revision)" = "${5:-}" ] || error 'Профиль изменился. Обновите статус и повторите проверку.'
+      job_dir="${VPN_TEST_ROOT:-/tmp/vpn-node-tests}/$proof"
+      jq -e --arg tag "$tag" --argjson now "$(date +%s)" '
+        .state=="done" and (.started_at >= $now-300 and .started_at <= $now) and any(.results[]; .tag==$tag and .ok and .passed==2 and .attempts==2)
+      ' "$job_dir/job.json" >/dev/null 2>&1 || error 'Нужны две успешные HTTPS-попытки за последние пять минут. Повторите быстрый тест.'
+      [ "$(cat "$job_dir/config.sha256" 2>/dev/null)" = "$(sha256sum "$CONFIG" | cut -d' ' -f1)" ] || error 'Конфигурация изменилась. Повторите тест.'
+      snapshot > "$TMP/before-switch.json"
+      jq -e --arg tag "$tag" --arg id "$profile" '
+        (.data.profiles[]|select(.id==$id)) as $p | .running and any(.nodes[]; . as $n |
+          .tag==$tag and .selectable and (($p.nodes|index($tag))!=null or ($p.subscriptions|index($n.subscription))!=null))
+      ' "$TMP/before-switch.json" >/dev/null || error 'Узел не загружен в действующий профиль.'
+    fi
     [ "$tag" != auto ] || tag=profile-auto
     curl -fsS --max-time 8 http://127.0.0.1:9090/proxies > "$TMP/proxies.json"
     jq -e --arg tag "$tag" '.proxies["vpn-out"].all | index($tag)!=null' "$TMP/proxies.json" >/dev/null \
       || error 'Node does not belong to the active profile/configuration'
+    if [ "$1" = node-checked ]; then
+      url=$(jq -er '.target.url | select(startswith("https://"))' "$job_dir/job.json") || error 'Повторите HTTPS-проверку.'
+      curl -q -fsS --max-time 8 --noproxy '*' --get --data-urlencode "url=$url" --data-urlencode 'timeout=6000' \
+        "http://127.0.0.1:9090/proxies/$tag/delay" > "$TMP/candidate-delay.json" 2>/dev/null &&
+        jq -e '(.delay|type)=="number" and .delay>=0' "$TMP/candidate-delay.json" >/dev/null 2>&1 ||
+        error 'Узел не прошёл повторную проверку перед переключением. Текущее подключение сохранено.'
+    fi
     jq -n --arg name "$tag" '{name:$name}' | curl -fsS --max-time 8 -X PUT -H 'Content-Type: application/json' \
       --data-binary @- http://127.0.0.1:9090/proxies/vpn-out
     curl -fsS --max-time 8 http://127.0.0.1:9090/proxies > "$TMP/selection-confirm.json" \

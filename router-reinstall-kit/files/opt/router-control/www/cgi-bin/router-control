@@ -985,7 +985,7 @@ case "$ACTION" in vpn_profiles_*)
     vpn_profiles_save) printf '%s' "$CONTENT" | /usr/bin/vpn-profiles save "$(url_decode "$(field revision)")" > "$output_file" 2>&1 ;;
     vpn_profiles_activate) /usr/bin/vpn-profiles activate "$ARG" > "$output_file" 2>&1 ;;
     vpn_profiles_on) /usr/bin/vpnctl on > "$output_file" 2>&1 ;;
-    vpn_profiles_node) /usr/bin/vpn-profiles node "$ARG" > "$output_file" 2>&1 ;;
+    vpn_profiles_node) /usr/bin/vpn-profiles node-checked "$ARG" "$(url_decode "$(field profile)")" "$CONTENT" "$(url_decode "$(field revision)")" > "$output_file" 2>&1 ;;
     vpn_profiles_update) /usr/bin/vpn-profiles queue-update "$ARG" > "$output_file" 2>&1 ;;
     vpn_profiles_test) /usr/bin/vpn-profiles test "$ARG" > "$output_file" 2>&1 ;;
     vpn_profiles_targets_save)
