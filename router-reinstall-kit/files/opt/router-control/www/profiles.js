@@ -12,6 +12,7 @@
   }
   var snapshot, data, baseline, busy = false, view = 'VPN', drafts = new Map(), expanded = new Set();
   var probeJob = null, probeStarting = false, probeError = '', probeNote = '', drawProbe = null, targetId = 'google';
+  var probeNode = null, nodeResults = new Map();
   var connectionStarting = false, connectionSaving = false, connectionRefreshing = false, connectionError = '';
   var drawConnection = null, connectionTimer;
   var connectionControls = [], completedConnectionJob = null;
@@ -187,7 +188,7 @@
       ]);
     } finally { clearTimeout(timer); }
   }
-  function readProbe(payload, id) {
+  function acceptProbe(payload, id) {
     var job = payload.job;
     if (!job || typeof job.id !== 'string' || !job.id || (id && job.id !== id) ||
         !['running', 'done', 'failed'].includes(job.state) || !Array.isArray(job.results) ||
@@ -196,24 +197,26 @@
           item.passed < 0 || item.passed > 2 || item.attempts !== 2 || typeof item.ok !== 'boolean'; })) {
       throw new Error('Некорректный ответ задания проверки');
     }
+    job.results.forEach(function (item) { nodeResults.set(item.tag, { item: item, target: job.target }); });
     return job;
   }
   async function pollProbe() {
     try {
-      probeJob = readProbe(await probeRequest('vpn_profiles_probe_status', { arg: probeJob.id }), probeJob.id);
+      probeJob = acceptProbe(await probeRequest('vpn_profiles_probe_status', { arg: probeJob.id }), probeJob.id);
       probeError = '';
     } catch (error) { probeError = error.message; }
     updateConnection();
     if (probing()) setTimeout(pollProbe, 1500);
   }
-  async function startProbe(tags, speed, count) {
-    if (probing() || busy || connectionWorking() || !tags.length) return;
+  async function startProbe(tags, speed, count, nodeTag = null) {
+    if (probing() || busy || connectionWorking() || !tags.length || !targetId) return;
     if (speed && !window.confirm('Тест скорости через Cloudflare: до 2 MiB на узел, до ' + tags.length * 2 + ' MiB всего. Продолжить?')) return;
     probeStarting = true; probeError = ''; probeJob = null;
+    probeNode = nodeTag;
     probeNote = count > 60 ? 'Найдено: ' + count + '. Проверяются первые 60 узлов.' : 'Узлов: ' + tags.length;
     updateConnection();
     try {
-      probeJob = readProbe(await probeRequest('vpn_profiles_probe_start', {
+      probeJob = acceptProbe(await probeRequest('vpn_profiles_probe_start', {
         content: JSON.stringify({ tags: tags.slice(0, 60), target: targetId, speed: speed })
       }));
     } catch (error) { probeError = error.message; }
@@ -416,6 +419,7 @@
     details.addEventListener('toggle', toggle);
     details.open = expanded.has(key);
     if (details.open) toggle();
+    return details;
   }
   function compactEditor(parent, name, id, kind, build) {
     disclosure(parent, name, kind + ':' + id, function (details) { build(editor(details, name)); }, id);
@@ -823,60 +827,73 @@
     }
     var quick = button('Быстрый тест', function () { return batch(false); });
     var speed = button('Тест скорости', function () { return batch(true); }); testActions.append(quick, speed);
-    var probeStatus = result(tests), progress = el('progress'), results = el('table', undefined, 'vp-probe-results');
-    progress.setAttribute('aria-label', 'Прогресс HTTPS-теста'); tests.append(progress, results);
+    var probeStatus = result(tests), progress = el('progress'), drawNodes = new Map();
+    progress.setAttribute('aria-label', 'Прогресс HTTPS-теста'); tests.append(progress);
+    function jobStatus(status, text) {
+      var message = [text, probeError, probeJob && probeJob.error].filter(Boolean).join('\n');
+      if (status.textContent !== message) status.textContent = message;
+      status.classList.remove('vp-error');
+      if (probeError || probeJob && probeJob.state === 'failed') status.classList.add('vp-error');
+    }
     drawProbe = function () {
       var matches = filteredNodes(), active = probing(), blocked = active || busy || connectionWorking();
       quick.disabled = speed.disabled = blocked || !matches.length || !targetId;
       targetSelect.disabled = blocked;
-      list.querySelectorAll('button').forEach(function (node) { node.disabled = blocked; });
+      drawNodes.forEach(function (drawNode) { drawNode(); });
       urls.replaceChildren();
       targets.items.forEach(function (item) { urls.append(el('p', item.name + ' · HTTP ' + item.status), el('code', item.url)); });
       urls.append(el('p', 'Скорость · Cloudflare · 2 MiB'), el('code', 'https://speed.cloudflare.com/__down?bytes=2097152'));
-      var text = probeStarting ? 'Запуск...' : probeJob ?
-        ({ running: 'Проверка', done: 'Готово', failed: 'Ошибка задания' })[probeJob.state] + ': ' + probeJob.done + '/' + probeJob.total :
+      // Keep the list in place when an individual check starts below the batch controls.
+      if (probeNode !== null && probeStatus.textContent) return;
+      var batchJob = probeNode === null ? probeJob : null;
+      var text = probeNode === null && probeStarting ? 'Запуск...' : batchJob ?
+        ({ running: 'Проверка', done: 'Готово', failed: 'Ошибка задания' })[batchJob.state] + ': ' + batchJob.done + '/' + batchJob.total :
         'Найдено: ' + matches.length + '. К тесту: ' + Math.min(60, matches.length) + ' (максимум 60).';
-      if (probeJob) text += '\n' + probeNote + (probeJob.target ? ' · ' + probeJob.target.name : '');
-      if (probeJob && probeJob.state === 'running' && probeJob.phase === 'speed') {
-        text += '\nЗамер скорости: ' + probeJob.results.filter(function (item) { return item.speed_bytes != null; }).length + '/' +
-          probeJob.results.filter(function (item) { return item.ok; }).length;
+      if (batchJob) text += '\n' + probeNote + (batchJob.target ? ' · ' + batchJob.target.name : '');
+      if (batchJob && batchJob.state === 'running' && batchJob.phase === 'speed') {
+        text += '\nЗамер скорости: ' + batchJob.results.filter(function (item) { return item.speed_bytes != null; }).length + '/' +
+          batchJob.results.filter(function (item) { return item.ok; }).length;
       }
-      probeStatus.textContent = text + (probeError ? '\n' + probeError : '') + (probeJob && probeJob.error ? '\n' + probeJob.error : '');
-      probeStatus.classList.remove('vp-error');
-      if (probeError || probeJob && probeJob.state === 'failed') probeStatus.classList.add('vp-error');
-      progress.hidden = !active; progress.max = probeJob ? probeJob.total || 1 : 1; progress.value = probeJob ? probeJob.done : 0;
-      results.replaceChildren();
-      if (!probeJob || !probeJob.results.length) return;
-      var head = el('thead'), headings = el('tr');
-      ['Узел', 'HTTPS', 'HTTPS, мс', 'Мбит/с'].forEach(function (name) { var cell = el('th', name); cell.scope = 'col'; headings.append(cell); });
-      head.append(headings); results.append(head);
-      var body = el('tbody'); results.append(body);
-      probeJob.results.forEach(function (item) {
-        var row = el('tr'); body.append(row);
-        var values = [
-          (item.title || item.tag) + (item.type ? ' · ' + item.type : ''),
-          (item.ok ? 'Доступен' : item.passed ? 'Нестабильно' : 'Недоступен') +
-            ' · ' + item.passed + '/' + item.attempts + (item.http_code ? ' · HTTP ' + item.http_code : ''),
-          item.latency_ms == null ? '—' : String(item.latency_ms),
-          item.speed_mbps == null ? '—' : String(item.speed_mbps)
-        ];
-        values.forEach(function (value, index) {
-          var cell = el('td', value); cell.setAttribute('data-label', ['Узел', 'HTTPS', 'HTTPS, мс', 'Мбит/с'][index]); row.append(cell);
-          if (index === 1 && item.error) cell.append(el('p', item.error, 'vp-error'));
-          if (index === 3 && item.speed_error) cell.append(el('p', item.speed_error, 'vp-error'));
-        });
-      });
+      if (batchJob && batchJob.results.length) text += '\nРезультаты в карточках узлов.';
+      if (probeNode === null) jobStatus(probeStatus, text);
+      else probeStatus.textContent = text;
+      progress.hidden = probeNode !== null || !active;
+      progress.max = batchJob ? batchJob.total : 1; progress.value = batchJob ? batchJob.done : 0;
     };
     var list = el('div'), pages = el('div', undefined, 'vp-actions'); area.append(list, pages);
     function draw() {
       list.replaceChildren();
+      drawNodes.clear();
       var matches = filteredNodes();
       if (!matches.length) list.append(el('p', 'Узлы не найдены'));
       matches.slice(page * 30, (page + 1) * 30).forEach(function (node) {
-        var row = el('div', undefined, 'vp-node');
-        row.append(el('strong', node.title || node.tag), el('p', node.type + ' · ' + groupName(node.subscription)));
-        row.append(button('Проверить узел', function () { return startProbe([node.tag], false, 1); })); list.append(row);
-        compactEditor(row, 'Переименовать узел', node.tag, 'node', function (group) {
+        var row = disclosure(list, undefined, 'node:' + node.tag, function (details) {
+          var group = el('div', undefined, 'vp-node-body'); details.append(group);
+          var check = button('Проверить узел', function () { return startProbe([node.tag], false, 1, node.tag); });
+          group.append(check);
+          var status = result(group), measurement = result(group);
+          function drawNode() {
+            check.disabled = probing() || busy || connectionWorking() || !targetId;
+            if (probeNode === node.tag) {
+              jobStatus(status, probeStarting ? 'Запуск проверки…' : probing() ? 'Проверка HTTPS…' :
+                probeJob && probeJob.state === 'failed' ? 'Ошибка проверки' : '');
+            } else {
+              status.textContent = '';
+            }
+            var last = nodeResults.get(node.tag);
+            if (!last) return;
+            var item = last.item;
+            var text = (last.target ? last.target.name + ' · ' : '') +
+              (item.ok ? 'Доступен' : item.passed ? 'Нестабильно' : 'Недоступен') + ' · ' + item.passed + '/' + item.attempts;
+            if (item.http_code) text += ' · HTTP ' + item.http_code;
+            if (item.latency_ms != null) text += ' · ' + item.latency_ms + ' мс';
+            if (item.speed_mbps != null) text += ' · ' + item.speed_mbps + ' Мбит/с';
+            if (item.error) text += '\n' + item.error;
+            if (item.speed_error) text += '\nОшибка замера скорости: ' + item.speed_error;
+            if (measurement.textContent !== text) measurement.textContent = text;
+          }
+          drawNodes.set(node.tag, drawNode);
+          drawNode();
           var key = 'node-name:' + node.tag;
           var name = field(group, 'Название узла', input(drafts.get(key) ?? node.title ?? node.tag, function (value) {
             if (value === (node.title || node.tag)) drafts.delete(key); else drafts.set(key, value);
@@ -890,7 +907,10 @@
             catalog.nodeNames[node.tag] = title;
             return request('vpn_profiles_save', undefined, output, { revision: snapshot.revision, content: JSON.stringify(catalog) }, true, [key]);
           }));
-        });
+        }, node.tag);
+        row.classList.add('vp-node');
+        row.children[0].append(el('strong', node.title || node.tag),
+          el('span', node.type + ' · ' + groupName(node.subscription), 'vp-node-source'));
       });
       pages.replaceChildren();
       if (matches.length > 30) {

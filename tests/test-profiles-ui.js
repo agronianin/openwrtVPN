@@ -102,6 +102,8 @@ function disclosure(title, parent = root) {
 function group(title) { return root.querySelectorAll('fieldset').find(node => node.children[0].textContent === title); }
 function postedData() { return JSON.parse(requests.at(-1).fields.content); }
 function nodeSearch() { return root.querySelectorAll('input').find(node => node.type === 'search'); }
+function nodeCards() { return root.querySelectorAll('details').filter(node => node.classes.has('vp-node')); }
+function nodeCard(tag) { return nodeCards().find(node => node.attributes['data-editor-id'] === tag); }
 
 // Приоритеты не сортируются сами, идентификаторы стабильны, сохранение одного профиля отправляет его правки с исходной ревизией.
 async function testAtomicSaveAndOrdering() {
@@ -163,13 +165,43 @@ async function testConnectionAndSearch() {
   assert.equal(requests.at(-1).fields.action, 'vpn_profiles_on');
   assert.ok(named('Выключить VPN'));
   await click('Узлы'); await edit(nodeSearch(), 'Node B');
-  assert.equal(buttons().filter(node => node.textContent === 'Проверить узел').length, 1);
-  replies.push({ ok: true, job: { ...probeJob('done', 1), total: 1 } }); await click('Проверить узел');
-  assert.equal(requests.at(-1).fields.action, 'vpn_profiles_probe_start');
-  assert.deepEqual(postedData(), { tags: ['b'], target: 'google', speed: false });
+  assert.deepEqual(nodeCards(), [nodeCard('b')]);
   assert.equal(root.querySelectorAll('script').length, 0);
   await click('Узлы'); await edit(root.querySelectorAll('select')[0], 'second', 'change');
-  assert.equal(buttons().filter(node => node.textContent === 'Проверить узел').length, 1);
+  assert.deepEqual(nodeCards(), [nodeCard('b')]);
+}
+
+// Одиночная проверка обновляет только карточку узла и сохраняет её при переходах по вкладкам.
+async function testSingleNodeProbe() {
+  boot(); await click('Узлы');
+  assert.equal(nodeCards().length, initial.nodes.length);
+  const card = nodeCard('b'), neighbor = nodeCard('a');
+  assert.ok(nodeCards().every(node => !node.open && buttons(node).length === 0));
+  assert.equal(card.children[0].querySelectorAll('strong')[0].textContent, 'Node B');
+  assert.equal(card.children[0].querySelectorAll('span')[0].textContent, 'hy2 · Second');
+  openDetails(card);
+  const check = named('Проверить узел', card);
+  const batchStatus = root.querySelectorAll('p').find(node => node.textContent.includes('К тесту:'));
+  const batchText = batchStatus.textContent;
+  replies.push({ ok: true, job: { ...probeJob(), total: 1 } }); await click('Проверить узел', card);
+  assert.equal(requests.at(-1).fields.action, 'vpn_profiles_probe_start');
+  assert.deepEqual(postedData(), { tags: ['b'], target: 'google', speed: false });
+  assert.ok(card.textContent.includes('Проверка HTTPS'));
+  assert.equal(check.disabled, true);
+  const measurement = { tag: 'b', passed: 2, attempts: 2, ok: true, http_code: 204, latency_ms: 13 };
+  replies.push({ ok: true, job: { ...probeJob('done', 1, [measurement]), total: 1 } }); await tick();
+  assert.equal(nodeCard('b'), card); assert.equal(named('Проверить узел', card), check);
+  assert.equal(check.disabled, false); assert.equal(card.open, true);
+  assert.equal(neighbor.open, false);
+  assert.equal(batchStatus.textContent, batchText);
+  const reading = 'Google · Доступен · 2/2 · HTTP 204 · 13 мс';
+  assert.ok(card.textContent.includes(reading)); assert.ok(!neighbor.textContent.includes(reading));
+  assert.equal(root.querySelectorAll('table').length, 0);
+  replies.push(new Error('Проверка недоступна')); await click('Проверить узел', card);
+  assert.ok(card.textContent.includes('Проверка недоступна'));
+  assert.equal(batchStatus.textContent, batchText);
+  await click('Статус'); await click('Узлы');
+  assert.equal(nodeCard('b').open, true); assert.ok(nodeCard('b').textContent.includes(reading));
 }
 
 // CRUD подписок и профилей сохраняет порядок зеркал и блокирует удаление используемого источника.
@@ -215,8 +247,9 @@ async function testNodeNameAndLocalGroup() {
   await click('Сохранить группу', editor('first'));
   assert.deepEqual(postedData().subscriptions[0].priority, ['a']);
   await click('Узлы');
-  await edit(editor('b').querySelectorAll('input')[0], 'New node label');
-  await click('Сохранить узел', editor('b'));
+  const card = openDetails(nodeCard('b'));
+  await edit(card.querySelectorAll('input')[0], 'New node label');
+  await click('Сохранить узел', card);
   assert.deepEqual(postedData().nodeNames, { b: 'New node label' });
   assert.deepEqual(postedData().profiles, initial.data.profiles);
 }
@@ -263,10 +296,10 @@ async function testLargeCatalog() {
   assert.ok(chooser.textContent.includes('1. Server 599')); assert.ok(chooser.textContent.includes('2. Server 598'));
   checks[2].checked = true; await checks[2].fire('change');
   assert.ok(chooser.textContent.includes('3. Server 500'));
-  await click('Узлы'); assert.equal(buttons().filter(node => node.textContent === 'Проверить узел').length, 30);
+  await click('Узлы'); assert.equal(nodeCards().length, 30);
   await click('Далее'); assert.ok(root.textContent.includes('Server 30')); assert.ok(!root.textContent.includes('Server 0'));
   await edit(nodeSearch(), 'node-599');
-  assert.equal(buttons().filter(node => node.textContent === 'Проверить узел').length, 1);
+  assert.deepEqual(nodeCards(), [nodeCard('node-599')]);
 }
 
 // Фактическое подключение не маскируется состоянием «выключен», а сохранение своего правила не требует потери чужих правок.
@@ -515,15 +548,22 @@ function testMobileLayout() {
     for (const width of [320, 390, 1200]) {
       const shell = '<!doctype html><body style="margin:0"><script>' +
         'const frame=document.createElement("iframe");frame.style="border:0;width:' + width + 'px;height:1800px";' +
-        'frame.onload=()=>{try{const d=frame.contentDocument,w=frame.contentWindow,app=d.getElementById("vpn-app");' +
+        'frame.onload=async()=>{try{const d=frame.contentDocument,w=frame.contentWindow,app=d.getElementById("vpn-app");' +
         'if(!app)throw Error("Missing app");if(w.innerWidth!==' + width + ')throw Error("Wrong viewport");' +
-        'for(const view of ["Статус","Профили","Подписки","Правила","Узлы"]){' +
+        'for(const view of ["Статус","Профили","Группы узлов","Правила","Узлы"]){' +
         '[...app.querySelectorAll("nav button")].find(b=>b.textContent===view).click();' +
-        'app.querySelectorAll("details").forEach(n=>n.open=true);' +
+        'if(view==="Узлы" && ![...app.querySelectorAll(".vp-node")].every(n=>!n.open))throw Error("Open node on entry");' +
+        'app.querySelectorAll("details").forEach(n=>{n.open=true;n.dispatchEvent(new Event("toggle"));});' +
         'if(d.documentElement.scrollWidth>w.innerWidth)throw Error("Page overflow: "+view);' +
         'for(const n of app.querySelectorAll("button,input,select,textarea,summary,progress")){' +
         'if(!n.getClientRects().length)continue;const r=n.getBoundingClientRect();' +
         'if(r.left<0||r.right>w.innerWidth+1)throw Error("Control overflow: "+view+" "+n.tagName);}' +
+        'if(view==="Узлы"){const card=app.querySelector(".vp-node"),top=card.getBoundingClientRect().top;' +
+        'w.fetch=async()=>({ok:true,json:async()=>({ok:true,job:{id:"test",state:"done",total:1,done:1,' +
+        'results:[{tag:"a",ok:true,passed:2,attempts:2,latency_ms:13}]}})});' +
+        '[...card.querySelectorAll("button")].find(b=>b.textContent==="Проверить узел").click();' +
+        'await new Promise(resolve=>w.setTimeout(resolve,0));' +
+        'if(!card.open||!card.textContent.includes("13 мс")||card.getBoundingClientRect().top!==top)throw Error("Node result moved the list");}' +
         '}[...app.querySelectorAll("nav button")].find(b=>b.textContent==="Статус").click();' +
         'app.querySelector("details").open=true;' +
         'const columns=w.getComputedStyle(app.querySelector(".vp-recovery-grid")).gridTemplateColumns.split(" ").length;' +
@@ -541,7 +581,7 @@ function testMobileLayout() {
       assert.ok(output.includes('data-layout="pass"'), 'Layout ' + width + ': ' + (output.match(/data-layout="([^"]*)"/) || [])[1]);
     }
   } finally { fs.rmSync(profile, { recursive: true, force: true }); }
-  console.log('PASS: Chrome layouts at 320, 390 and 1200 px, all five views and recovery controls');
+  console.log('PASS: Chrome layouts at 320, 390 and 1200 px, including inline probe results and stable node position');
 }
 
 // Ответы заданий и виртуальное время позволяют проверить polling без реальной сети и ожидания.
@@ -566,24 +606,31 @@ async function testFilteredProbeAndProgress() {
   await click('Далее');
   const nav = root.querySelectorAll('nav')[0], search = nodeSearch(), uri = root.querySelectorAll('textarea')[0];
   const targetSelect = root.querySelectorAll('select')[1]; await edit(targetSelect, 'youtube', 'change');
+  const visibleCard = openDetails(nodeCards()[0]);
   replies.push({ ok: true, job: probeJob() }); await click('Быстрый тест');
   assert.equal(requests.at(-1).fields.action, 'vpn_profiles_probe_start');
   assert.deepEqual(postedData(), { tags: Array.from({ length: 60 }, (_, i) => 'tag-' + (i * 2 + 1)), target: 'youtube', speed: false });
   assert.ok(root.textContent.includes('Найдено: 70. Проверяются первые 60'));
   assert.equal(named('Быстрый тест').disabled, true); assert.equal(named('Тест скорости').disabled, true);
-  assert.ok(buttons().filter(node => node.textContent === 'Проверить узел').every(node => node.disabled));
+  assert.equal(named('Проверить узел', visibleCard).disabled, true);
   await named('Быстрый тест').fire('click'); assert.equal(requests.length, 1);
   const result = { tag: 'tag-1', title: '<img src=x>', type: 'vless', passed: 1, attempts: 2, ok: false,
     http_code: 503, latency_ms: 0, error: 'TLS failed', speed_mbps: null, speed_error: 'No download' };
   replies.push({ ok: true, job: probeJob('running', 1, [result]) }); await tick();
   assert.equal(requests.at(-1).fields.arg, 'job-1'); assert.equal(requests.at(-1).fields.action, 'vpn_profiles_probe_status');
   assert.ok(root.textContent.includes('1/60')); assert.equal(root.querySelectorAll('progress')[0].value, 1);
-  assert.ok(root.textContent.includes('TLS failed')); assert.ok(root.textContent.includes('No download'));
+  assert.ok(!root.textContent.includes('TLS failed')); assert.ok(!root.textContent.includes('No download'));
   assert.equal(root.querySelectorAll('img').length, 0);
   assert.equal(root.querySelectorAll('nav')[0], nav); assert.equal(nodeSearch(), search);
   assert.equal(uri.value, 'vless://draft@host:443'); assert.equal(targetSelect.value, 'youtube');
   replies.push({ ok: true, job: probeJob('done', 60, [result]) }); await tick();
   assert.ok(root.textContent.includes('Готово: 60/60')); assert.equal(named('Быстрый тест').disabled, false);
+  await click('Назад');
+  const testedCard = openDetails(nodeCard('tag-1'));
+  assert.ok(testedCard.textContent.includes('TLS failed'));
+  assert.ok(testedCard.textContent.includes('0 мс'));
+  assert.ok(testedCard.textContent.includes('Ошибка замера скорости: No download'));
+  assert.ok(!openDetails(nodeCard('tag-3')).textContent.includes('TLS failed'));
   assert.equal(timers.size, 0);
   assert.ok(requests.every(request => !['vpn_profiles_activate', 'vpn_profiles_node', 'vpn_profiles_snapshot'].includes(request.fields.action)));
 }
@@ -640,7 +687,7 @@ async function testTargetEditing() {
 }
 
 (async function () {
-  const tests = [testAtomicSaveAndOrdering, testFailuresAndDiscard, testConnectionAndSearch, testCatalogCrud, testNodeNameAndLocalGroup, testRuleActions,
+  const tests = [testAtomicSaveAndOrdering, testFailuresAndDiscard, testConnectionAndSearch, testSingleNodeProbe, testCatalogCrud, testNodeNameAndLocalGroup, testRuleActions,
     testLargeCatalog, testEffectiveAndRuleGuard, testImportAndRefresh, testUpdateJob, testLastCheck,
     testFilteredProbeAndProgress, testProbeErrorsAndSpeed, testTargetEditing, testSelectionFeedback,
     testConnectionDraftsAndNoCandidate, testConnectionErrorsAndCheck, testRecoverySettings, testConnectionSnapshotRace];
