@@ -89,9 +89,13 @@ if(proxy.endsWith('21081') && n===0) console.log('403 0.02'); else console.log('
   env.STUB_CURL_MODE = 'tls-error';
   // После отката часов новая задача может оказаться раньше сохранённых по имени.
   for (let index = 0; index < 20; index++) fs.mkdirSync(path.join(jobs, `9999999999-${index}`));
+  // Повторная проверка использует сохранённый адрес вместо уже загруженного адреса с тем же тегом.
+  fs.writeFileSync(path.join(root, 'profiles/catalog.json'), JSON.stringify({nodeEndpoints:{one:{server:'edited.example', server_port:8443}}}));
   const failedStart = run(['start'], JSON.stringify({tags: ['one'], target: 'google', speed: false}));
   assert.equal(failedStart.status, 0, failedStart.stderr);
   const failed = await finish(JSON.parse(failedStart.stdout));
+  const edited = JSON.parse(fs.readFileSync(path.join(work, 'checked.json'))).outbounds[0];
+  assert.equal(edited.server, 'edited.example'); assert.equal(edited.server_port, 8443);
   assert.equal(failed.state, 'done', JSON.stringify(failed));
   assert.equal(failed.results[0].passed, 0); assert.equal(failed.results[0].ok, false);
   assert.equal(failed.results[0].latency_ms, null); assert.match(failed.results[0].error, /Certificate/);

@@ -105,6 +105,7 @@ collect_pool() {
   tested=0
   mkdir -p "$J/data/profiles/cache"
   cp "$BASE/config.json" "$J/data/config.json"
+  jq '{nodeEndpoints,nodeNames,subscriptions:[.subscriptions[]|{id,priority}]}' "$DB" > "$J/data/profiles/catalog.json"
   jq -s '.' "$J/target.json" > "$J/data/profiles/test-targets.json"
   : > "$J/all.nodes"; : > "$J/all.titles"; : > "$J/ru-tags"
   for file in "$BASE/profiles/cache/"*.nodes; do
@@ -128,10 +129,10 @@ collect_pool() {
   fi
   jq -Rn '[inputs]' < "$J/ru-tags" > "$J/ru.json"
   jq --slurpfile cache "$J/cached.json" --slurpfile profile "$J/profile.json" --slurpfile titles "$J/titles.json" \
-    --slurpfile ru "$J/ru.json" --slurpfile catalog "$DB" '
+    --slurpfile ru "$J/ru.json" --slurpfile catalog "$J/data/profiles/catalog.json" '
     ($catalog[0].subscriptions|map({key:.id,value:(.priority//[])})|from_entries) as $priorities |
     ([.outbounds[]|select(.type=="vless" or .type=="hysteria2")]+$cache[0])
-    | unique_by(.tag) | map(. as $node | $profile[0] as $p |
+    | unique_by(.tag) | map((. + ($catalog[0].nodeEndpoints[.tag]//{})) as $node | $profile[0] as $p |
       ($p.subscriptions|map(select(. as $id|$node.tag|startswith($id+"-")))|max_by(length)) as $source |
       ($p.subscriptions|index($source)) as $rank |
       select($rank!=null or ($p.nodes|index($node.tag))!=null) |
@@ -142,7 +143,7 @@ collect_pool() {
          (if $p.preference=="ru" then 0 else 1 end) else (if $p.preference=="non-ru" then 0 else 1 end) end)})
     | sort_by(.rank,.priority,.country_rank,.node.tag)' "$J/data/config.json" > "$J/pool.json" || fail 'Не удалось собрать кандидатов профиля'
   if [ "$(jq -r .allow_reload "$J/settings.json")" = false ]; then
-    jq --slurpfile config "$J/data/config.json" 'map(. as $entry|select(any($config[0].outbounds[];.tag==$entry.node.tag)))' \
+    jq --slurpfile config "$J/data/config.json" 'map(. as $entry|select(any($config[0].outbounds[];.tag==$entry.node.tag and .server==$entry.node.server and .server_port==$entry.node.server_port)))' \
       "$J/pool.json" > "$J/pool.new"; mv "$J/pool.new" "$J/pool.json"
   fi
   [ "$(jq length "$J/pool.json")" -gt 0 ] || fail 'В выбранном профиле нет кэшированных узлов'
@@ -188,7 +189,9 @@ commit_winner() {
   winner=$(jq -r .tag "$J/winner.json")
   jq --slurpfile pool "$J/pool.json" '.tag as $tag | .title=([$pool[0][]|select(.node.tag==$tag)|.title][0]//.title)' \
     "$J/winner.json" > "$J/winner.new"; mv "$J/winner.new" "$J/winner.json"
-  if api | jq -e --arg tag "$winner" '.proxies["vpn-out"].all|index($tag)!=null' >/dev/null; then
+  if jq -e --arg tag "$winner" --slurpfile pool "$J/pool.json" '
+    ($pool[0][]|select(.node.tag==$tag)|.node) as $n | any(.outbounds[];.tag==$tag and .server==$n.server and .server_port==$n.server_port)
+  ' "$J/data/config.json" >/dev/null && api | jq -e --arg tag "$winner" '.proxies["vpn-out"].all|index($tag)!=null' >/dev/null; then
     lock_settings
     same_context || fail 'Контекст изменился перед переключением'
     selection_pending=1

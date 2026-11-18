@@ -53,7 +53,7 @@ const initial = {
       rules: ['20-direct', '05-proxy'], final: 'vpn-out', preference: 'non-ru' }]
   },
   nodes: [{ tag: 'a', subscription: 'first', title: '<img src=x onerror=alert(1)>', type: 'vless' },
-    { tag: 'b', subscription: 'second', title: 'Node B', type: 'hy2' },
+    { tag: 'b', subscription: 'second', title: 'Node B', server: 'node.example', server_port: 443, type: 'hy2' },
     { tag: 'extra', subscription: 'third', title: 'Extra', type: 'vless' },
     { tag: 'excluded', subscription: 'third', title: 'Excluded', type: 'vless' }],
   rules: [{ id: '05-proxy', name: 'Proxy', content: 'proxy content', revision: 'sha-proxy' },
@@ -294,7 +294,13 @@ async function testNodeNameAndLocalGroup() {
   await click('Узлы');
   const card = openDetails(nodeCard('b'));
   await edit(card.querySelectorAll('input')[0], 'New node label');
+  await edit(card.querySelectorAll('input')[1], '[2001:db8::7]');
+  await edit(card.querySelectorAll('input')[2], '65536');
+  const priorRequests = requests.length;
+  await click('Сохранить узел', card); assert.equal(requests.length, priorRequests);
+  await edit(card.querySelectorAll('input')[2], '8443');
   await click('Сохранить узел', card);
+  assert.deepEqual(postedData().nodeEndpoints, {b:{server:'2001:db8::7',server_port:8443}});
   assert.deepEqual(postedData().nodeNames, { b: 'New node label' });
   assert.deepEqual(postedData().profiles, initial.data.profiles);
 }

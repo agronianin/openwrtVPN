@@ -152,6 +152,15 @@ async function test() {
   f=setup('loaded'); f.settings.allow_reload=false;f.save();result=await start(f,'find');
   assert.equal(result.job.state,'done',JSON.stringify(result));assert.equal(result.job.selected.tag,'src-old');
   assert.ok(!fs.readFileSync(path.join(f.root,'events'),'utf8').includes('restart'));
+  // Изменение адреса при том же теге требует загрузить новый outbound перед использованием.
+  f=setup('edited-loaded');
+  const editedCatalog=JSON.parse(fs.readFileSync(path.join(f.root,'profiles/catalog.json')));
+  editedCatalog.nodeEndpoints={'src-old':{server:'new.example.org',server_port:8443}};
+  f.write('profiles/catalog.json',editedCatalog);
+  f.write('results.json',{'src-old':{passed:2,latency:25}});
+  result=await start(f,'find');assert.equal(result.job.state,'done',JSON.stringify(result));
+  const changedNode=JSON.parse(fs.readFileSync(path.join(f.root,'config.json'))).outbounds.find(item=>item.tag==='src-old');
+  assert.equal(changedNode.server,'new.example.org');assert.equal(changedNode.server_port,8443);
   // Одна провалившаяся пара запросов с последующим успехом — моргание, а не повод искать другой узел.
   f=setup('blink');f.env.TEST_FAIL_FIRST='2';let launched=f.run(['auto']);assert.equal(launched.status,0,launched.stderr);
   result=await finish(f);assert.equal(result.job.state,'done',JSON.stringify(result));

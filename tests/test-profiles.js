@@ -124,11 +124,20 @@ try {
   withPriority.data.subscriptions.find(source => source.id === 'test-source').priority = [second.tag];
   // Импорт в sandbox пишет локальный путь; сохранение каталога принимает штатные пути роутера.
   withPriority.data.subscriptions.find(source => source.id.startsWith('manual-')).urls = ['file:///etc/sing-box/manual-subscriptions/test.txt'];
+  // Локальный адрес сохраняется отдельно от подписки и применяется при сборке профиля.
+  const endpoint = {server:'2001:db8::7', server_port:8443};
+  withPriority.data.nodeEndpoints = {[cached.tag]:endpoint};
+  for (const invalid of [{server:'bad/domain',server_port:443}, {server:'1::2::3',server_port:443}, {...endpoint,server_port:65536}]) {
+    const next = {...withPriority.data,nodeEndpoints:{[cached.tag]:invalid}};
+    assert.notEqual(run(['save',withPriority.revision],JSON.stringify(next)).status,0);
+  }
   const savedPriority = run(['save', withPriority.revision], JSON.stringify(withPriority.data));
   assert.equal(savedPriority.status, 0, savedPriority.stderr);
   assert.equal(spawnSync('sh', [safeCli, 'check', 'black'], {env, encoding: 'utf8'}).status, 0);
   const prioritized = JSON.parse(fs.readFileSync(path.join(root, 'last-checked.json'), 'utf8'));
   assert.equal(prioritized.outbounds.filter(node => node.tag === cached.tag).length, 1);
+  assert.equal(snapshot().nodes.find(node=>node.tag===cached.tag).server, endpoint.server);
+  assert.equal(prioritized.outbounds.find(node=>node.tag===cached.tag).server_port, endpoint.server_port);
   assert.deepEqual(prioritized.outbounds.find(node => node.tag === 'vpn-out').outbounds, [second.tag, cached.tag]);
   write('profiles/active', 'old-profile\n');
   mock('cp', 'case "$2" in */config.json.new) exit 1 ;; esac\nexec /bin/cp "$@"\n');
@@ -180,6 +189,7 @@ else if(process.argv.includes('PUT')) {
     write('probe-jobs/job-1/job.json', JSON.stringify({state:'done', started_at:start, target:{url:'https://example.com/check'},
       results:[{tag:cached.tag, ok, attempts:2, passed:ok ? 2 : 1}]}));
   }
+  write('probe-jobs/job-1/catalog.sha256', revision);
   write('probe-jobs/job-1/config.sha256', require('node:crypto').createHash('sha256').update(fs.readFileSync(path.join(root,'config.json'))).digest('hex'));
   proof(now-400, true); assert.notEqual(checkedSelect().status, 0);
   proof(now, false); assert.notEqual(checkedSelect().status, 0);

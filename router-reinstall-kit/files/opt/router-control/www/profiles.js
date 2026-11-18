@@ -39,7 +39,7 @@
     var savedMeasurements = new Map(JSON.parse(window.localStorage.getItem('vpn-node-measurements') || '[]'));
     snapshot.nodes.forEach(function (node) {
       var item = savedMeasurements.get(node.tag);
-      if (item && [0, 1, 2].includes(item.passed)) nodeResults.set(node.tag, { item: item });
+      if (item && (item.revision || null) === (snapshot.data.nodeEndpoints?.[node.tag] ? snapshot.revision : null) && [0, 1, 2].includes(item.passed)) nodeResults.set(node.tag, { item: item });
     });
   } catch (_) {}
   function dirty() { return JSON.stringify(data) !== baseline || drafts.size > 0; }
@@ -218,7 +218,7 @@
       try {
         var measurements = Array.from(nodeResults, function (entry) {
           var item = entry[1].item;
-          return [entry[0], { passed: item.passed, attempts: 2, ok: item.ok, latency_ms: item.latency_ms,
+          return [entry[0], { revision: snapshot.data.nodeEndpoints?.[entry[0]] ? snapshot.revision : null, passed: item.passed, attempts: 2, ok: item.ok, latency_ms: item.latency_ms,
             speed_mbps: item.speed_mbps, speed_error: item.speed_error ? 'Замер не удался' : '', http_code: item.http_code }];
         });
         window.localStorage.setItem('vpn-node-measurements', JSON.stringify(measurements));
@@ -313,6 +313,11 @@
       if (!payload.ok) throw new Error(payload.error || 'Операция отклонена сервером');
       if (!payload.snapshot || !payload.snapshot.data) throw new Error('В ответе сервера отсутствуют данные VPN');
       var previous = JSON.parse(baseline), working = data;
+      var freshNodes = new Map(payload.snapshot.nodes.map(function (node) { return [node.tag, node]; }));
+      snapshot.nodes.forEach(function (node) {
+        var next = freshNodes.get(node.tag);
+        if (!next || next.server !== node.server || next.server_port !== node.server_port) nodeResults.delete(node.tag);
+      });
       snapshot = payload.snapshot;
       data = JSON.parse(JSON.stringify(snapshot.data)); baseline = JSON.stringify(data);
       if (saving) {
@@ -1069,18 +1074,42 @@
           drawNodes.set(node.tag, drawNode);
           drawNode();
           if (profile) return;
-          var key = 'node-name:' + node.tag;
-          var name = field(group, 'Название узла', input(drafts.get(key) ?? displayName(node), function (value) {
+          var fields = editor(group, 'Редактировать узел');
+          var key = 'node-name:' + node.tag, hostKey = 'node-host:' + node.tag, portKey = 'node-port:' + node.tag;
+          var name = field(fields, 'Название узла', input(drafts.get(key) ?? displayName(node), function (value) {
             if (value === displayName(node)) drafts.delete(key); else drafts.set(key, value);
           }));
-          var output = result(group);
-          group.append(command('Сохранить узел', function () {
+          function endpointField(label, draftKey, value) {
+            return field(fields, label, input(drafts.get(draftKey) ?? value, function (next) {
+              if (next === value) drafts.delete(draftKey); else drafts.set(draftKey, next);
+            }));
+          }
+          var host = endpointField('IP-адрес или домен', hostKey, node.server || '');
+          var port = endpointField('Порт', portKey, String(node.server_port ?? ''));
+          port.type = 'number'; port.min = 1; port.max = 65535;
+          if (node.endpointPending) fields.append(el('p', 'Работающий VPN использует прежний адрес. Для перехода примените профиль.', 'vp-warning'));
+          if (node.sourceServer && (node.sourceServer !== node.server || node.sourcePort !== node.server_port)) fields.append(button('Вернуть исходный адрес и порт', function () {
+            host.value = node.sourceServer; port.value = String(node.sourcePort);
+            drafts.set(hostKey, host.value); drafts.set(portKey, port.value); changed();
+          }));
+          var output = result(fields);
+          fields.append(command('Сохранить узел', function () {
+            if (probing()) { fail(output, 'Дождитесь окончания проверки узлов.'); return; }
+            var server = host.value.trim(), number = Number(port.value);
+            if (/^\[[0-9a-f:.]+\]$/i.test(server)) server = server.slice(1, -1);
+            if (!server || /[^a-z0-9.:-]/i.test(server) || !/^\d{1,5}$/.test(port.value) || number < 1 || number > 65535) {
+              fail(output, 'Укажите IP-адрес или доменное имя и порт от 1 до 65535.'); return;
+            }
             var title = name.value.trim();
             if (!title || title.length > 160) { fail(output, 'Укажите название до 160 символов.'); return; }
             var catalog = JSON.parse(baseline);
             catalog.nodeNames = Object.assign(Object.create(null), catalog.nodeNames);
             catalog.nodeNames[node.tag] = title;
-            return request('vpn_profiles_save', undefined, output, { revision: snapshot.revision, content: JSON.stringify(catalog) }, true, [key]);
+            if (server !== node.server || number !== node.server_port) {
+              catalog.nodeEndpoints = Object.assign(Object.create(null), catalog.nodeEndpoints);
+              catalog.nodeEndpoints[node.tag] = { server: server, server_port: number };
+            }
+            return request('vpn_profiles_save', undefined, output, { revision: snapshot.revision, content: JSON.stringify(catalog) }, true, [key, hostKey, portKey]);
           }));
         }, node.tag);
         row.classList.add('vp-node');

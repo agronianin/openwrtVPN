@@ -89,10 +89,27 @@ validate() {
     def id_char: .==45 or .==95 or (.>=48 and .<=57) or (.>=65 and .<=90) or (.>=97 and .<=122);
     def id: type=="string" and length>=1 and length<=80 and (explode | (.[0]|id_char) and all(.[]; id_char or .==46));
     def ids: type=="array" and length<=500 and all(.[]; id) and (unique|length)==length;
+    def digit: .>=48 and .<=57;
+    def ipv4: split(".") | length==4 and all(.[]; length>0 and length<=3 and (explode|all(.[];digit)) and (tonumber<=255));
+    def host: type=="string" and length>0 and length<=253 and
+      (if contains(":") then
+        split(":") as $parts | split("::") as $halves |
+        (([$parts[]|select(length>0)]|length) + (if ($parts[-1]|contains(".")) then 1 else 0 end)) as $groups |
+        ($halves|length)<=2 and (contains(":::")|not) and
+        ((startswith(":")|not) or startswith("::")) and ((endswith(":")|not) or endswith("::")) and
+        (if ($halves|length)==2 then $groups<8 else $groups==8 end) and
+        all($parts|to_entries[]; .key as $i | .value | length==0 or
+          (length<=4 and (ascii_downcase|explode|all(.[];digit or (.>=97 and .<=102)))) or ($i==($parts|length)-1 and ipv4))
+      elif (explode|all(.[];digit or .==46)) then ipv4
+      else rtrimstr(".")|split(".")|all(.[];length>0 and length<=63 and (startswith("-")|not) and (endswith("-")|not)
+        and (ascii_downcase|explode|all(.[];digit or .==45 or (.>=97 and .<=122)))) end);
     def name: type=="string" and length>0 and length<=160;
     length==1 and (.[0] |
     . as $d | .version==1 and (.subscriptions|type)=="array" and (.profiles|type)=="array"
     and (if has("nodeNames") then (.nodeNames | type=="object" and all(to_entries[]; (.key|id) and (.value|name))) else true end)
+    and (if has("nodeEndpoints") then (.nodeEndpoints | type=="object" and all(to_entries[];
+      (.key|id) and (.value|type=="object" and keys==["server","server_port"] and (.server|host)
+      and (.server_port|type=="number" and floor==. and .>=1 and .<=65535)))) else true end)
     and (.subscriptions|length)<=100 and (.profiles|length)<=100
     and ([.subscriptions[].id]|ids) and ([.profiles[].id]|ids)
     and all(.subscriptions[]; (.id|length)<=48 and (.name|type)=="string" and (.name|length)>0 and (.name|length)<=160
@@ -122,7 +139,7 @@ snapshot() (
   jq -r '.subscriptions[].id' "$DB" | while IFS= read -r id; do
     [ -s "$STORE/$id.nodes" ] || continue
     cache_json "$STORE/$id.nodes" | jq --arg subscription "$id" \
-      '[.[] | {tag,subscription:$subscription,type,title:.tag}]' > "$TMP/source-nodes.json"
+      '[.[] | {tag,subscription:$subscription,type,server,server_port,title:.tag}]' > "$TMP/source-nodes.json"
     if [ -f "$STORE/$id.titles" ]; then
       jq -Rn '[inputs | split("\t") | {key:.[0],value:(.[1:]|join("\t"))}]|from_entries' \
         < "$STORE/$id.titles" > "$TMP/titles.json"
@@ -141,11 +158,14 @@ snapshot() (
   jq --slurpfile data "$DB" --slurpfile cached "$TMP/nodes.json" \
     --slurpfile titles "$TMP/loaded-titles.json" \
     '[.outbounds[]?|select(.type=="vless" or .type=="hysteria2")|. as $node|
-      {tag,type,title:([$cached[0][]|select(.tag==$node.tag)|.title][0]//$titles[0][.tag]//.tag),
+      {tag,type,server,server_port,title:([$cached[0][]|select(.tag==$node.tag)|.title][0]//$titles[0][.tag]//.tag),
        subscription:([$data[0].subscriptions[]|. as $source|select($node.tag|startswith($source.id+"-"))|.id]|max_by(length)//"loaded")}]' \
     "$CONFIG" > "$TMP/loaded.json"
   jq --slurpfile loaded "$TMP/loaded.json" --slurpfile data "$DB" '
-    .+$loaded[0]|unique_by(.tag)|map(.title=($data[0].nodeNames[.tag]//.title))
+    ($loaded[0]|map({key:.tag,value:.})|from_entries) as $live |
+    .+$loaded[0]|unique_by(.tag)|map(. as $source | . + ($data[0].nodeEndpoints[.tag]//{}) |
+      .sourceServer=$source.server | .sourcePort=$source.server_port | .title=($data[0].nodeNames[.tag]//.title) | .endpointPending=($live[.tag]!=null and
+      ([.server,.server_port]!=[$live[.tag].server,$live[.tag].server_port])))
   ' "$TMP/nodes.json" > "$TMP/nodes.new"
   mv "$TMP/nodes.new" "$TMP/nodes.json"
   echo '[]' > "$TMP/rules.json"
@@ -194,7 +214,7 @@ snapshot() (
     --slurpfile targets "$TMP/test-targets.json" \
     --slurpfile connection "$TMP/connection.json" \
     '{revision:$revision,data:$data[0],active:(if $active=="" then null else $active end),running:$running,managed:$managed,
-      effective:$effective[0],selection:$selection[0],connection:$connection[0],updateJob:$job[0],testTargets:$targets[0],nodes:($nodes[0]|map(.selectable=($selectable[0][.tag]//false))),rules:$rules[0]}'
+      effective:$effective[0],selection:$selection[0],connection:$connection[0],updateJob:$job[0],testTargets:$targets[0],nodes:($nodes[0]|map(.selectable=(($selectable[0][.tag]//false) and (.endpointPending|not)))),rules:$rules[0]}'
 )
 
 refresh_sources() {
@@ -241,6 +261,8 @@ test_node() (
     [ ! -s "$TMP/probe-node.json" ] || break
   done
   [ -s "$TMP/probe-node.json" ] || error 'Node not found in subscription cache'
+  jq --slurpfile catalog "$DB" '. + ($catalog[0].nodeEndpoints[.tag]//{})' "$TMP/probe-node.json" > "$TMP/endpoint.json"
+  mv "$TMP/endpoint.json" "$TMP/probe-node.json"
   port=$((18000 + $$ % 10000))
   jq -n --slurpfile node "$TMP/probe-node.json" --argjson port "$port" \
     '{log:{level:"error"},dns:{servers:[{type:"udp",tag:"dns-direct",server:"77.88.8.8"}]},
@@ -322,7 +344,7 @@ build_profile() (
           else [($p.subscriptions|length),($p.nodes|index($tag))//500,.key] end)
     | map(.value) as $nodes
     | $config
-    | .outbounds |= (map(select(.type!="urltest" and .tag!="vpn-out")) | unique_by(.tag)
+    | .outbounds |= (map(select(.type!="urltest" and .tag!="vpn-out")) | unique_by(.tag) | map(if .type=="vless" or .type=="hysteria2" then . + ($catalog[0].nodeEndpoints[.tag]//{}) else . end)
       + [{type:"selector",tag:"vpn-out",outbounds:$nodes,default:$nodes[0],interrupt_exist_connections:false}])
     | .route.rules |= ([{action:"route",outbound:"direct",ip_cidr:["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10",
         "127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.168.0.0/16","224.0.0.0/4","255.255.255.255/32",
@@ -462,6 +484,7 @@ case "${1:-snapshot}" in
       jq -e --arg tag "$tag" --argjson now "$(date +%s)" '
         .state=="done" and (.started_at >= $now-300 and .started_at <= $now) and any(.results[]; .tag==$tag and .ok and .passed==2 and .attempts==2)
       ' "$job_dir/job.json" >/dev/null 2>&1 || error 'Нужны две успешные HTTPS-попытки за последние пять минут. Повторите быстрый тест.'
+      [ "$(cat "$job_dir/catalog.sha256" 2>/dev/null)" = "$(revision)" ] || error 'Каталог изменился. Повторите тест.'
       [ "$(cat "$job_dir/config.sha256" 2>/dev/null)" = "$(sha256sum "$CONFIG" | cut -d' ' -f1)" ] || error 'Конфигурация изменилась. Повторите тест.'
       snapshot > "$TMP/before-switch.json"
       jq -e --arg tag "$tag" --arg id "$profile" '
