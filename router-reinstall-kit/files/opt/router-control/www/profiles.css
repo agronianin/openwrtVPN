@@ -43,6 +43,10 @@
 #vpn-app .vp-node > summary { padding: 8px 12px; }
 #vpn-app .vp-node[open] { border-color: #145b91; }
 #vpn-app .vp-node[open] > summary { border-bottom: 1px solid #bac6cf; background: #e5f0f7; border-radius: 5px 5px 0 0; }
+#vpn-app .vp-import { border: 2px solid #39749f; border-radius: 6px; padding: 0 12px; margin-bottom: 16px; }
+#vpn-app .vp-import > summary { margin: 0 -12px; padding: 12px; border-radius: 4px; background: #e5f0f7; color: #153b55; font-weight: 700; }
+#vpn-app .vp-import[open] { padding-bottom: 12px; }
+#vpn-app .vp-import[open] > summary { border-bottom: 1px solid #91afc5; border-radius: 4px 4px 0 0; }
 #vpn-app .vp-node-source { display: block; color: #52616d; font-size: 13px; padding-left: 16px; }
 #vpn-app .vp-node-body { padding: 12px; }
 #vpn-app code { display: block; overflow-wrap: anywhere; font-size: 13px; }

@@ -781,7 +781,7 @@
   }
   function nodes() {
     var area = section('Узлы'), query = '', sourceId = '', page = 0;
-    var importer = el('details', undefined, 'vp-compact');
+    var importer = el('details', undefined, 'vp-compact vp-import');
     importer.append(el('summary', 'Добавить узел')); area.append(importer);
     importer.open = expanded.has('node-import');
     importer.addEventListener('toggle', function () { if (importer.open) expanded.add('node-import'); else expanded.delete('node-import'); });
