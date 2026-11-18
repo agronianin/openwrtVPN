@@ -59,8 +59,9 @@ const initial = {
   rules: [{ id: '05-proxy', name: 'Proxy', content: 'proxy content', revision: 'sha-proxy' },
     { id: '20-direct', name: 'Direct', content: 'direct content', revision: 'sha-direct' }]
 };
-function boot(snapshot = initial, localStorage) {
+function boot(snapshot = initial, localStorage, view) {
   root = new Element('main'); requests = []; replies = []; confirmAnswer = true; timers = new Map();
+  if (view) root.setAttribute('data-view', view);
   const seed = new Element('script'); seed.textContent = JSON.stringify(snapshot);
   context = {
     document: { getElementById: id => id === 'vpn-app' ? root : seed, createElement: tag => new Element(tag) },
@@ -447,6 +448,24 @@ async function testLastCheck() {
   assert.ok(root.textContent.includes(check.reason)); assert.ok(root.textContent.includes('Устарело:'));
 }
 
+// Обзор показывает сводку без редакторов и запускает те же задания проверки и подбора.
+async function testOverview() {
+  for (const [label, kind] of [['Проверить текущий узел', 'check'], ['Подобрать и включить узел', 'find']]) {
+    boot(initial, null, 'overview');
+    assert.equal(root.querySelectorAll('nav, select').length, 0);
+    assert.ok(root.textContent.includes('Профиль: Work'));
+    assert.ok(root.textContent.includes('Текущий узел: Node B'));
+    replies.push(connectionReply('running', { job: {kind} })); await click(label);
+    assert.equal(requests[0].fields.arg, kind);
+    assert.equal(requests[0].fields.action, 'vpn_profiles_connection_start');
+    assert.equal(named(label).disabled, true);
+    replies.push(connectionReply('done', {job: {kind}}), {ok:true, snapshot: initial}); await tick();
+    assert.equal(named(label).disabled, false);
+  }
+  boot({...initial, running:false}, null, 'overview');
+  assert.ok(named('Подобрать и включить узел').disabled);
+}
+
 // Автовыбор — конечное задание: polling показывает прогресс, блокирует конфликтующие команды и один раз читает итоговый снимок.
 async function testSelectionFeedback() {
   boot();
@@ -611,6 +630,7 @@ function testMobileLayout() {
         'for(const view of ["Статус","Профили","Группы узлов","Правила","Узлы"]){' +
         '[...app.querySelectorAll("nav button")].find(b=>b.textContent===view).click();' +
         'if(view==="Узлы" && ![...app.querySelectorAll(".vp-node")].every(n=>!n.open))throw Error("Open node on entry");' +
+        'if(view==="Узлы" && app.querySelector(".vp-tests").open)throw Error("HTTPS settings initially open");' +
         'app.querySelectorAll("details").forEach(n=>{n.open=true;n.dispatchEvent(new Event("toggle"));});' +
         'if(d.documentElement.scrollWidth>w.innerWidth)throw Error("Page overflow: "+view);' +
         'for(const n of app.querySelectorAll("button,input,select,textarea,summary,progress")){' +
@@ -621,6 +641,8 @@ function testMobileLayout() {
         'results:[{tag:"a",ok:true,passed:2,attempts:2,latency_ms:13}]}})});' +
         '[...card.querySelectorAll("button")].find(b=>b.textContent==="Быстрый тест").click();' +
         'await new Promise(resolve=>w.setTimeout(resolve,0));' +
+        'for(const pair of app.querySelectorAll(".vp-test-pair")){const [a,b]=pair.querySelectorAll("button");' +
+        'if(a.getBoundingClientRect().top!==b.getBoundingClientRect().top)throw Error("Test buttons wrapped");}' +
         'if(!card.open||!card.textContent.includes("13 мс")||card.getBoundingClientRect().top!==top)throw Error("Node result moved the list");}' +
         '}[...app.querySelectorAll("nav button")].find(b=>b.textContent==="Статус").click();' +
         'app.querySelector("details").open=true;' +
@@ -748,7 +770,7 @@ async function testTargetEditing() {
 (async function () {
   const tests = [testAtomicSaveAndOrdering, testFailuresAndDiscard, testConnectionAndSearch, testSingleNodeProbe, testNodeMeasurements, testCatalogCrud, testNodeNameAndLocalGroup, testRuleActions,
     testLargeCatalog, testEffectiveAndRuleGuard, testImportAndRefresh, testUpdateJob, testLastCheck,
-    testFilteredProbeAndProgress, testProbeErrorsAndSpeed, testTargetEditing, testSelectionFeedback,
+    testFilteredProbeAndProgress, testProbeErrorsAndSpeed, testTargetEditing, testOverview, testSelectionFeedback,
     testConnectionDraftsAndNoCandidate, testConnectionErrorsAndCheck, testRecoverySettings, testConnectionSnapshotRace];
   for (const test of tests) await test();
   assert.ok(!source.includes('innerHTML'));

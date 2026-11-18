@@ -853,6 +853,14 @@ EOF
 EOF
 }
 
+render_profiles_app() {
+  printf '<div id="vpn-app" data-view="%s"></div><script type="application/json" id="vpn-profile-data">\n' "$1"
+  /usr/bin/vpn-profiles snapshot | jq -c --arg view "$1" 'if $view=="overview" then
+    {active,managed,running,effective,selection,connection,data:{profiles:[.data.profiles[]|{id,name}]},
+     nodes:[.nodes[]|{tag,title,type}]} else . end' | sed 's/</\\u003c/g; s/>/\\u003e/g; s/\&/\\u0026/g'
+  printf '</script><script defer src="/profiles.js?v=%s"></script>\n' "$ASSET_VERSION"
+}
+
 render_vpn_cards() {
   vstat="$(/usr/bin/vpnctl status 2>&1)"
   running="$(printf '%s\n' "$vstat" | sed -n 's/^VPN: //p' | head -n 1)"
@@ -864,6 +872,15 @@ render_vpn_cards() {
   tun="$(ip link show tun0 >/dev/null 2>&1 && echo present || echo absent)"
   service="$(/etc/init.d/sing-box status >/dev/null 2>&1 && echo running || echo stopped)"
 
+  if [ "${1:-}" = overview ] && [ -x /usr/bin/vpn-profiles ]; then
+    echo '<section class="status-panel">'
+    render_profiles_app overview
+    echo '<details><summary>Технический статус VPN</summary><div class="status-grid">'
+    item "Туннель tun0" "$tun" "Состояние интерфейса на момент открытия обзора."
+    item "Последний выход" "${exit_line:---}" "Последние сохранённые данные о выходном IP."
+    printf '</div><pre>%s</pre></details></section>\n' "$(esc "$vstat")"
+    return
+  fi
   cat <<EOF
 <section class="status-panel">
   <div class="panel-title">
@@ -1349,7 +1366,7 @@ EOF
 if [ "$ACTIVE_TAB" = overview ]; then
 echo '<section class="tab tab-overview">'
 [ "$MODEM_ENABLED" != 1 ] || render_modem_cards
-render_vpn_cards
+render_vpn_cards overview
 echo '</section>'
 fi
 
@@ -1405,9 +1422,7 @@ fi
 if [ "$ACTIVE_TAB" = vpn ]; then
 echo '<section class="tab tab-vpn">'
 if [ -x /usr/bin/vpn-profiles ]; then
-  echo '<div id="vpn-app"></div><script type="application/json" id="vpn-profile-data">'
-  /usr/bin/vpn-profiles snapshot | jq -c . | sed 's/</\\u003c/g; s/>/\\u003e/g; s/\&/\\u0026/g'
-  printf '</script><script defer src="/profiles.js?v=%s"></script>\n' "$ASSET_VERSION"
+  render_profiles_app vpn
   echo '<details class="advanced"><summary>Периоды автоматизации</summary>'
   vpn_interval_editor
   echo '</details>'

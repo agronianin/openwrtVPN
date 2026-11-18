@@ -4,6 +4,8 @@
   var source = document.getElementById('vpn-profile-data');
   if (!root || !source) return;
 
+  var overview = root.getAttribute('data-view') === 'overview';
+
   function el(tag, text, className) {
     var node = document.createElement(tag);
     if (text !== undefined) node.textContent = text;
@@ -455,42 +457,46 @@
   function availabilityLevel(check) { return check.ok ? 'good' : check.passed ? 'warn' : 'bad'; }
   function latencyLevel(ms) { return ms <= 300 ? 'good' : ms <= 1000 ? 'warn' : 'bad'; }
   function vpn() {
-    var area = section('Статус');
+    var area = section(overview ? 'VPN' : 'Статус');
     var current = snapshot.data.profiles.find(function (profile) { return profile.id === snapshot.active; });
     var serviceStatus = el('p', '', 'vp-status'); area.append(serviceStatus);
     var legacy = snapshot.running && !current;
     if (legacy) area.append(el('p', 'Старое подключение: выберите профиль', 'vp-warning'));
-    if (current) area.append(el('p', 'Профиль: ' + current.name));
-    var runtime = el('div'), lastCheck = el('div', undefined, 'vp-last-check'); area.append(runtime, lastCheck);
+    var profileName = el('p'); area.append(profileName);
+    var runtime = el('div'), lastCheck = el('div', undefined, 'vp-last-check'); var summary = el('div', undefined, overview ? 'vp-overview-grid' : undefined);
+    summary.append(runtime, lastCheck); area.append(summary);
     var jobStatus = result(area), progress = el('progress'), connectionMessage = result(area);
     progress.setAttribute('aria-label', 'Ход проверки подключения'); area.append(progress);
     var target = result(area);
-    var profiles = snapshot.data.profiles.map(function (profile) { return [profile.id, profile.name]; });
-    if (!current) profiles.unshift(['', 'Выберите профиль']);
-    var selectedProfile = current ? current.id : '';
-    var chooser = connectionControl(field(area, 'Профиль', select(profiles, selectedProfile, async function (id) {
-      if (!id || !await request('vpn_profiles_activate', id, target)) chooser.value = selectedProfile;
-    })));
-    var reapply = button(
-      'Применить профиль',
-      function () {
-        if (chooser.value && window.confirm('Применить сохранённые настройки профиля? VPN может кратко прерваться; ручная фиксация узла сбросится.')) {
-          request('vpn_profiles_activate', chooser.value, target);
-        }
-      },
-      'Повторно собирает выбранный профиль из сохранённых подписок и правил и применяет его. Возможен краткий разрыв соединений. ' +
-        'Подписки не скачивает; ручная фиксация узла сбрасывается.'
-    );
-    area.append(connectionControl(reapply, !chooser.value));
+    if (!overview) {
+      var profiles = snapshot.data.profiles.map(function (profile) { return [profile.id, profile.name]; });
+      if (!current) profiles.unshift(['', 'Выберите профиль']);
+      var selectedProfile = current ? current.id : '';
+      var chooser = connectionControl(field(area, 'Профиль', select(profiles, selectedProfile, async function (id) {
+        if (!id || !await request('vpn_profiles_activate', id, target)) chooser.value = selectedProfile;
+      })));
+      var reapply = button(
+        'Применить профиль',
+        function () {
+          if (chooser.value && window.confirm('Применить сохранённые настройки профиля? VPN может кратко прерваться; ручная фиксация узла сбросится.')) {
+            request('vpn_profiles_activate', chooser.value, target);
+          }
+        },
+        'Повторно собирает выбранный профиль из сохранённых подписок и правил и применяет его. Возможен краткий разрыв соединений. ' +
+          'Подписки не скачивает; ручная фиксация узла сбрасывается.'
+      );
+      area.append(connectionControl(reapply, !chooser.value));
+      chooser.title = 'Выбор профиля применяет его сохранённые настройки и может кратко прервать соединения.';
+    }
     var actions = el('div', undefined, 'vp-actions');
     var check = button(
-      'Проверить подключение',
+      overview ? 'Проверить текущий узел' : 'Проверить подключение',
       function () { return startConnection('check'); },
       'Два HTTPS-запроса через текущий узел. ' +
         'Узел не переключает, VPN не перезапускает; геолокацию не проверяет.'
     );
     var auto = button(
-      'Автовыбор узла',
+      overview ? 'Подобрать и включить узел' : 'Автовыбор узла',
       function () { return startConnection('find'); },
       'Разовый поиск рабочего узла профиля с учётом приоритетов и HTTPS-задержки: две успешные HTTPS-попытки. ' +
         'Во время поиска VPN не перезапускается. Если кандидата нет, текущий узел сохраняется. ' +
@@ -502,9 +508,11 @@
       return request('vpn_profiles_on', undefined, target);
     });
     area.append(power);
-    chooser.title = 'Выбор профиля применяет его сохранённые настройки и может кратко прервать соединения.';
     drawConnection = function () {
       var connection = snapshot.connection, job = connection && connection.job, latest = connection && connection.lastCheck;
+      current = snapshot.data.profiles.find(function (profile) { return profile.id === snapshot.active; });
+      profileName.textContent = current ? 'Профиль: ' + current.name : '';
+      profileName.hidden = !current;
       serviceStatus.textContent = snapshot.running ? 'Сервис VPN запущен' : 'VPN выключен';
       serviceStatus.className = 'vp-status ' + (snapshot.running ? 'vp-info' : 'vp-muted');
       var stale = !snapshot.running || !latest || latest.profile !== snapshot.active || !snapshot.effective || latest.node !== snapshot.effective.tag;
@@ -549,6 +557,10 @@
       if (connectionError) connectionMessage.classList.add('vp-error');
       check.disabled = auto.disabled = busy || connectionWorking() || probing() || !snapshot.running || !current;
     };
+    if (overview) {
+      var settingsLink = el('a', 'Настройки VPN'); settingsLink.href = '?tab=vpn';
+      area.append(settingsLink); return;
+    }
     recoverySettings(area);
     if (current && snapshot.running) disclosure(area, 'Подбор узла профиля «' + current.name + '»', 'status-nodes', function (details) {
       details.append(el('p', 'Сравните узлы профиля. После успешной проверки можно отдельно переключить VPN на выбранный узел.'));
@@ -872,8 +884,8 @@
     }).map(function (item) {
       return [item.id, item.name];
     })), '', function (value) { sourceId = value; page = 0; draw(); }));
-    var tests = el('div', undefined, 'vp-tests'); area.append(tests);
-    tests.append(el('h3', 'HTTPS-тесты'));
+    var tests = el('details', undefined, 'vp-compact vp-tests'); area.append(tests);
+    tests.append(el('summary', 'HTTPS-тесты'));
     var targets = snapshot.testTargets || { revision: '', items: defaultTargets };
     var targetItems = drafts.has('__targets') ? JSON.parse(drafts.get('__targets')) : JSON.parse(JSON.stringify(targets.items));
     var targetSelect = field(tests, 'Ресурс', select([], '', function (value) { targetId = value; }));
@@ -938,7 +950,7 @@
     var targetURLs = el('details', undefined, 'vp-compact');
     targetURLs.append(el('summary', 'URL проверки')); tests.append(targetURLs);
     var urls = el('div'); targetURLs.append(urls);
-    var testActions = el('div', undefined, 'vp-actions'); tests.append(testActions);
+    var testActions = el('div', undefined, 'vp-test-pair');
     var sort = 'catalog', visibleTags = [];
     field(area, 'Сортировка узлов', select([
       ['catalog', 'Порядок каталога'], ['name', 'По имени (А–Я)'], ['speed_mbps', 'По скорости (быстрые сначала)'],
@@ -960,7 +972,7 @@
       var matches = filteredNodes();
       return startProbe(matches.slice(0, 60).map(function (node) { return node.tag; }), speed, matches.length);
     }
-    testActions.append(el('p', 'Быстрый тест делает два HTTPS-запроса. Тест скорости дополнительно скачивает до 2 МиБ через каждый узел с результатом 2/2.'));
+    tests.append(el('p', 'Быстрый тест делает два HTTPS-запроса. Тест скорости дополнительно скачивает до 2 МиБ через каждый узел с результатом 2/2.'), testActions);
     var quick = button('Быстрый тест', function () { return batch(false); });
     var speed = button('Тест скорости', function () { return batch(true); }); testActions.append(quick, speed);
     var probeStatus = result(tests), progress = el('progress'), drawNodes = new Map();
@@ -1017,7 +1029,7 @@
           var group = el('div', undefined, 'vp-node-body'); details.append(group);
           var check = button('Быстрый тест', function () { return startProbe([node.tag], false, 1, node.tag); });
           var speedCheck = button('Тест скорости', function () { return startProbe([node.tag], true, 1, node.tag); });
-          var actions = el('div', undefined, 'vp-actions'); actions.append(check, speedCheck); group.append(actions);
+          var actions = el('div', undefined, 'vp-test-pair'); actions.append(check, speedCheck); group.append(actions);
           var status = result(group), measurement = result(group);
           var apply;
           function canApply() {
@@ -1118,7 +1130,7 @@
     var refresh = command('Обновить', function () { request('vpn_profiles_snapshot', undefined, notice); },
       'Перечитывает состояние роутера и фактический выбор sing-box. Не применяет профиль, не тестирует интернет и не перезапускает VPN. Несохранённые правки потребуют подтверждения перед сбросом.');
     refresh.setAttribute('aria-label', 'Обновить состояние'); nav.append(refresh);
-    root.append(nav);
+    if (!overview) root.append(nav);
     var toolbar = el('div', undefined, 'vp-save');
     saveState = el('span'); toolbar.append(saveState);
     if (view !== 'VPN') root.append(toolbar);
